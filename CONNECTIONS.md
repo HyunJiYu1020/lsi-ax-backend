@@ -17,23 +17,40 @@ S.LSI/
 
 ### 2-1. `frontend-html` (실제 연결됨)
 
-- `overseas.html:456` — `OV_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/overseas"`
-- `shared/core.js:2235` — `CHAT_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/chat"`
+`index.html`이 유일한 진입점이다(`overseas.html`은 `index.html#/a/overseas`로 리다이렉트만 하는
+빈 스텁). 실제 API 호출은 전부 `shared/core.js` 안에 있다:
 
-두 파일 모두 전역 `window.OV_API_BASE`로 베이스 URL을 바꿀 수 있다(하드코딩 아님). 운영 배포 시엔
-`index.html`/`overseas.html`에서 `core.js`를 로드하기 **전에** 아래처럼 한 줄 추가하면 된다.
+```js
+// shared/core.js:3540, 3606, 3638
+const OV_API   = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/overseas";
+const FX_API   = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/fx";
+const PLAN_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/management-plan";
+```
+
+세 베이스 모두 같은 전역 `window.OV_API_BASE`를 쓴다(하드코딩 아님). 운영 배포 시엔 `index.html`에서
+`core.js`를 로드하기 **전에** 아래처럼 한 줄 추가하면 된다.
 
 ```html
 <script>window.OV_API_BASE = "https://api.실제도메인.com";</script>
 <script src="shared/core.js"></script>
 ```
 
-실제로 호출하는 경로 (base: `/api/v1`):
+**실제로 `fetch`하는 경로는 이 5개뿐이다** (base: `/api/v1`):
 
-| 호출부 | 엔드포인트 |
-|---|---|
-| `overseas.html` | `GET/PUT /overseas/state`, `PUT /overseas/custom-rows`, `DELETE /overseas/custom-rows`, `PUT/DELETE /overseas/memo-cols`, `PUT /overseas/memos` |
-| `shared/core.js` (플로팅 채팅) | `GET /chat/providers`, `POST /chat`, `POST /chat/confirm` |
+| 호출부 (core.js) | 엔드포인트 | 시점 |
+|---|---|---|
+| `ovApiLoad` / `ovApiFlush` | `GET/PUT /overseas/state` | 로드 시 1회 / 단계전환·블러 시 |
+| `ovLabsApiLoad` / `ovLabsApiFlush` | `GET/PUT /overseas/labs` | 로드 시 / 연구소 기준정보 저장 시 |
+| `ovUploadRaw` | `POST /overseas/uploads/file` | 엑셀 업로드할 때마다(파싱 성패 무관, fire-and-forget) |
+| `fxApiLoad` / `fxApiFlush` | `GET/PUT /fx/state` | 로드 시 / 환율 저장 시 |
+| `verPlanApi*` | `GET/POST/PUT/DELETE /management-plan/versions` | 경영계획 버전(P00~) 만들기·확정·삭제 시 |
+
+**`/management-plan/entries`는 아직 안 붙어 있다** — core.js 주석(3636~3637줄)에 그대로 적혀 있듯,
+경영계획 "버전 목록"만 `/management-plan/versions`로 동기화하고, 실제 금액은 여전히
+`/overseas/state`의 `cost_entries`(version="plan") 슬롯을 그대로 쓴다.
+
+**위 5개 외의 `/overseas/*` 엔드포인트**(`custom-rows`, `memo-cols`, `memos`, `sheet-rows`, `notes`,
+`fx-rates`, `cost-entries`)는 화면에 전용 버튼이 없고, **AI 플로팅 챗봇을 통해서만** 호출된다 — 4절 참고.
 
 ### 2-2. `frontend` (React/Vite) — 백엔드 미연결
 
@@ -65,11 +82,19 @@ allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?"  # 로컬 개발 �
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | anthropic 공급자가 쓸 모델명 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | `CHAT_PROVIDER=ollama`일 때만. 기본값 쓰면 생략 가능 |
 | `OLLAMA_MODEL` | `gemma4:26b` | ollama 공급자가 쓸 모델명 |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | (없음) | 업로드 원본 파일을 S3에 보존하려면 채운다(버킷 전용 IAM, `s3:PutObject`/`s3:GetObject`로 최소화). 비워두면 업로드 기능은 S3 저장만 건너뛰고 나머지(파일명·파싱 결과)는 그대로 동작 |
+| `AWS_REGION` | `ap-northeast-2` | S3 리전 |
+| `S3_UPLOAD_BUCKET` | (없음) | 업로드 원본 보관용 버킷명. 비어 있으면 S3 저장 스킵 |
 
 ## 4. MCP 연결
 
 두 가지 경로로 같은 MCP 도구 세트(`app/mcp_server.py`)가 쓰인다. 어느 쪽이든 **MCP 서버는 DB에 직접
 접근하지 않고, 백엔드 HTTP API(`/api/v1/...`)를 호출하는 얇은 어댑터**라는 점이 동일하다.
+
+이 도구 세트가 `/overseas/*`의 거의 모든 엔드포인트(`custom-rows`, `memo-cols`, `memos`, `sheet-rows`,
+`notes`, `fx-rates`, `cost-entries`, `uploads`, `labs`, `lab-sheets`, `step`)와 `/common-codes`,
+`/errors`까지를 다 덮는다 — 즉 **2-1에서 설명한 화면 버튼 5개보다 실제 API 커버리지가 훨씬 넓고**, 그
+나머지는 전부 챗봇을 거쳐야만 호출된다.
 
 ### 4-1. 외부 MCP 클라이언트 (Claude Code/Desktop 등) — stdio
 
@@ -97,3 +122,8 @@ import해서 `mcp.list_tools()` / `mcp.call_tool()`을 직접 호출한다(4-1�
 
 - 읽기 도구(`list_*`, `get_*`)는 바로 실행.
 - 쓰기 도구(`upsert_*`, `record_*`, `update_*`, `delete_*`)는 `/chat/confirm`으로 사람이 승인해야 실행된다.
+
+**주의**: 이 승인 게이트가 있어도 "테스트로 한번 해볼게요" 같은 대화로 더미 데이터가 실제로 저장될 수
+있다 — 2026-11-04에 `error_logs`/`fx_applied_rates`(수동 API 테스트)와 `memos`/`memo_cols`/`notes`/
+`custom_rows`(챗봇으로 넣은 "테스트 메모"·"테스트 사유"·중복 더미 행)에서 실제로 발견되어 정리했다.
+운영 전환 시 이 경로로 들어간 데이터를 주기적으로 점검할 것.

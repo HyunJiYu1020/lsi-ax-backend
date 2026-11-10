@@ -9,6 +9,7 @@ class CodeGroup(str, Enum):
     """common_code_groups.group_code와 1:1로 맞아야 하는 그룹 목록."""
 
     ACCOUNT_STATUS = "ACCOUNT_STATUS"
+    OVERSEAS_SHEET_TYPE = "OVERSEAS_SHEET_TYPE"
 
 
 class AccountStatus(str, Enum):
@@ -20,3 +21,12 @@ class AccountStatus(str, Enum):
     SUBMITTED = "submitted"
     REVIEWED = "reviewed"
     REJECTED = "rejected"
+
+
+class OverseasSheetType(str, Enum):
+    """common_codes(group_code=OVERSEAS_SHEET_TYPE)의 code 값. overseas_lab_sheets.sheet_key에 저장된다.
+    연구소 워크북 1개 안의 시트 구성(연구소마다 다를 수 있음)을 나타낸다."""
+
+    COST = "cost"
+    VARIANCE = "variance"
+    VENDOR = "vendor"

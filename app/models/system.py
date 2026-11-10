@@ -36,7 +36,7 @@ class CommonCode(Base):
     group_code: Mapped[str] = mapped_column(
         String(40),
         ForeignKey("common_code_groups.group_code"),
-        comment='코드그룹 ("VERSION", "FX_RATE_TYPE", "CURRENCY", "DEPT", ...)',
+        comment='코드그룹 ("VERSION", "FX_RATE_TYPE", "DEPT", ...)',
     )
     code: Mapped[str] = mapped_column(String(40), comment="코드값")
     name: Mapped[str] = mapped_column(String(100), comment="코드명(한글)")

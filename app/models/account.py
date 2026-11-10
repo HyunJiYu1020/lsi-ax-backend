@@ -42,6 +42,10 @@ class Account(Base):
         "(drafting|drafted|not_submitted|submitted|reviewed|rejected)",
     )
     memo: Mapped[str | None] = mapped_column(Text, comment="비고 메모")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="status · memo 마지막 수정 시각"
+    )
+    updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="status · memo를 마지막으로 수정한 사용자 (users.id)")
 
 
 class AccountStep(Base):
@@ -54,7 +58,7 @@ class AccountStep(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(SmallInteger, comment="accounts.id FK")
-    step_order: Mapped[int] = mapped_column(SmallInteger, comment="단계 순서 (0-based)")
+    step_order: Mapped[int] = mapped_column(SmallInteger, comment="단계 순서 (1-based, 화면에 보이는 'N단계'와 동일한 값)")
     tag: Mapped[str] = mapped_column(String(20), comment="단계 태그 (취합/편성/검토/분석 등)")
     title: Mapped[str] = mapped_column(String(100), comment="단계 제목 (예: '기초자료 업로드 · 맵핑')")
 
@@ -79,8 +83,8 @@ class AccountProgress(Base):
     account_id: Mapped[int] = mapped_column(SmallInteger, unique=True, comment="accounts.id FK, 계정당 1행")
     current_step_order: Mapped[int] = mapped_column(
         SmallInteger,
-        default=0,
-        comment="현재 단계 (account_steps.step_order 참조, 복합 FK로 유효 단계만 허용)",
+        default=1,
+        comment="현재 단계 (account_steps.step_order 참조, 복합 FK로 유효 단계만 허용). 1부터 시작",
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
