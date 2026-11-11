@@ -50,7 +50,7 @@ class Account(Base):
 
 class AccountStep(Base):
     """계정별 편성 프로세스 단계 정의. 계정마다 단계 수·이름이 전부 다르고
-    (해외연구소 3단계, 감가상각비 4단계, 위탁용역비·생소비 6단계 등) 앞으로도
+    (해외연구소 3단계, 감가상각비 5단계, 위탁용역비·생소비 6단계 등) 앞으로도
     늘어날 수 있어서, 고정 개수 컬럼이 아니라 행으로 둔다 — 단계가 늘어도
     이 테이블에 행만 추가하면 되고 스키마는 안 바뀐다."""
 
@@ -74,8 +74,7 @@ class AccountStep(Base):
 
 class AccountProgress(Base):
     """계정별 현재 진행 단계. current_step_order는 반드시 그 계정의
-    account_steps에 실제로 정의된 단계여야 한다 (복합 FK로 강제).
-    REQ_013: 조회·갱신 API 대상."""
+    account_steps에 실제로 정의된 단계여야 한다 (복합 FK로 강제)."""
 
     __tablename__ = "account_progress"
 

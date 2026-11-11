@@ -10,6 +10,7 @@
                프런트는 공급자 전환 시 대화를 초기화한다)."""
 
 import base64
+import json
 from typing import Any
 
 import anthropic
@@ -19,13 +20,26 @@ from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
+from app.core.chat_prompts import build_system_prompt
 from app.core.config import settings
-from app.mcp_server import mcp
+from app.mcp_server import CATEGORY_LABELS, mcp
 
 router = APIRouter()
 
 READ_PREFIXES = ("list_", "get_")
-MAX_TURNS = 6  # 도구 호출이 연쇄될 때 무한 루프 방지용 상한
+# list_*/get_* 패턴을 안 따르지만 부작용이 없는(데이터를 바꾸지 않는) 도구 — calculate는 순수 산술이라
+# list_cost_entries 조회 결과를 넘겨서 바로 계산해야 하는데, 승인 팝업이 뜨면 그 흐름이 끊긴다.
+# set_display_unit·set_labor_split은 이름이 set_*이지만 저장된 데이터를 전혀 건드리지 않는다 —
+# 화면의 표시 단위(K$ vs $)나 인건비 분해 줄의 펼침 여부만 바꾸는 도구라 승인 팝업 없이 바로
+# 실행한다(보는 방식을 바꾸는 데 매번 승인을 받으면, 숫자를 눈으로 비교하려는 흐름이 그때마다 끊긴다).
+SAFE_NON_PREFIXED_TOOLS = {"calculate", "combine_series", "set_display_unit", "set_labor_split"}
+# 데이터를 지우는 도구 — 쓰기 승인(한 번) 위에 "정말 지울까요?"를 한 번 더 받게 하려고 따로 표시한다.
+# 값을 덮어쓰는 upsert_*는 잘못돼도 다시 덮어쓰면 되지만, delete_*는 되돌릴 방법이 없어서 구분한다.
+DESTRUCTIVE_PREFIXES = ("delete_",)
+MAX_TURNS = 10  # 도구 호출이 연쇄될 때 무한 루프 방지용 상한. list_cost_across_labs 덕분에 "연구소
+# 수만큼 호출"은 더 이상 이 한도에 안 걸리지만(1번으로 끝남), list+combine_series+upsert처럼 여러
+# 단계가 겹치는 요청엔 여전히 여유가 필요해 6에서 10으로 올렸다 — 그래도 모자라면(값을 못 구하면)
+# 지어내지 말고 못 구했다고 답하게 시스템 프롬프트(규칙 7)로 막는다.
 
 
 class ChatMessage(BaseModel):
@@ -37,6 +51,10 @@ class PendingTool(BaseModel):
     tool_use_id: str
     name: str
     input: dict[str, Any]
+    # True면 프런트가 승인 버튼을 눌렀을 때 "정말 삭제하시겠습니까?"를 한 번 더 묻는다.
+    # 어느 도구가 파괴적인지는 서버가 정한다 — 화면마다 따로 판단하면 새 삭제 도구가 생겼을 때
+    # 한쪽만 고치고 다른 쪽을 빼먹기 쉽다.
+    destructive: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -67,7 +85,11 @@ class ProviderInfo(BaseModel):
 
 
 def _is_write_tool(name: str) -> bool:
-    return not name.startswith(READ_PREFIXES)
+    return not name.startswith(READ_PREFIXES) and name not in SAFE_NON_PREFIXED_TOOLS
+
+
+def _is_destructive_tool(name: str) -> bool:
+    return name.startswith(DESTRUCTIVE_PREFIXES)
 
 
 _tools_cache: list[Any] | None = None
@@ -81,61 +103,148 @@ async def _mcp_tools() -> list[Any]:
     return _tools_cache
 
 
-def _system_prompt(context: dict[str, Any]) -> str:
-    ctx_lines = "\n".join(f"- {k}: {v}" for k, v in context.items() if v not in (None, ""))
+# 프론트 화면 상태는 cur/prev/prior/plan이지만 MCP의 세분화 도구(list_cost_entries 등)는
+# forecast/actual만 받는다. 고정 매핑이라 모델에게 맡기지 않고 프론트(agChatCtx)가 미리 계산해
+# context의 version_api로 넣어준다. plan(경영계획)은 MCP 도구가 다루지 못해 매핑하지 않는다.
+#
+# 시스템 프롬프트(공통 규칙 + 계정 전용 규칙)는 app/core/chat_prompts.py가 갖고 있다 —
+# 계정이 늘어날 때 이 파일을 건드리지 않고 그쪽 ACCOUNT_RULES에 키만 추가하면 된다.
+
+
+def _parse_concat_json(text: str) -> list[Any]:
+    """도구 결과는 리스트 항목 하나당 content 파트가 하나씩 와서, 이어붙이면 "{...}{...}{...}"처럼
+    구분자 없는 JSON 객체 여러 개가 된다(배열이 아니다) — json.loads 한 번으로는 못 읽는다."""
+    decoder, items, idx, text = json.JSONDecoder(), [], 0, text.strip()
+    while idx < len(text):
+        obj, idx = decoder.raw_decode(text, idx)
+        items.append(obj)
+        while idx < len(text) and text[idx] in " \t\n\r":
+            idx += 1
+    return items
+
+
+async def _lab_mismatch_hint(args: dict[str, Any], context: dict[str, Any]) -> str | None:
+    """lab_pk로 조회했는데 결과가 비었고, 그 lab_pk가 화면에 떠 있는 연구소(lab_code)와 완전히 다른
+    실제 연구소를 가리킬 때(SIRC vs SARC처럼 이름이 비슷해 착각하기 쉬운 경우) 참고 문구를 만든다.
+    이 판정은 LLM의 추측이 아니라 list_labs로 확인한 사실이라, 프롬프트 설명 대신 코드로 고정한다."""
+    lab_pk = args.get("lab_pk")
+    ctx_lab_pk = context.get("lab_pk")
+    if not lab_pk or not ctx_lab_pk or lab_pk == ctx_lab_pk:
+        return None
+    lab_code, ctx_lab_code = str(lab_pk).split(":")[0], str(ctx_lab_pk).split(":")[0]
+    if lab_code == ctx_lab_code:
+        return None  # 같은 연구소의 다른 파트(SARC:CPU vs SARC:GPU)는 사용자가 명시적으로 고른 것 — 정상
+    try:
+        labs_result = await mcp.call_tool("list_labs", {})
+        labs = _parse_concat_json("".join(c.text for c in labs_result.content if hasattr(c, "text")))
+    except Exception:
+        return None
+    if not any(lab.get("lab_code") == lab_code for lab in labs):
+        return None  # 존재하지 않는 코드는 _check_lab_pk가 이미 400으로 걸러낸다
+    ctx_candidates = sorted({lab["pk"] for lab in labs if lab.get("lab_code") == ctx_lab_code})
     return (
-        "너는 S.LSI 예산관리 플랫폼의 데이터 비서다. 숫자나 사실을 지어내지 말고, "
-        "반드시 제공된 도구로 조회한 값만 근거로 답해라. 모르면 모른다고 답해라.\n\n"
-        f"사용자가 지금 보고 있는 화면:\n{ctx_lines or '(알 수 없음)'}\n\n"
-        "연구소/계정 관련 도구를 쓸 때 lab_pk 파라미터 규칙(중요, 반드시 지켜라):\n"
-        "1. 위 '현재 화면' 정보에 'lab_pk'로 시작하는 키가 있으면, 사용자가 다른 연구소 이름을 "
-        "명시적으로 말하지 않는 한 그 값을 lab_pk로 그대로 사용해라. list_labs로 다시 찾거나 "
-        "사용자에게 되묻지 마라 — 예를 들어 그 값이 'SARC:CPU'면 사용자가 'SARC'나 'SARC+AC'라고만 "
-        "말해도 바로 'SARC:CPU'를 써라.\n"
-        "2. lab_pk 값은 절대 네가 지어내지 마라(예: 'SARC+AC'를 'SARC:AC'로 바꿔치기 금지). "
-        "'현재 화면의 lab_pk'에도 없고 사용자가 말한 이름과도 안 맞으면 list_labs로 정확한 pk 목록을 "
-        "확인한 뒤 그 목록에 있는 값만 써라.\n"
-        "3. 도구의 version 파라미터(cur|prev|prior|plan)에는 '현재 화면' 정보의 'version' 키 값만 써라. "
-        "'ver' 키(예: '26.09 속보', '26.08 실적')는 사람이 화면에서 보는 라벨일 뿐 도구가 받는 값이 "
-        "아니다 — 'ver'를 version 파라미터에 그대로 넣지 마라. 'version' 키가 없으면 다른 값으로 "
-        "지어내지 말고 list_labs/list_lab_sheets 등으로 확인하거나 사용자에게 되물어라.\n"
-        "4. 반대로 사용자에게 결과를 말할 때는 cur/prev/prior/plan 같은 내부 코드를 그대로 노출하지 "
-        "마라 — 'cur'는 '현재 화면'의 'ver' 라벨(예: '26.09 속보')로, 'prev'는 '전실행'으로, "
-        "'prior'는 '전년 실적'으로, 'plan'은 '경영계획'으로 풀어서 말해라.\n"
-        "5. 도구의 year 파라미터에는 '현재 화면' 정보의 'year' 키 값을 써라(예: 2026). 'ver' 라벨에서 "
-        "연도를 직접 유추하지 말고, 'year' 키가 있으면 그 값을 그대로 써라. 'year' 키가 없는데 "
-        "연도가 필요하면 사용자에게 되물어라.\n"
-        "6. 추가 행/추가 열 도구(upsert_custom_row, list_custom_rows, delete_custom_row 등)의 "
-        "actual_thru_month 파라미터에는 '현재 화면' 정보의 'actual_thru_month' 키 값을 그대로 써라 — "
-        "생략하거나 추측하지 마라. 생략하면 화면이 실제 보고 있는 달과 다른 자리에 저장되어, 방금 "
-        "추가한 행이 사용자 화면에는 안 보이게 된다.\n"
-        "그 외(연구소를 특정할 필요 없는 값)도 위 '현재 화면' 정보를 기본값으로 쓰고, "
-        "거기에도 없는 값만 사용자에게 되물어라.\n\n"
-        "읽기 vs 쓰기 판단(중요, 반드시 지켜라):\n"
-        "'바꿔줘'·'수정해줘'·'넣어줘'·'적어줘'·'올려줘'·'지워줘' 같은 동사가 있으면 조회가 아니라 "
-        "변경 요청이다. 이때:\n"
-        "- 변경에 필요한 값(대상 월·금액·항목 등)이 문장에 다 있으면 반드시 해당 쓰기 도구"
-        "(upsert_*, record_*, delete_* 등)를 호출해라. list_*/get_*로 비슷한 값을 조회해서 "
-        "보여주는 것으로 때우지 마라 — 그건 사용자가 원한 변경을 안 한 것이다.\n"
-        "- 필요한 값이 하나라도 빠졌으면 절대 추측하지 말고, 아무 도구도 쓰지 말고 바로 "
-        "사용자에게 무엇이 부족한지 되물어라. 빠진 값 대신 비슷한 걸 조회해서 보여주고 끝내지 마라.\n"
-        "- 예외: upsert_custom_row로 '행 추가'만 할 때는 금액을 말 안 해도 되물지 말고 v를 전부 0으로 "
-        "비워서 바로 추가해라 — 화면의 '+행 추가' 버튼도 빈 행(0)부터 만들고 나중에 칸을 채우는 "
-        "방식이라, 행 추가 자체에는 금액이 필수가 아니다. 단, 이미 있는 값(기존 셀의 금액)을 "
-        "'바꿔달라'는 요청이면 이 예외가 아니라 위 규칙대로 금액을 반드시 되물어라.\n"
-        "- upsert_custom_row로 행을 추가할 때 사용자가 '~계정/~비용 아래에'처럼 위치를 지정하면, "
-        "그 계정에 맞는 anchor_key를 반드시 같이 넣어라(도구 설명의 유효값 목록 참고). 위치를 "
-        "말하지 않았으면 anchor_key는 생략해라(표 맨 끝에 붙는다).\n"
-        "- 쓰기 도구(upsert_*, record_*, delete_* 등)를 호출할 때는 그 호출과 같은 턴에 반드시 "
-        "짧은 한국어 문장 하나를 같이 말해라 — 무엇을 어디에 어떻게 바꾸려는지 사용자가 읽고 바로 "
-        "이해할 수 있게(예: \"SIRC 연구소 IT 관련 비용 아래에 '클라우드 사용료' 행을 2026년 "
-        "속보(9월 기준)로 추가하겠습니다. 금액은 모두 0으로 시작합니다.\"). anchor_key·"
-        "actual_thru_month·version 같은 내부 코드/파라미터 이름을 이 문장에 그대로 쓰지 마라 — "
-        "이 문장이 사용자가 승인 전에 보는 유일한 설명이다."
+        f"[시스템 참고] 화면은 '{ctx_lab_pk}'인데, 방금 조회한 '{lab_pk}'는 전혀 다른 연구소이고 "
+        f"결과가 비어 있다. 비슷한 이름의 다른 연구소를 착각했을 가능성이 높으니, 그냥 '없다'고만 "
+        f"답하지 말고 화면과 다르다는 점을 짚어서 되물어라. 화면 연구소('{ctx_lab_code}')의 실제 "
+        f"하위 후보: {', '.join(ctx_candidates)}."
     )
 
 
-async def _tool_result_text(name: str, args: dict[str, Any]) -> tuple[str, bool]:
+# 파생 행/열(다른 항목을 계산해 만든 값)을 추가하는 도구들 — '집계' 탭에서만 허용한다.
+_DERIVED_ADD_TOOLS = {"upsert_extra_row": "행", "upsert_extra_col": "열"}
+# 행·열을 지우는 도구들 — 서버가 "원시는 취합에서만, 파생은 집계에서만"을 검사하는데, 그 판단에
+# 필요한 현재 단계는 모델이 아니라 프런트가 보내준 context에 있다(아래 _inject_step 참고).
+_STEP_SCOPED_DELETE_TOOLS = {"delete_extra_row", "delete_extra_col"}
+
+
+def _derived_row_block_hint(name: str, args: dict[str, Any], context: dict[str, Any]) -> str | None:
+    """파생 행/열(is_derived=True, 다른 계정·월을 계산해 만든 값)은 사용자가 지금 '집계'
+    탭(화면 상단 진행 단계 표시의 짧은 이름 — 취합·집계·증감분석)을 보고 있을 때만 허용한다. 서버의
+    전역 진행 단계(account_progress)는 이 화면의 탭 전환과 동기화되지 않는 별개 개념이라(core.js의
+    S.ov.step 주석 참고) 그걸로는 판단할 수 없고, 프런트가 매 요청마다 보내주는 context['step']
+    (화면에 지금 보이는 탭 이름)으로만 판단할 수 있다 — 그래서 이 판정은 MCP 서버(REST API)가 아니라
+    context를 받는 여기(chat.py)에서 한다."""
+    what = _DERIVED_ADD_TOOLS.get(name)
+    if what is None or not args.get("is_derived"):
+        return None
+    if context.get("step") == "집계":
+        return None
+    return (
+        f"도구 실행 실패: 지금 화면 탭은 '{context.get('step') or '알 수 없음'}'이다. 다른 항목을 "
+        f"계산해 만든 파생 {what}은 '집계' 탭을 보고 있을 때만 추가할 수 있다. 재시도하지 "
+        "말고, '집계' 탭으로 이동한 뒤 다시 요청해달라고 사용자에게 설명해라."
+    )
+
+
+# 집계의 파생 행/열이 붙는 범위 — 연구소 하나가 아니라 "전체 연구소 합산"이다
+# (overseas.py의 ALL_SCOPE와 같은 값이어야 한다).
+ALL_SCOPE = "ALL"
+
+
+def _force_all_scope(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """파생 행/열의 lab_pk를 전체 합산 범위로 강제한다.
+
+    모델은 '현재 화면'의 lab_pk(예: SARC:CPU)를 기본값으로 쓰도록 배워서, 그냥 두면 파생 행을
+    연구소 하나에 붙인다. 그런데 집계 화면은 전체 합산만 보여주고 취합 화면은 파생 행을 걸러내므로,
+    그렇게 저장된 행은 화면 어디에도 안 나타난다 — 저장은 됐는데 안 보이는, 사용자가 가장
+    혼란스러워하는 상태가 된다. 비율을 연구소별로 따로 내서 더하면 뜻이 없다는 이유로 범위를
+    전체로 정했으니(인당인건비 = 전체 인건비 ÷ 전체 인력), 프롬프트로 부탁하는 대신 여기서 못을 박는다."""
+    if name not in _DERIVED_ADD_TOOLS or not args.get("is_derived"):
+        return args
+    return {**args, "lab_pk": ALL_SCOPE}
+
+
+def _inject_step(name: str, args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """삭제 도구에 현재 화면 단계를 끼워 넣는다. 서버는 "원시 행/열은 취합에서만, 파생은 집계에서만
+    지울 수 있다"를 이 값으로 검사하는데, 모델이 단계를 직접 채우게 하면 틀리거나 빼먹을 수 있다 —
+    프런트가 매 요청마다 보내주는 context['step']이 화면에 실제로 보이는 탭이라 그걸 그대로 쓴다."""
+    if name not in _STEP_SCOPED_DELETE_TOOLS:
+        return args
+    step = context.get("step")
+    return {**args, "step": step} if step else args
+
+
+def _is_empty_list_result(text: str) -> bool:
+    # 빈 리스트를 돌려주는 도구는 content 파트가 하나도 없어(text="") 조인 결과가 빈 문자열이 된다 —
+    # "[]" 텍스트가 오는 경우는 실제로 없지만 혹시 바뀌어도 깨지지 않게 둘 다 받아준다.
+    if text.strip() == "":
+        return True
+    try:
+        return json.loads(text) == []
+    except ValueError:
+        return False
+
+
+# 화면이 $ 단위로 보고 있을 때(context["usd_unit"] == "dollar") 금액을 받는 쓰기 도구들 — 그 금액은
+# 사용자가 화면에서 읽은 $ 값이라 1000으로 나눠 K$로 바꿔 저장해야 한다. 어느 인자가 금액인지만
+# 적어둔다(upsert_cost_extra의 value는 제외 — 추가 열은 사용자가 이름을 직접 붙이는 자유 칸이라
+# 금액이 아닐 수도 있고, 화면 입력칸도 K$ 환산 없이 그대로 쓴다).
+_USD_AMOUNT_ARGS = {"upsert_cost_entry": ("amount",), "upsert_extra_row": ("v",)}
+
+
+def _to_kdollar(name: str, args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """$ 단위로 보고 있는 화면에서 들어온 금액을 K$로 환산한다. 이 환산을 모델에게 맡기지 않고
+    코드에서 하는 이유: 모델이 나눗셈을 빼먹으면 1000배 큰 금액이 그대로 저장되고(되돌리려면 원래
+    값을 알아야 한다), 가벼운 모델일수록 '말한 숫자를 그대로 넘기기'보다 '나눠서 넘기기'를 더 자주
+    틀린다. 그래서 시스템 프롬프트는 '사용자가 말한 숫자를 그대로 넣어라'로 고정하고(규칙 9-1),
+    실제 환산은 여기서만 한다."""
+    if context.get("usd_unit") != "dollar":
+        return args
+    keys = _USD_AMOUNT_ARGS.get(name)
+    if not keys:
+        return args
+    out = dict(args)
+    for k in keys:
+        v = out.get(k)
+        if isinstance(v, list):
+            out[k] = [(x / 1000 if isinstance(x, (int, float)) else x) for x in v]
+        elif isinstance(v, (int, float)):
+            out[k] = v / 1000
+    return out
+
+
+async def _tool_result_text(name: str, args: dict[str, Any], context: dict[str, Any]) -> tuple[str, bool]:
+    args = _force_all_scope(name, _to_kdollar(name, _inject_step(name, args, context), context))
     try:
         result = await mcp.call_tool(name, args)
     except Exception as exc:
@@ -153,7 +262,90 @@ async def _tool_result_text(name: str, args: dict[str, Any]) -> tuple[str, bool]
             return f"도구 실행 실패 ({cause.response.status_code}): {detail}", True
         return f"도구 실행 중 오류: {cause}", True
     text = "".join(c.text for c in result.content if hasattr(c, "text"))
+    if name.startswith("list_") and "lab_pk" in args and _is_empty_list_result(text):
+        hint = await _lab_mismatch_hint(args, context)
+        if hint:
+            text = f"{text}\n\n{hint}"
     return text, bool(result.is_error)
+
+
+# list_memo_cols 등 화면 코드(cur/prev/prior/plan)와 list_cost_entries 등 API 코드(forecast/actual)를
+# 섞어 쓰는 쓰기 도구들이 있어, 사람이 보는 설명 문장에서는 둘 다 알아듣게 라벨을 붙인다.
+_VERSION_LABELS = {"forecast": "속보", "actual": "실적", "cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}
+
+
+def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
+    """모델이 쓰기 도구 호출과 같은 턴에 설명 문장을 빼먹었을 때 쓰는 대체 문장. 시스템 프롬프트가
+    이 문장을 요구하지만 지키라고 "말"만 하는 거라 모델이(특히 가벼운 모델일수록) 종종 빼먹는다 —
+    그때도 사용자가 내용 없이 승인 버튼만 보는 일이 없도록 도구 이름·인자에서 기계적으로 만들어
+    채운다. 모델이 이미 문장을 냈으면 이 함수는 호출되지 않는다(아래 호출부에서 note 없을 때만 씀)."""
+    g = args.get
+    v = _VERSION_LABELS.get(g("version"), g("version"))
+    if name == "upsert_cost_entry":
+        category = CATEGORY_LABELS.get(g("category_key"), g("category_key"))
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')}) {category} 항목 {g('month')}월 금액을 {g('amount')}로 변경합니다."
+    if name == "upsert_extra_row":
+        anchor = CATEGORY_LABELS.get(g("anchor_key"), g("anchor_key"))
+        where = f" ('{anchor}' 아래)" if g("anchor_key") else ""
+        if g("is_derived"):
+            # 파생 행은 숫자가 아니라 계산식을 저장한다 — 승인 전 설명도 "무엇으로 계산하는 행인지"를
+            # 보여줘야 사용자가 무엇에 동의하는지 안다(operands는 코드가 아니라 한글명으로 풀어서).
+            formula = g("formula") or {}
+            materials = " · ".join(CATEGORY_LABELS.get(k, k) for k in formula.get("operands", []))
+            how = "합계" if formula.get("op") == "sum_elementwise" else "나눈 값"
+            return (
+                f"전체 연구소 합산 기준 {v}({g('yyyymm')})에 '{g('label')}' 행을 추가합니다{where} — "
+                f"{materials}을(를) 월별로 {how}으로 계산합니다(원본이 바뀌면 자동으로 다시 계산됩니다)."
+            )
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')})에 '{g('label')}' 행을 추가/수정합니다{where}."
+    if name == "upsert_extra_col":
+        if g("is_derived"):
+            formula = g("formula") or {}
+            months = formula.get("months", [])
+            how = "합계" if formula.get("op") == "sum_months" else "평균"
+            when = "+".join(f"{m}월" for m in months)
+            return (
+                f"전체 연구소 합산 기준 {v}({g('yyyymm')})에 '{g('label')}' 열을 추가합니다 — "
+                f"각 행의 {when}을 {how}으로 계산합니다(원본이 바뀌면 자동으로 다시 계산됩니다)."
+            )
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')})에 '{g('label')}' 열을 추가합니다."
+    if name == "delete_extra_row":
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')}) 추가 행을 삭제합니다."
+    if name == "upsert_cost_extra":
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')})에 '{g('label')}' 열을 추가/수정합니다."
+    if name == "delete_extra_col":
+        return f"{g('lab_pk')} 연구소의 {v} 기준({g('yyyymm')}) '{g('label')}' 열을 삭제합니다."
+    if name == "upsert_note":
+        category = CATEGORY_LABELS.get(g("category_key"), g("category_key"))
+        return f"{g('lab_scope')}의 {category} 증감분석 비고를 저장합니다: \"{g('note_text')}\""
+    if name == "upsert_memo_col":
+        return f"{g('lab_pk')} 연구소의 {v} 기준에 메모 열 '{g('label')}'을 추가/수정합니다."
+    if name == "delete_memo_col":
+        return f"{g('lab_pk')} 연구소의 {v} 기준 메모 열을 삭제합니다."
+    if name == "upsert_memo":
+        return f"{g('lab_pk')} 연구소의 {v} 기준 메모를 저장합니다: \"{g('text')}\""
+    if name == "upsert_sheet_row":
+        return f"{g('lab_pk')} 연구소의 {v} 기준 시트 행을 추가/수정합니다."
+    if name == "delete_sheet_row":
+        return f"{g('lab_pk')} 연구소의 {v} 기준 시트 행을 삭제합니다."
+    if name == "update_step":
+        return f"편성 진행 단계를 {g('step')}단계로 변경합니다."
+    if name == "upsert_common_code":
+        return f"공통코드 '{g('group_code')}/{g('code')}'를 추가/수정합니다: {g('name')}"
+    if name == "delete_common_code":
+        return f"공통코드 '{g('group_code')}/{g('code')}'를 삭제합니다."
+    if name == "record_upload":
+        return f"{g('lab_pk')} 연구소에 업로드 이력 '{g('filename')}'을 기록합니다."
+    if name == "open_version":
+        return f"{g('year')}년 {g('month')}월 {_VERSION_LABELS.get(g('kind'), g('kind'))} 버전을 새로 엽니다(작성중)."
+    if name == "update_version_status":
+        kind = _VERSION_LABELS.get(g("kind"), g("kind"))
+        what = "완료(확정)로" if g("status") == "done" else "작성중으로(완료 취소)"
+        return f"{g('year')}년 {g('month')}월 {kind} 버전을 {what} 바꿉니다."
+    if name == "delete_sheet_rows_all":
+        v = _VERSION_LABELS.get(g("version"), g("version"))
+        return f"{g('lab_pk')} 연구소의 {v} 기준 '{g('sheet_key')}' 시트 행을 전부 삭제합니다."
+    return None  # 알 수 없는 도구(새로 추가된 쓰기 도구 등)는 모델이 낸 설명이 없으면 그냥 없는 채로 둔다
 
 
 def _tool_result_message(provider: str, tool_use_id: str, text: str, is_error: bool) -> dict[str, Any]:
@@ -210,7 +402,7 @@ async def _run_turn_anthropic(messages: list[dict[str, Any]], context: dict[str,
         resp = await client.messages.create(
             model=settings.anthropic_model,
             max_tokens=1024,
-            system=_system_prompt(context),
+            system=build_system_prompt(context),
             messages=messages,
             tools=await _anthropic_tools(),
         )
@@ -227,22 +419,31 @@ async def _run_turn_anthropic(messages: list[dict[str, Any]], context: dict[str,
         return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=text)
 
     if _is_write_tool(tool_use.name):
+        block_hint = _derived_row_block_hint(tool_use.name, tool_use.input, context)
+        if block_hint is not None:
+            if depth >= MAX_TURNS:
+                return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
+            messages = messages + [_tool_result_message("anthropic", tool_use.id, block_hint, True)]
+            return await _run_turn_anthropic(messages, context, depth + 1)
         note = "".join(b.text for b in resp.content if b.type == "text")
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
-            reply=note or None,
-            pending=PendingTool(tool_use_id=tool_use.id, name=tool_use.name, input=tool_use.input),
+            reply=note or _default_write_note(tool_use.name, tool_use.input),
+            pending=PendingTool(
+                tool_use_id=tool_use.id, name=tool_use.name, input=tool_use.input,
+                destructive=_is_destructive_tool(tool_use.name),
+            ),
         )
 
     if depth >= MAX_TURNS:
-        text, _ = await _tool_result_text(tool_use.name, tool_use.input)
+        text, _ = await _tool_result_text(tool_use.name, tool_use.input, context)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
             reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
         )
 
     # 읽기 도구는 사람 확인 없이 바로 실행하고, 결과를 다시 모델에 넣어 다음 턴을 이어간다.
-    result_text, is_error = await _tool_result_text(tool_use.name, tool_use.input)
+    result_text, is_error = await _tool_result_text(tool_use.name, tool_use.input, context)
     messages = messages + [_tool_result_message("anthropic", tool_use.id, result_text, is_error)]
     return await _run_turn_anthropic(messages, context, depth + 1)
 
@@ -266,7 +467,7 @@ async def _run_turn_ollama(messages: list[dict[str, Any]], context: dict[str, An
                 json={
                     "model": settings.ollama_model,
                     "stream": False,
-                    "messages": [{"role": "system", "content": _system_prompt(context)}] + messages,
+                    "messages": [{"role": "system", "content": build_system_prompt(context)}] + messages,
                     "tools": await _ollama_tools(),
                 },
             )
@@ -296,20 +497,28 @@ async def _run_turn_ollama(messages: list[dict[str, Any]], context: dict[str, An
     call_id = call.get("id") or name
 
     if _is_write_tool(name):
+        block_hint = _derived_row_block_hint(name, args, context)
+        if block_hint is not None:
+            if depth >= MAX_TURNS:
+                return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
+            messages = messages + [_tool_result_message("ollama", call_id, block_hint, True)]
+            return await _run_turn_ollama(messages, context, depth + 1)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
-            reply=msg.get("content") or None,
-            pending=PendingTool(tool_use_id=call_id, name=name, input=args),
+            reply=msg.get("content") or _default_write_note(name, args),
+            pending=PendingTool(
+                tool_use_id=call_id, name=name, input=args, destructive=_is_destructive_tool(name)
+            ),
         )
 
     if depth >= MAX_TURNS:
-        text, _ = await _tool_result_text(name, args)
+        text, _ = await _tool_result_text(name, args, context)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
             reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
         )
 
-    result_text, is_error = await _tool_result_text(name, args)
+    result_text, is_error = await _tool_result_text(name, args, context)
     messages = messages + [_tool_result_message("ollama", call_id, result_text, is_error)]
     return await _run_turn_ollama(messages, context, depth + 1)
 
@@ -377,7 +586,7 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
             model=settings.gemini_model,
             contents=_messages_to_gemini_contents(messages),
             config=genai_types.GenerateContentConfig(
-                system_instruction=_system_prompt(context),
+                system_instruction=build_system_prompt(context),
                 tools=[await _gemini_tool()],
                 automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
                 thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
@@ -397,25 +606,38 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
         # thought=True part는 모델의 내부 추론(사고 과정)이다 — 최종 답변이 아니라 그냥 흘려보내면
         # 안 되므로 반드시 제외하고 합친다.
         text = "".join(p.text for p in parts if p.text and not p.thought)
+        if not text.strip():
+            # Gemini가 과부하 등으로 함수 호출도 텍스트도 없는 빈 응답을 줄 때가 있다 — 그걸 그대로
+            # reply=""로 돌려주면 사용자 눈에는 "아무 반응도 없는" 것처럼 보인다. 빈 응답 대신 분명한
+            # 에러 문구를 돌려줘서 재시도하라는 걸 알 수 있게 한다.
+            text = "모델이 빈 응답을 반환했습니다(일시적인 과부하일 수 있습니다). 다시 시도해 주세요."
         return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=text)
 
     name, args = fn_call.name, dict(fn_call.args or {})
     if _is_write_tool(name):
+        block_hint = _derived_row_block_hint(name, args, context)
+        if block_hint is not None:
+            if depth >= MAX_TURNS:
+                return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
+            messages = messages + [_tool_result_message("gemini", name, block_hint, True)]
+            return await _run_turn_gemini(messages, context, depth + 1)
         note = "".join(p.text for p in parts if p.text and not p.thought)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
-            reply=note or None,
-            pending=PendingTool(tool_use_id=name, name=name, input=args),
+            reply=note or _default_write_note(name, args),
+            pending=PendingTool(
+                tool_use_id=name, name=name, input=args, destructive=_is_destructive_tool(name)
+            ),
         )
 
     if depth >= MAX_TURNS:
-        text, _ = await _tool_result_text(name, args)
+        text, _ = await _tool_result_text(name, args, context)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
             reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
         )
 
-    result_text, is_error = await _tool_result_text(name, args)
+    result_text, is_error = await _tool_result_text(name, args, context)
     messages = messages + [_tool_result_message("gemini", name, result_text, is_error)]
     return await _run_turn_gemini(messages, context, depth + 1)
 
@@ -450,7 +672,7 @@ async def chat_confirm(body: ConfirmRequest) -> ChatResponse:
     provider = _resolve_provider(body.provider)
     messages = [m.model_dump() for m in body.messages]
     if body.approved:
-        result_text, is_error = await _tool_result_text(body.pending.name, body.pending.input)
+        result_text, is_error = await _tool_result_text(body.pending.name, body.pending.input, body.context)
     else:
         result_text, is_error = "사용자가 이 작업을 취소했습니다.", True
     messages = messages + [_tool_result_message(provider, body.pending.tool_use_id, result_text, is_error)]

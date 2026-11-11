@@ -35,22 +35,37 @@ const PLAN_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/mana
 <script src="shared/core.js"></script>
 ```
 
-**실제로 `fetch`하는 경로는 이 5개뿐이다** (base: `/api/v1`):
+**실제로 `fetch`하는 경로는 이것들이다** (base: `/api/v1`):
 
 | 호출부 (core.js) | 엔드포인트 | 시점 |
 |---|---|---|
 | `ovApiLoad` / `ovApiFlush` | `GET/PUT /overseas/state` | 로드 시 1회 / 단계전환·블러 시 |
 | `ovLabsApiLoad` / `ovLabsApiFlush` | `GET/PUT /overseas/labs` | 로드 시 / 연구소 기준정보 저장 시 |
 | `ovUploadRaw` | `POST /overseas/uploads/file` | 엑셀 업로드할 때마다(파싱 성패 무관, fire-and-forget) |
+| (추가 행 조회/저장/삭제) | `GET/PUT/DELETE /overseas/extra-rows` | 사용자가 행 추가·수정·삭제할 때 |
+| (추가 열 조회/삭제) | `GET/DELETE /overseas/extra-cols` | 추가 열 목록 조회·열 삭제 시 |
+| (추가 열 값 조회/저장) | `GET/PUT /overseas/cost-extras` | 추가 열 칸 값 입력 시 |
+| (고정 비용항목 코드 조회) | `GET /common-codes?group_code=OVERSEAS_CATEGORY` | 로드 시 |
+| `ovCostApiBatch` | `PUT /cost-entries/batch` | `/overseas/state` 저장과 같은 시점에 **병행 저장**(중복, 아래 참고) |
 | `fxApiLoad` / `fxApiFlush` | `GET/PUT /fx/state` | 로드 시 / 환율 저장 시 |
+| `verApi*` | `GET/POST/PUT/DELETE /versions` | 연월×속보·실적 버전 열기·완료·삭제 시 |
 | `verPlanApi*` | `GET/POST/PUT/DELETE /management-plan/versions` | 경영계획 버전(P00~) 만들기·확정·삭제 시 |
 
-**`/management-plan/entries`는 아직 안 붙어 있다** — core.js 주석(3636~3637줄)에 그대로 적혀 있듯,
-경영계획 "버전 목록"만 `/management-plan/versions`로 동기화하고, 실제 금액은 여전히
-`/overseas/state`의 `cost_entries`(version="plan") 슬롯을 그대로 쓴다.
+**`ovCostApiBatch`는 중복 저장이다** — `overseas_cost_entries` 테이블이 있던 시절, 공용 테이블
+(`cost_entries`)로 데이터를 옮기는 동안 "새 테이블에도 같이 쌓기"용으로 넣은 병행 호출인데, 지금은
+`/overseas/state` 저장 로직이 이미 `cost_entries`/`cost_entry_details`에 직접 쓰기 때문에 같은 행을
+두 경로로 중복 upsert하는 셈이다. API.md 참고.
 
-**위 5개 외의 `/overseas/*` 엔드포인트**(`custom-rows`, `memo-cols`, `memos`, `sheet-rows`, `notes`,
-`fx-rates`, `cost-entries`)는 화면에 전용 버튼이 없고, **AI 플로팅 챗봇을 통해서만** 호출된다 — 4절 참고.
+**`/management-plan/entries`는 아직 안 붙어 있다** — core.js 주석에 그대로 적혀 있듯, 경영계획
+"버전 목록"만 `/management-plan/versions`로 동기화하고, 실제 금액은 여전히 `/overseas/state`의
+`cost_entries`(version="plan") 슬롯을 그대로 쓴다.
+
+**외주용역 시트**는 `/overseas/state`의 `vendor` 필드로 연구소×버전 단위 전체 교체로 저장되고,
+DB는 마스터(`overseas_vendor_rows`) + 월별 디테일(`overseas_vendor_row_details`)로 나뉘어 있다
+(`cost_entries`/`cost_entry_details`와 같은 모양). 증감사유는 `reason` 필드 ↔ `overseas_reason_rows`.
+
+**위 외의 `/overseas/*` 엔드포인트**(`memo-cols`, `memos`, `sheet-rows`, `notes`, `cost-entries`,
+`lab-sheets`, `step`)는 화면에 전용 버튼이 없고, **AI 플로팅 챗봇을 통해서만** 호출된다 — 4절 참고.
 
 ### 2-2. `frontend` (React/Vite) — 백엔드 미연결
 
@@ -91,10 +106,10 @@ allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?"  # 로컬 개발 �
 두 가지 경로로 같은 MCP 도구 세트(`app/mcp_server.py`)가 쓰인다. 어느 쪽이든 **MCP 서버는 DB에 직접
 접근하지 않고, 백엔드 HTTP API(`/api/v1/...`)를 호출하는 얇은 어댑터**라는 점이 동일하다.
 
-이 도구 세트가 `/overseas/*`의 거의 모든 엔드포인트(`custom-rows`, `memo-cols`, `memos`, `sheet-rows`,
-`notes`, `fx-rates`, `cost-entries`, `uploads`, `labs`, `lab-sheets`, `step`)와 `/common-codes`,
-`/errors`까지를 다 덮는다 — 즉 **2-1에서 설명한 화면 버튼 5개보다 실제 API 커버리지가 훨씬 넓고**, 그
-나머지는 전부 챗봇을 거쳐야만 호출된다.
+이 도구 세트가 `/overseas/*`의 거의 모든 엔드포인트(`extra-rows`, `memo-cols`, `memos`, `sheet-rows`,
+`notes`, `cost-entries`, `uploads`, `labs`, `lab-sheets`, `step`)와 `/common-codes`, `/errors`까지를
+다 덮는다 — 즉 **2-1에서 설명한 화면 버튼보다 실제 API 커버리지가 훨씬 넓고**, 화면에 없는 나머지는
+전부 챗봇을 거쳐야만 호출된다.
 
 ### 4-1. 외부 MCP 클라이언트 (Claude Code/Desktop 등) — stdio
 
@@ -122,8 +137,26 @@ import해서 `mcp.list_tools()` / `mcp.call_tool()`을 직접 호출한다(4-1�
 
 - 읽기 도구(`list_*`, `get_*`)는 바로 실행.
 - 쓰기 도구(`upsert_*`, `record_*`, `update_*`, `delete_*`)는 `/chat/confirm`으로 사람이 승인해야 실행된다.
+- `calculate` · `combine_series` · `set_display_unit`은 이 이름 규칙을 안 따르지만 데이터를 바꾸지 않아
+  승인 없이 바로 실행된다(`chat.py`의 `SAFE_NON_PREFIXED_TOOLS`).
+
+**시스템 프롬프트는 2층**(`chat.py`의 `_COMMON_RULES` + `_ACCOUNT_RULES`): 계정 무관 공통 규칙에,
+지금 보고 있는 계정(`context.key`)의 전용 규칙만 골라 붙인다. 해외연구소 화면은 약 10,500자, 다른
+계정 화면은 약 6,200자가 된다. 계정이 늘면 `_ACCOUNT_RULES`에 그 계정 블록만 추가하면 된다.
+
+**어느 도구를 쓸지(행이냐 열이냐, 연구소냐 행이냐 같은 구분)는 프롬프트가 아니라 도구 설명
+(`mcp_server.py`의 `description`)에 적는다** — 4-1의 외부 MCP 클라이언트는 이 프롬프트 없이 도구만
+받기 때문에, 도구 사용법을 `chat.py`에만 적으면 그쪽에서는 적용되지 않는다. 프롬프트에는 화면 정보
+해석(`ref_tab`이면 기준정보 화면 등)처럼 특정 도구에 매달 수 없는 것만 남긴다.
+
+**표시 단위(K$ ↔ $)**: "K$ 말고 $로 보여줘"는 `set_display_unit` 도구 호출 하나로 끝나고 DB는 건드리지
+않는다 — 저장값은 언제나 K$다. 프론트(`core.js`의 `OV_USD_UNIT`)가 해외연구소 표의 달러 칸만 1000배 해서
+그리고, 지금 어느 단위로 보고 있는지를 매 요청 `context.usd_unit`으로 돌려보낸다. $ 단위로 보는 중에
+사용자가 말한 금액을 저장할 때는 모델이 아니라 서버(`chat.py`의 `_to_kdollar`)가 1000으로 나눠 K$로
+넣는다 — 모델에게 나눗셈을 맡기면 빼먹었을 때 1000배 큰 금액이 그대로 저장되기 때문이다.
+`OV_USD_UNIT`은 `S`(localStorage)에 저장하지 않아서 새로고침하면 K$ 표시로 돌아간다.
 
 **주의**: 이 승인 게이트가 있어도 "테스트로 한번 해볼게요" 같은 대화로 더미 데이터가 실제로 저장될 수
-있다 — 2026-11-04에 `error_logs`/`fx_applied_rates`(수동 API 테스트)와 `memos`/`memo_cols`/`notes`/
-`custom_rows`(챗봇으로 넣은 "테스트 메모"·"테스트 사유"·중복 더미 행)에서 실제로 발견되어 정리했다.
+있다 — 2026-11-04에 `error_logs`/`fx_applied_rates`(수동 API 테스트)와 `memos`/`memo_cols`/
+`notes`(챗봇으로 넣은 "테스트 메모"·"테스트 사유"·중복 더미 행)에서 실제로 발견되어 정리했다.
 운영 전환 시 이 경로로 들어간 데이터를 주기적으로 점검할 것.

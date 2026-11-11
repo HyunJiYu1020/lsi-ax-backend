@@ -16,7 +16,7 @@ class CommonCodeGroup(Base):
     __table_args__ = {"comment": "공통코드 그룹 레지스트리. common_codes.group_code가 FK로 참조한다."}
 
     group_code: Mapped[str] = mapped_column(
-        String(40), primary_key=True, comment='그룹코드 ("VERSION", "FX_RATE_TYPE", "ACCOUNT_STATUS", ...)'
+        String(40), primary_key=True, comment='그룹코드 ("ACCOUNT_STATUS", "VERSION_STATUS", "OVERSEAS_CATEGORY", ...)'
     )
     name: Mapped[str] = mapped_column(String(100), comment="그룹명 (한글)")
     description: Mapped[str | None] = mapped_column(Text, comment="설명")
@@ -29,14 +29,14 @@ class CommonCode(Base):
     __tablename__ = "common_codes"
     __table_args__ = (
         UniqueConstraint("group_code", "code"),
-        {"comment": "전사 공통코드(코드그룹×코드값). 버전·환율종류·통화·부서코드·계정과목 등."},
+        {"comment": "전사 공통코드(코드그룹×코드값). 계정 상태·버전 상태·해외연구소 비용항목·시트 종류 등."},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     group_code: Mapped[str] = mapped_column(
         String(40),
         ForeignKey("common_code_groups.group_code"),
-        comment='코드그룹 ("VERSION", "FX_RATE_TYPE", "DEPT", ...)',
+        comment='코드그룹 ("ACCOUNT_STATUS", "VERSION_STATUS", "OVERSEAS_CATEGORY", ...)',
     )
     code: Mapped[str] = mapped_column(String(40), comment="코드값")
     name: Mapped[str] = mapped_column(String(100), comment="코드명(한글)")

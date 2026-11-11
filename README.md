@@ -35,6 +35,25 @@ uv run alembic upgrade head
 uv run python -m app.db.seed
 ```
 
+해외연구소 편성의 "증감사유 · 외주용역" 시트는 화면 확인용 예시 데이터를 따로 만든다 — 비용 시트
+(`cost_entries`)의 금액에서 사유 문장과 외주용역 상세(업체·과제별 월 금액)를 만들어 채우므로,
+비용 데이터가 먼저 들어 있어야 한다. 재실행하면 같은 값으로 다시 채운다(결정적).
+
+```bash
+uv run python -m app.db.seed_overseas_sheets
+```
+
+## 버전 값 체계 (주의)
+
+같은 "버전"인데 테이블마다 값이 다르다 — 섞어 쓰면 조회가 비게 된다.
+
+- `cost_entries` · `extra_cols`: `forecast`(속보) | `actual`(실적) + `yyyymm`(편성 기준 연월)
+- `overseas_reason_rows` · `overseas_vendor_rows` · `uploads` · `memo_cols` · `memos` · `notes` ·
+  `sheet_rows`: `cur`(당월 속보) | `prev`(전실행) | `prior`(전년 실적) | `plan`(경영계획)
+
+프론트는 화면 상태로 `cur/prev/prior/plan`을 쓰고, 비용 API를 부를 때만 `ovVerApi`/`ovYyyymmApi`로
+`forecast|actual` + `yyyymm`으로 바꿔 보낸다. 챗봇도 같은 규칙을 프롬프트로 지시받는다.
+
 ## Docker로 전체(API + Postgres) 띄우기
 
 프로젝트 루트에서:
@@ -49,12 +68,13 @@ docker compose up --build
 - `app/core/config.py` — 환경변수 설정 (pydantic-settings)
 - `app/db/session.py` — SQLAlchemy engine/세션, `Base`
 - `app/db/seed.py` — 초기 데이터 시드 스크립트
+- `app/db/seed_overseas_sheets.py` — 해외연구소 증감사유 · 외주용역 시트의 예시 데이터 생성·적재
 - `app/api/v1/` — API 라우터: `overseas`(해외연구소), `fx`(전사 공통 환율), `plan`(경영계획 버전),
   `system`(공통코드·에러로그), `chat`(AI 플로팅 채팅), `health`
 - `app/mcp_server.py` — MCP 도구 세트. 외부 MCP 클라이언트와 `chat.py` 양쪽에서 재사용 (CONNECTIONS.md 4절)
 - `app/models/` — SQLAlchemy 모델: `account`(19개 계정), `common`(19개 계정 공유 범용 테이블:
-  `cost_entries`/`cost_entry_months`/`custom_rows`/`memo_cols`/`memos`/`notes`/`sheet_rows`/`uploads`),
-  `overseas`(해외연구소 전용), `fx`(전사 공통 환율 3종 + 적용환율 캐시), `plan`(경영계획 버전),
+  `cost_entries`/`cost_entry_details`/`extra_cols`/`memo_cols`/`memos`/`notes`/`sheet_rows`/`uploads`),
+  `overseas`(해외연구소 전용: 연구소·시트 기준정보, 증감사유, 외주용역, CP 계약), `fx`(전사 공통 환율 3종 + 적용환율 캐시), `plan`(경영계획 버전),
   `system`(공통코드·에러로그), `user`
 - `alembic/` — DB 마이그레이션
 

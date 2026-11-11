@@ -10,6 +10,9 @@ class CodeGroup(str, Enum):
 
     ACCOUNT_STATUS = "ACCOUNT_STATUS"
     OVERSEAS_SHEET_TYPE = "OVERSEAS_SHEET_TYPE"
+    OVERSEAS_CATEGORY = "OVERSEAS_CATEGORY"
+    VERSION_STATUS = "VERSION_STATUS"
+    OVERSEAS_FX_RULE = "OVERSEAS_FX_RULE"
 
 
 class AccountStatus(str, Enum):
@@ -30,3 +33,14 @@ class OverseasSheetType(str, Enum):
     COST = "cost"
     VARIANCE = "variance"
     VENDOR = "vendor"
+
+
+class VersionStatus(str, Enum):
+    """common_codes(group_code=VERSION_STATUS)의 code 값. versions.status에 저장된다.
+    not_started는 실제로는 저장되지 않는다 — 그 연월 버전이 아직 열리지 않았으면 행 자체가 없는
+    것으로 "예정"을 나타내기 때문(versions 테이블 코멘트 참고). 그래도 화면에 보일 라벨이 필요해
+    공통코드에는 셀렉트 옵션용으로 남겨둔다."""
+
+    NOT_STARTED = "not_started"
+    DRAFTING = "drafting"
+    DONE = "done"

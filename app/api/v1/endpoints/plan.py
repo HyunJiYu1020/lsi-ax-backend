@@ -1,12 +1,12 @@
-from datetime import date, datetime
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models import ManagementPlanEntry, ManagementPlanVersion
+from app.models import ManagementPlanEntry, ManagementPlanEntryDetail, ManagementPlanVersion
 from app.schemas.plan import PlanEntryIn, PlanEntryOut, PlanVersionIn, PlanVersionOut, PlanVersionUpdate
 
 router = APIRouter()
@@ -18,8 +18,18 @@ def _version_out(v: ManagementPlanVersion) -> PlanVersionOut:
     )
 
 
-def _entry_months(entry: ManagementPlanEntry) -> list[float]:
-    return [float(getattr(entry, f"month{m}")) for m in range(1, 13)]
+def _entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list[float]]:
+    """엔트리별 월 값을 한 번의 쿼리로 모아 돌려준다 (호출부가 엔트리마다 따로 조회하지 않도록)."""
+    if not entry_ids:
+        return {}
+    by_entry: dict[int, dict[int, float]] = {}
+    for r in db.scalars(
+        select(ManagementPlanEntryDetail).where(
+            ManagementPlanEntryDetail.plan_entry_id.in_(entry_ids), ManagementPlanEntryDetail.period_type == "MONTH"
+        )
+    ):
+        by_entry.setdefault(r.plan_entry_id, {})[r.period] = float(r.amount)
+    return {eid: [by_entry.get(eid, {}).get(m, 0.0) for m in range(1, 13)] for eid in entry_ids}
 
 
 @router.get("/management-plan/versions", response_model=list[PlanVersionOut])
@@ -57,9 +67,11 @@ def update_plan_version(
     v.is_confirmed = body.is_confirmed
     v.is_final = body.is_final
     if body.is_final:
-        db.query(ManagementPlanVersion).filter(
-            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no != plan_no
-        ).update({"is_final": False})
+        db.execute(
+            update(ManagementPlanVersion)
+            .where(ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no != plan_no)
+            .values(is_final=False)
+        )
     db.commit()
     return _version_out(v)
 
@@ -71,9 +83,11 @@ def delete_plan_version(year: int, plan_no: str, db: Session = Depends(get_db)) 
         raise HTTPException(status_code=404, detail=f"버전을 찾을 수 없습니다: {year}-{plan_no}")
     if v.is_confirmed:
         raise HTTPException(status_code=400, detail="확정된 버전은 삭제할 수 없습니다. 먼저 확정을 취소하세요.")
-    db.query(ManagementPlanEntry).filter(
-        ManagementPlanEntry.year == year, ManagementPlanEntry.plan_no == plan_no
-    ).delete()
+    db.execute(
+        delete(ManagementPlanEntry).where(
+            ManagementPlanEntry.year == year, ManagementPlanEntry.plan_no == plan_no
+        )
+    )
     db.delete(v)
     db.commit()
     return {"status": "ok"}
@@ -94,23 +108,25 @@ def list_plan_entries(
     if plan_no:
         stmt = stmt.where(ManagementPlanEntry.plan_no == plan_no)
     if account_key:
-        stmt = stmt.where(ManagementPlanEntry.account_key == account_key)
+        stmt = stmt.where(ManagementPlanEntry.account_code == account_key)
     if scope_key:
-        stmt = stmt.where(ManagementPlanEntry.scope_key == scope_key)
+        stmt = stmt.where(ManagementPlanEntry.scope_code == scope_key)
     if category_key:
-        stmt = stmt.where(ManagementPlanEntry.category_key == category_key)
+        stmt = stmt.where(ManagementPlanEntry.category_code == category_key)
+    entries = list(db.scalars(stmt))
+    months_by_entry = _entry_months_bulk(db, [e.id for e in entries])
     return [
         PlanEntryOut(
-            account_key=e.account_key,
-            scope_key=e.scope_key,
+            account_key=e.account_code,
+            scope_key=e.scope_code,
             year=e.year,
             plan_no=e.plan_no,
-            category_key=e.category_key,
+            category_key=e.category_code,
             month=m,
             amount=amount,
         )
-        for e in db.scalars(stmt)
-        for m, amount in enumerate(_entry_months(e), start=1)
+        for e in entries
+        for m, amount in enumerate(months_by_entry[e.id], start=1)
     ]
 
 
@@ -121,19 +137,27 @@ def upsert_plan_entry(body: PlanEntryIn, db: Session = Depends(get_db)) -> PlanE
         raise HTTPException(status_code=400, detail=f"알 수 없는 경영계획 버전입니다: {body.year}-{body.plan_no}")
     if v.is_confirmed:
         raise HTTPException(status_code=400, detail="확정된 버전은 수정할 수 없습니다. 먼저 확정을 취소하세요.")
-    col = f"month{body.month}"
     stmt = pg_insert(ManagementPlanEntry).values(
-        account_key=body.account_key,
-        scope_key=body.scope_key,
-        year=body.year,
-        plan_no=body.plan_no,
-        category_key=body.category_key,
-        **{col: body.amount},
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["account_key", "scope_key", "year", "plan_no", "category_key"],
-        set_={col: getattr(stmt.excluded, col), "updated_at": datetime.utcnow()},
+        account_code=body.account_key, scope_code=body.scope_key, year=body.year, plan_no=body.plan_no,
+        category_code=body.category_key,
+    ).on_conflict_do_nothing(
+        index_elements=["account_code", "scope_code", "category_code", "year", "plan_no"]
     )
     db.execute(stmt)
+    entry_id = db.scalar(
+        select(ManagementPlanEntry.id).where(
+            ManagementPlanEntry.account_code == body.account_key, ManagementPlanEntry.scope_code == body.scope_key,
+            ManagementPlanEntry.category_code == body.category_key, ManagementPlanEntry.year == body.year,
+            ManagementPlanEntry.plan_no == body.plan_no,
+        )
+    )
+    s2 = pg_insert(ManagementPlanEntryDetail).values(
+        plan_entry_id=entry_id, year=body.year, period_type="MONTH", period=body.month, col_name="", amount=body.amount,
+    )
+    s2 = s2.on_conflict_do_update(
+        index_elements=["plan_entry_id", "year", "period_type", "period", "col_name"],
+        set_={"amount": s2.excluded.amount},
+    )
+    db.execute(s2)
     db.commit()
     return PlanEntryOut(**body.model_dump())

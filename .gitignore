@@ -17,3 +17,6 @@ wheels/
 
 # OS
 .DS_Store
+
+# 업로드 원본 로컬 보관 폴더(S3 미설정 시)
+var/
