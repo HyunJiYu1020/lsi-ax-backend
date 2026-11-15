@@ -46,6 +46,15 @@ from app.models import (
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, category_label, resolve_leaves
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, ym_month, ym_year, yyyymm
+from app.services.overseas.entries import (
+    bulk_upsert_cost_entries,
+    bulk_upsert_plan_entries,
+    ensure_plan_version,
+    entry_months_bulk,
+    get_or_create_entry,
+    plan_entry_months_bulk,
+    upsert_entry_months,
+)
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LAB_EPOCH, LabView, all_labs, lab_views, overseas_account
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
@@ -235,51 +244,8 @@ def _basis_month(db: Session) -> int:
     return ym_month(latest) if latest else 0
 
 
-def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[float | None]]:
-    """엔트리별 월 값을 한 번의 쿼리로 모아 돌려준다 (호출부가 엔트리마다 따로 조회하지 않도록).
-    기본은 12개월(그 헤더의 yyyymm 연도)이지만, 다음 연도치(year+1)까지 저장돼 있으면 24개월(그다음도
-    저장돼 있으면 36개월…, 항상 12의 배수)로 이어 붙여 돌려준다 — 기간을 12개월 너머로 늘려 받을 때
-    쓰는 확장 지점.
-
-    디테일 행이 아예 없는 달은 0이 아니라 None(미등록)으로 돌려준다 — 0으로 채우면 "0원으로 올라온
-    달"과 "아직 안 올라온 달"이 구분되지 않는다(공통 RULE: 빈칸 처리). 계산에 쓸 때는 _n()으로 0으로
-    바꿔 더한다."""
-    entry_ids = [e.id for e in entries]
-    if not entry_ids:
-        return {}
-    base_year_by_id = {e.id: ym_year(e.yyyymm) for e in entries}
-    by_entry: dict[int, dict[int, float]] = {}
-    max_idx_by_entry: dict[int, int] = {}
-    for r in db.scalars(
-        select(CostEntryDetail).where(
-            CostEntryDetail.cost_entry_id.in_(entry_ids), CostEntryDetail.period_type == "MONTH"
-        )
-    ):
-        idx = (r.year - base_year_by_id[r.cost_entry_id]) * 12 + (r.period - 1)  # 0-based: 0~11=1년차, 12~23=2년차…
-        by_entry.setdefault(r.cost_entry_id, {})[idx] = float(r.amount)
-        max_idx_by_entry[r.cost_entry_id] = max(max_idx_by_entry.get(r.cost_entry_id, -1), idx)
-    out: dict[int, list[float | None]] = {}
-    for eid in entry_ids:
-        # 디테일이 하나도 없어도(= 행은 있지만 아직 한 달도 안 올라옴) 12칸은 돌려준다 — 빈 배열을
-        # 주면 받는 쪽이 월 인덱스로 집으려다 터진다. 그 12칸은 전부 None(미등록)이다.
-        n = max(12, ((max_idx_by_entry.get(eid, -1) // 12) + 1) * 12)
-        vals = by_entry.get(eid, {})
-        out[eid] = [vals.get(i) for i in range(n)]
-    return out
 
 
-def _plan_entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list[float | None]]:
-    """경영계획 월 값. _entry_months_bulk와 같이 디테일이 없는 달은 None(미등록)이다."""
-    if not entry_ids:
-        return {}
-    by_entry: dict[int, dict[int, float]] = {}
-    for r in db.scalars(
-        select(ManagementPlanEntryDetail).where(
-            ManagementPlanEntryDetail.plan_entry_id.in_(entry_ids), ManagementPlanEntryDetail.period_type == "MONTH"
-        )
-    ):
-        by_entry.setdefault(r.plan_entry_id, {})[r.period] = float(r.amount)
-    return {eid: [by_entry.get(eid, {}).get(m) for m in range(1, 13)] for eid in entry_ids}
 
 
 def _latest_uploads_stmt(lab_pks: set[str], versions: list[str]):
@@ -300,153 +266,14 @@ def _latest_uploads_stmt(lab_pks: set[str], versions: list[str]):
     )
 
 
-def _get_or_create_entry(db: Session, scope_code: str, version: str, category_code: str, yyyymm: str) -> int:
-    """비용 헤더(cost_entries)를 account_code×scope_code×category_code×yyyymm×version으로 upsert하고
-    id를 돌려준다."""
-    stmt = pg_insert(CostEntry).values(
-        yyyymm=yyyymm, account_code=ACCOUNT_KEY, scope_code=scope_code, version=version, category_code=category_code,
-    ).on_conflict_do_nothing(index_elements=["account_code", "scope_code", "category_code", "yyyymm", "version"])
-    db.execute(stmt)
-    return db.scalar(
-        select(CostEntry.id).where(
-            CostEntry.account_code == ACCOUNT_KEY,
-            CostEntry.scope_code == scope_code,
-            CostEntry.category_code == category_code,
-            CostEntry.yyyymm == yyyymm,
-            CostEntry.version == version,
-        )
-    )
 
 
-def _upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months: list[float | None]) -> None:
-    """months는 12개(1년치)가 기본이지만 12의 배수(24·36…)면 2년차부터 base_year+1, base_year+2…로
-    이어서 저장한다 — 기간을 12개월 너머로 늘려 받을 때 쓰는 확장 지점.
-
-    월마다 따로 실행하면 행 하나 저장에 12번(24개월이면 24번) DB 왕복이 나서, 디테일 전체를
-    한 문장으로 모아 upsert한다(_bulk_upsert_cost_entries와 같은 이유).
-
-    None인 달은 아예 쓰지 않는다 — 미등록은 "0으로 등록됨"이 아니라 "행이 없음"이어야 조회할 때
-    다시 빈칸으로 나온다(공통 RULE: 빈칸 처리)."""
-    values = [
-        {
-            "cost_entry_id": cost_entry_id, "year": base_year + i // 12, "period_type": "MONTH",
-            "period": i % 12 + 1, "col_name": "", "amount": amount,
-        }
-        for i, amount in enumerate(months)
-        if amount is not None
-    ]
-    if not values:
-        return
-    stmt = pg_insert(CostEntryDetail).values(values)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
-        set_={"amount": stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
-    )
-    db.execute(stmt)
 
 
-def _bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, list[float | None]]]) -> None:
-    """(scope_code, version, category_code, yyyymm, months) 목록을 헤더·디테일 각각 단일 upsert
-    문으로 한 번에 처리한다 — save_overseas_state가 행마다 _get_or_create_entry+월별 insert를
-    따로 호출하면 (lab×category 조합 수)×14번 왕복이 나서, 그걸 피하려고 모아서 처리한다.
-    같은 키가 두 번 들어오면 (호출부가 겹쳐 보낸 경우) 마지막 값이 이긴다 — 기존의 순차 upsert와 동일한 규칙."""
-    dedup: dict[tuple[str, str, str, str], list[float | None]] = {
-        (scope_code, version, category_code, yyyymm): months
-        for scope_code, version, category_code, yyyymm, months in rows
-    }
-    if not dedup:
-        return
-
-    header_stmt = pg_insert(CostEntry).values(
-        [
-            {
-                "yyyymm": yyyymm, "account_code": ACCOUNT_KEY, "scope_code": scope_code,
-                "version": version, "category_code": category_code,
-            }
-            for scope_code, version, category_code, yyyymm in dedup
-        ]
-    )
-    header_stmt = header_stmt.on_conflict_do_update(
-        index_elements=["account_code", "scope_code", "category_code", "yyyymm", "version"],
-        set_={"yyyymm": header_stmt.excluded.yyyymm},  # no-op 갱신 — DO NOTHING은 충돌 행을 RETURNING 안 해줘서 못 씀
-    ).returning(CostEntry.id, CostEntry.scope_code, CostEntry.category_code, CostEntry.yyyymm, CostEntry.version)
-    id_by_key = {(r.scope_code, r.category_code, r.yyyymm, r.version): r.id for r in db.execute(header_stmt)}
-
-    # amount가 None인 달은 건너뛴다 — 미등록을 0으로 저장하면 다시 읽을 때 빈칸이 아니라 0이 된다.
-    detail_values = [
-        {
-            "cost_entry_id": id_by_key[(scope_code, category_code, yyyymm, version)],
-            # months가 12개(기본)를 넘으면(12의 배수, 기간을 늘려 받는 경우) 12개씩 다음 연도로
-            # 넘겨 저장한다 — upsert_cost_entry/_upsert_entry_months와 동일한 규칙.
-            "year": ym_year(yyyymm) + i // 12, "period_type": "MONTH", "period": i % 12 + 1,
-            "col_name": "", "amount": amount,
-        }
-        for (scope_code, version, category_code, yyyymm), months in dedup.items()
-        for i, amount in enumerate(months)
-        if amount is not None
-    ]
-    if not detail_values:
-        return
-    detail_stmt = pg_insert(CostEntryDetail).values(detail_values)
-    detail_stmt = detail_stmt.on_conflict_do_update(
-        index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
-        set_={"amount": detail_stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
-    )
-    db.execute(detail_stmt)
 
 
-def _ensure_plan_version(db: Session, year: int) -> None:
-    if not db.scalar(
-        select(ManagementPlanVersion.year).where(
-            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no == PLAN_NO
-        )
-    ):
-        db.add(ManagementPlanVersion(year=year, plan_no=PLAN_NO))
-        db.flush()
 
 
-def _bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[float | None]]]) -> None:
-    """(scope_code, category_code, year, months) 목록을 헤더·디테일 각각 단일 upsert 문으로 처리한다
-    (_bulk_upsert_cost_entries와 같은 이유)."""
-    dedup = {(r[0], r[1], r[2]): r[3] for r in rows}
-    if not dedup:
-        return
-    for year in {year for _, _, year in dedup}:
-        _ensure_plan_version(db, year)
-
-    header_stmt = pg_insert(ManagementPlanEntry).values(
-        [
-            {
-                "account_code": ACCOUNT_KEY, "scope_code": scope_code, "year": year,
-                "plan_no": PLAN_NO, "category_code": category_code,
-            }
-            for scope_code, category_code, year in dedup
-        ]
-    )
-    header_stmt = header_stmt.on_conflict_do_update(
-        index_elements=["account_code", "scope_code", "category_code", "year", "plan_no"],
-        set_={"year": header_stmt.excluded.year},
-    ).returning(ManagementPlanEntry.id, ManagementPlanEntry.scope_code, ManagementPlanEntry.category_code, ManagementPlanEntry.year)
-    id_by_key = {(r.scope_code, r.category_code, r.year): r.id for r in db.execute(header_stmt)}
-
-    # 미등록(None)인 달은 저장하지 않는다 — _bulk_upsert_cost_entries와 같은 이유.
-    detail_values = [
-        {
-            "plan_entry_id": id_by_key[(scope_code, category_code, year)],
-            "year": year, "period_type": "MONTH", "period": m, "col_name": "", "amount": amount,
-        }
-        for (scope_code, category_code, year), months in dedup.items()
-        for m, amount in enumerate(months, start=1)
-        if amount is not None
-    ]
-    if not detail_values:
-        return
-    detail_stmt = pg_insert(ManagementPlanEntryDetail).values(detail_values)
-    detail_stmt = detail_stmt.on_conflict_do_update(
-        index_elements=["plan_entry_id", "year", "period_type", "period", "col_name"],
-        set_={"amount": detail_stmt.excluded.amount},
-    )
-    db.execute(detail_stmt)
 
 
 @router.get("/overseas/state", response_model=OverseasState)
@@ -486,7 +313,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
             )
             if entry.scope_code in lab_pks and (entry.scope_code, entry.category_code) not in custom_keys
         ]
-        forecast_months = _entry_months_bulk(db, forecast_entries)
+        forecast_months = entry_months_bulk(db, forecast_entries)
         for entry in forecast_entries:
             pk = entry.scope_code
             months = forecast_months[entry.id]
@@ -516,7 +343,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
             and entry.scope_code in lab_pks
             and (entry.scope_code, entry.category_code) not in custom_keys
         ]
-        latest_actual_months = _entry_months_bulk(db, latest_actual_entries)
+        latest_actual_months = entry_months_bulk(db, latest_actual_entries)
         for entry in latest_actual_entries:
             pk = entry.scope_code
             months = latest_actual_months[entry.id]
@@ -549,7 +376,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
             and entry.scope_code in lab_pks
             and (entry.scope_code, entry.category_code) not in custom_keys
         ]
-        latest_prior_months = _entry_months_bulk(db, latest_prior_entries)
+        latest_prior_months = entry_months_bulk(db, latest_prior_entries)
         for entry in latest_prior_entries:
             pk = entry.scope_code
             months = latest_prior_months[entry.id]
@@ -570,7 +397,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
         )
         if entry.scope_code in lab_pks
     ]
-    plan_months = _plan_entry_months_bulk(db, [e.id for e in plan_entries])
+    plan_months = plan_entry_months_bulk(db, [e.id for e in plan_entries])
     for entry in plan_entries:
         pk = entry.scope_code
         months = plan_months[entry.id]
@@ -730,8 +557,8 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
                     plan_rows.append((pk, category_key, state.basis_year, months))
             if "_ETC" in lab_pks:
                 plan_rows.append(("_ETC", "etc", state.basis_year, vd.etc))
-    _bulk_upsert_cost_entries(db, cost_rows)
-    _bulk_upsert_plan_entries(db, plan_rows)
+    bulk_upsert_cost_entries(db, cost_rows)
+    bulk_upsert_plan_entries(db, plan_rows)
 
     # 1-1) "N월실적" 헤더로 업로드된 확정 실적 스냅샷 (있을 때만, 지금은 cur만 사용)
     actual_cost_rows: list[tuple[str, str, str, str, list[float]]] = []
@@ -742,7 +569,7 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
                 actual_cost_rows.append((pk, "actual", category_key, actual_yyyymm, months))
         if "_ETC" in lab_pks:
             actual_cost_rows.append(("_ETC", "actual", "etc", actual_yyyymm, snap.etc))
-    _bulk_upsert_cost_entries(db, actual_cost_rows)
+    bulk_upsert_cost_entries(db, actual_cost_rows)
 
     # 2) 업로드 이력 (연구소×버전당 최신 파일명만 의미 있으므로, 바뀐 것만 새로 기록)
     # pk×version 조합마다 따로 조회하지 않고, 이 계정의 업로드 이력을 한 번에 읽어 메모리에서 비교한다.
@@ -1538,7 +1365,7 @@ def list_cost_entries(
     if category_key:
         stmt = stmt.where(CostEntry.category_code == category_key)
     entries = list(db.scalars(stmt))
-    months_by_entry = _entry_months_bulk(db, entries)
+    months_by_entry = entry_months_bulk(db, entries)
 
     out: list[CostEntryOut] = []
     for entry in entries:
@@ -1559,7 +1386,7 @@ def upsert_cost_entry(body: CostEntryIn, db: Session = Depends(get_db)) -> CostE
     _check_lab_pk(db, body.lab_pk)
     _check_version(body.version)
     _check_category(db, body.category_key)
-    entry_id = _get_or_create_entry(db, body.lab_pk, body.version, body.category_key, body.yyyymm)
+    entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.category_key, body.yyyymm)
     base_year = ym_year(body.yyyymm)
     year, period = base_year + (body.month - 1) // 12, (body.month - 1) % 12 + 1
     stmt = pg_insert(CostEntryDetail).values(
@@ -2012,7 +1839,7 @@ def carry_forward_defs(body: CarryForwardIn, db: Session = Depends(get_db)) -> C
             if exists is not None:
                 skipped.append(src.label or src.category_code)
                 continue
-            entry_id = _get_or_create_entry(db, ALL_SCOPE, body.to_version, src.category_code, body.to_yyyymm)
+            entry_id = get_or_create_entry(db, ALL_SCOPE, body.to_version, src.category_code, body.to_yyyymm)
             db.execute(
                 update(CostEntry).where(CostEntry.id == entry_id)
                 .values(
@@ -2398,7 +2225,7 @@ def _months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> 
     if lab_pk != ALL_SCOPE:
         stmt = stmt.where(CostEntry.scope_code == lab_pk)
     entries = list(db.scalars(stmt))
-    months_by_entry = _entry_months_bulk(db, entries)
+    months_by_entry = entry_months_bulk(db, entries)
     out: dict[str, list[float]] = {}
     for e in entries:
         acc = out.setdefault(e.category_code, [])
@@ -2489,7 +2316,7 @@ def list_extra_rows(
         stmt = stmt.where(CostEntry.scope_code == _check_lab_pk(db, lab_pk, allow_all=True))
 
     entries = list(db.scalars(stmt))
-    months_by_entry = _entry_months_bulk(db, entries)
+    months_by_entry = entry_months_bulk(db, entries)
     # 파생 행은 저장된 월값이 없고 계산식으로 매번 계산한다. 재료값(원시 행 전체)은 그 행이 속한
     # (연구소·버전) 조합당 한 번만 조회해서 돌려 쓴다 — 파생 행 수만큼 다시 조회하지 않도록.
     by_category_cache: dict[tuple[str, str], dict[str, list[float]]] = {}
@@ -2539,7 +2366,7 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
             status_code=400,
             detail=f"row_key '{body.row_key}'는 업로드된 고정 계정과 같습니다. 다른 row_key를 쓰세요.",
         )
-    entry_id = _get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
+    entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
     db.execute(
         update(CostEntry).where(CostEntry.id == entry_id)
         .values(
@@ -2556,7 +2383,7 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
             )
         )
     else:
-        _upsert_entry_months(db, entry_id, ym_year(body.yyyymm), body.v)
+        upsert_entry_months(db, entry_id, ym_year(body.yyyymm), body.v)
     db.commit()
 
     result = ExtraRowOut(**body.model_dump())
@@ -2690,7 +2517,7 @@ def list_cost_extras(
         col_stmt = col_stmt.where(ExtraCol.scope_key == lab_pk)
     derived_cols = list(db.scalars(col_stmt))
     if derived_cols:
-        months_by_entry = _entry_months_bulk(db, entries)
+        months_by_entry = entry_months_bulk(db, entries)
         entries_by_scope: dict[tuple[str, str], list[CostEntry]] = {}
         for entry in entries:
             entries_by_scope.setdefault((entry.scope_code, entry.version), []).append(entry)
@@ -2734,7 +2561,7 @@ def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> Extr
             )
             .on_conflict_do_nothing(index_elements=["account_key", "scope_key", "version", "yyyymm", "label"])
         )
-    entry_id = _get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
+    entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
     stmt = pg_insert(CostEntryDetail).values(
         cost_entry_id=entry_id, year=ym_year(body.yyyymm), period_type="CUSTOM", period=0, col_name=body.label,
         amount=body.value,

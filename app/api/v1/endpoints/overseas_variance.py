@@ -26,12 +26,11 @@ from sqlalchemy.orm import Session
 from app.api.v1.endpoints.overseas import (
     _basis_month,
     _n,
-    _plan_entry_months_bulk,
-    _entry_months_bulk,
     _source_hash,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
 from app.core.periods import PERIOD_IX, month_value, yyyymm
+from app.services.overseas.entries import entry_months_bulk, plan_entry_months_bulk
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.core.reason_translate import (
@@ -364,7 +363,7 @@ def _load_cost_version(db: Session, version: str, yyyymm: str, lab_pks: set[str]
         )
         if e.scope_code in lab_pks
     ]
-    months = _entry_months_bulk(db, entries)
+    months = entry_months_bulk(db, entries)
     out: dict[str, dict[str, list]] = {}
     for e in entries:
         out.setdefault(e.scope_code, {})[e.category_code] = months[e.id]
@@ -383,7 +382,7 @@ def _load_plan_version(db: Session, year: int, plan_no: str, lab_pks: set[str]) 
         )
         if e.scope_code in lab_pks
     ]
-    months = _plan_entry_months_bulk(db, [e.id for e in entries])
+    months = plan_entry_months_bulk(db, [e.id for e in entries])
     out: dict[str, dict[str, list]] = {}
     for e in entries:
         out.setdefault(e.scope_code, {})[e.category_code] = months[e.id]

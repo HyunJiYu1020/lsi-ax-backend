@@ -3,12 +3,11 @@ from sqlalchemy import select
 from app.api.v1.endpoints.overseas import (
     ACCOUNT_KEY,
     PLAN_NO,
-    _bulk_upsert_cost_entries,
     _bulk_upsert_notes,
-    _bulk_upsert_plan_entries,
     _bulk_upsert_reason_rows,
 )
 from app.models import CostEntry, CostEntryDetail, ManagementPlanEntry, ManagementPlanEntryDetail, Note, OverseasReasonRow
+from app.services.overseas.entries import bulk_upsert_cost_entries, bulk_upsert_plan_entries
 from app.schemas.overseas import ReasonRow
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연월/연도를 키로 써서 테스트한다.
@@ -25,7 +24,7 @@ def test_bulk_upsert_cost_entries_inserts_header_and_details(db):
         ("SARC:CPU", "forecast", "hc", TEST_YM, _months(1.0)),
         ("SARC:GPU", "forecast", "hc", TEST_YM, _months(1.0, 2.0)),
     ]
-    _bulk_upsert_cost_entries(db, rows)
+    bulk_upsert_cost_entries(db, rows)
     db.flush()
 
     entries = db.scalars(
@@ -54,7 +53,7 @@ def test_bulk_upsert_cost_entries_dedup_last_wins(db):
         ("_ETC", "forecast", "etc", TEST_YM, [0.0] * 12),
         ("_ETC", "forecast", "etc", TEST_YM, [999.0] * 12),
     ]
-    _bulk_upsert_cost_entries(db, rows)
+    bulk_upsert_cost_entries(db, rows)
     db.flush()
 
     entry = db.scalar(
@@ -78,7 +77,7 @@ def test_bulk_upsert_cost_entries_dedup_last_wins(db):
 
 def test_bulk_upsert_cost_entries_conflict_reuses_same_header(db):
     """이미 있는 헤더에 다시 upsert하면 새 헤더가 또 생기지 않고(같은 id), 값만 갱신돼야 한다."""
-    _bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "hc", TEST_YM, _months(1.0))])
+    bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "hc", TEST_YM, _months(1.0))])
     db.flush()
     first_id = db.scalar(
         select(CostEntry.id).where(
@@ -90,7 +89,7 @@ def test_bulk_upsert_cost_entries_conflict_reuses_same_header(db):
         )
     )
 
-    _bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "hc", TEST_YM, [100.0] * 12)])
+    bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "hc", TEST_YM, [100.0] * 12)])
     db.flush()
     second_id = db.scalar(
         select(CostEntry.id).where(
@@ -114,11 +113,11 @@ def test_bulk_upsert_cost_entries_conflict_reuses_same_header(db):
 
 
 def test_bulk_upsert_cost_entries_empty_rows_is_noop(db):
-    _bulk_upsert_cost_entries(db, [])  # 에러 없이 조용히 리턴해야 한다
+    bulk_upsert_cost_entries(db, [])  # 에러 없이 조용히 리턴해야 한다
 
 
 def test_bulk_upsert_plan_entries(db):
-    _bulk_upsert_plan_entries(db, [("SARC:CPU", "hc", TEST_YEAR, _months(1.0))])
+    bulk_upsert_plan_entries(db, [("SARC:CPU", "hc", TEST_YEAR, _months(1.0))])
     db.flush()
 
     entry = db.scalar(
@@ -145,7 +144,7 @@ def test_bulk_upsert_plan_entries(db):
 
 
 def test_bulk_upsert_plan_entries_empty_rows_is_noop(db):
-    _bulk_upsert_plan_entries(db, [])
+    bulk_upsert_plan_entries(db, [])
 
 
 def test_bulk_upsert_notes_dedup_last_wins(db):

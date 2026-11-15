@@ -8,12 +8,11 @@ from sqlalchemy import select
 
 from app.api.v1.endpoints.overseas import (
     ACCOUNT_KEY,
-    _bulk_upsert_cost_entries,
-    _entry_months_bulk,
     _krw_months,
     _n,
 )
 from app.models import CostEntry, CostEntryDetail
+from app.services.overseas.entries import bulk_upsert_cost_entries, entry_months_bulk
 
 TEST_YM = "209902"
 
@@ -33,7 +32,7 @@ def _entry(db, scope: str, category: str) -> CostEntry:
 def test_none_months_are_not_stored_and_come_back_as_none(db):
     # 1·2월만 올라왔고(0.0도 "올라온" 값이다) 3월부터는 미등록인 연구소
     months = [10.0, 0.0] + [None] * 10
-    _bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "sal", TEST_YM, months)])
+    bulk_upsert_cost_entries(db, [("SARC:CPU", "forecast", "sal", TEST_YM, months)])
     db.flush()
 
     entry = _entry(db, "SARC:CPU", "sal")
@@ -48,7 +47,7 @@ def test_none_months_are_not_stored_and_come_back_as_none(db):
     # 미등록 달은 행 자체가 없어야 한다 — 0으로 넣어두면 다시 읽을 때 빈칸이 아니라 0이 된다.
     assert stored == {1, 2}
 
-    got = _entry_months_bulk(db, [entry])[entry.id]
+    got = entry_months_bulk(db, [entry])[entry.id]
     assert got[0] == 10.0
     assert got[1] == 0.0  # 0으로 올라온 달은 0으로 남는다
     assert got[2:] == [None] * 10  # 안 올라온 달은 빈칸
@@ -56,12 +55,12 @@ def test_none_months_are_not_stored_and_come_back_as_none(db):
 
 def test_all_none_row_stores_header_only(db):
     # 행은 만들어졌지만 아직 아무 달도 안 올라온 경우 — 디테일이 하나도 없어야 한다.
-    _bulk_upsert_cost_entries(db, [("DSRA", "forecast", "sal", TEST_YM, [None] * 12)])
+    bulk_upsert_cost_entries(db, [("DSRA", "forecast", "sal", TEST_YM, [None] * 12)])
     db.flush()
 
     entry = _entry(db, "DSRA", "sal")
     assert entry is not None
-    assert _entry_months_bulk(db, [entry])[entry.id] == [None] * 12
+    assert entry_months_bulk(db, [entry])[entry.id] == [None] * 12
 
 
 def test_krw_months_adds_only_present_values():

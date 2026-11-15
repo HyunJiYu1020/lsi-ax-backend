@@ -116,9 +116,10 @@ class CostEntry(Base):
 class CostEntryDetail(Base):
     """CostEntry 헤더에 달리는 디테일 행. period_type으로 월·분기·연간·커스텀열을 구분한다 —
     MONTH(period 1~12) | QUARTER(period 1~4) | YEAR(period 0) | CUSTOM(period 0, col_name에 라벨).
-    분기·연간 행은 공용 엔드포인트(cost.py)로 월 값을 쓸 때마다 그 해 12개월 합으로 재계산돼 덮어쓰인다
-    (cost.py의 _resync_summary). 단 해외연구소 저장 경로(/overseas/state)는 월 행만 쓰고 이 재계산을
-    하지 않아, 그 계정의 분기·연간 행은 한 번 백필된 값에서 갱신되지 않는다. col_name은
+    분기·연간 행은 월 값을 쓸 때마다 그 해 12개월 합으로 재계산돼 덮어쓰인다 — 공용 엔드포인트는
+    cost.py의 _resync_summary, 해외연구소는 services/overseas/entries.py의 resync_summaries가 한다.
+    (예전에는 해외연구소 경로가 월 행만 쓰고 재계산을 안 해서 그 계정의 분기·연간이 백필 시점 값에
+    멈춰 있었다 — PLAN.md P1-3. Phase 1-4에서 쓰기 경로를 services로 모으며 고쳤다.) col_name은
     CUSTOM이 아니면 빈 문자열(NULL 아님) — Postgres UNIQUE/ON CONFLICT가 NULL을 서로 다른 값으로
     취급해 중복 삽입될 수 있기 때문이다."""
 
