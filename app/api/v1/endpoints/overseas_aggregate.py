@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
 from app.api.v1.endpoints.overseas import (
     ACCOUNT_KEY,
     _basis_month,
@@ -26,12 +27,9 @@ from app.api.v1.endpoints.overseas import (
     _krw_months,
     _lab_views,
     _n,
-    _PERIOD_IX,
     _rate_arrays,
-    _yyyymm,
     _LABOR_TREE,
     _TOT_TREE,
-    _QUARTER_END_IX,
     get_overseas_state,
 )
 from app.api.v1.endpoints.overseas_variance import check_variance_reasons
@@ -100,7 +98,7 @@ def get_cp_contract(year: int, db: Session = Depends(get_db)) -> CpContractOut:
 
 
 # ---------- 확정 사전점검 ----------
-def _uploaded_lab_pks(db: Session, yyyymm: str, version: str) -> set[str]:
+def _uploaded_lab_pks(db: Session, ym: str, version: str) -> set[str]:
     """그 버전·연월에 "칸이 하나라도 등록된" 연구소 pk.
 
     값이 0인 칸도 올라온 것으로 센다 — 0으로 보고한 연구소를 미업로드로 세면 "12개 중 n개 기준"이
@@ -112,7 +110,7 @@ def _uploaded_lab_pks(db: Session, yyyymm: str, version: str) -> set[str]:
         .where(
             CostEntry.account_code == ACCOUNT_KEY,
             CostEntry.version == version,
-            CostEntry.yyyymm == yyyymm,
+            CostEntry.yyyymm == ym,
             CostEntry.label.is_(None),
             CostEntryDetail.period_type == "MONTH",
         )
@@ -135,7 +133,7 @@ def check_overseas_confirm(
     _check_kind(kind)
     month = basis_month or _basis_month(db) or 1
     version = _KIND_VERSION[kind]
-    yyyymm = _yyyymm(basis_year, month)
+    ym = yyyymm(basis_year, month)
 
     blocking: list[str] = []
     warnings: list[str] = []
@@ -156,7 +154,7 @@ def check_overseas_confirm(
         for lab in _lab_views(db, f"{basis_year:04d}-{month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
-    uploaded_pks = _uploaded_lab_pks(db, yyyymm, version)
+    uploaded_pks = _uploaded_lab_pks(db, ym, version)
     by_code: dict[str, list] = {}
     for lab in labs:
         by_code.setdefault(lab.lab_code, []).append(lab)
@@ -236,7 +234,7 @@ def get_labor_ratio(
     기간 합계끼리 나눈다 — 분모가 0이면 비율이 없으므로 0이 아니라 null로 돌려준다(화면 '—')."""
     if version not in ("cur", "prev", "prior", "plan"):
         raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
-    ix = _PERIOD_IX.get(period)
+    ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
@@ -258,7 +256,7 @@ def get_labor_ratio(
     ]
     rate = _rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
     api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = _extra_row_months(db, _yyyymm(basis_year, basis_month), api_version)
+    extras = _extra_row_months(db, yyyymm(basis_year, basis_month), api_version)
     cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)
 
     by_code: dict[str, dict] = {}
@@ -271,8 +269,8 @@ def get_labor_ratio(
         )
         if lab.lab_code == "CP":
             # CP만 PL 대신 계약 금액을 분기 말에 넣는다(/overseas/summary와 같은 규칙).
-            acc["tot"] += sum(cp_total_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
-            acc["lab"] += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
+            acc["tot"] += sum(cp_total_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
+            acc["lab"] += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
             continue
         cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
         if not cats and not extra:

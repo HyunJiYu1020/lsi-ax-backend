@@ -24,7 +24,7 @@ from app.api.v1.endpoints.overseas import (
     _krw_months,
     _lab_views,
     _rate_arrays,
-    _yyyymm,
+    yyyymm,
     get_labor_split,
     get_overseas_state,
 )
@@ -258,7 +258,7 @@ def test_labor_split_matches_backend(db, lab_scope):
     snap = state.actualV.get("cur")
     assert snap is not None  # get_labor_split이 성공했으면 반드시 있다
     basis_month = state.basis_month or 1
-    labs = {lab.pk: lab for lab in _lab_views(db, _yyyymm(BASIS_YEAR, basis_month))}
+    labs = {lab.pk: lab for lab in _lab_views(db, yyyymm(BASIS_YEAR, basis_month))}
 
     pks = [row.lab_pk for row in result.labs]
     if not pks:
@@ -308,7 +308,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
     아니라 설계가 갈린 지점이라 Phase 6(수식 백엔드 단일화)에서 맞춰야 한다 — 여기 기록만 남긴다.
     """
     basis_month = _basis_month(db) or 1
-    labs = _lab_views(db, _yyyymm(BASIS_YEAR, basis_month))
+    labs = _lab_views(db, yyyymm(BASIS_YEAR, basis_month))
     local = {lab.currency for lab in labs if lab.currency and lab.currency != "USD"}
     if not local:
         pytest.skip("현지통화 연구소가 없다")

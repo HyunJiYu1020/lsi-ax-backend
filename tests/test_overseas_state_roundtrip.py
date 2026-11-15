@@ -13,7 +13,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.v1.endpoints.overseas import _yyyymm, get_overseas_state, save_overseas_state
+from app.api.v1.endpoints.overseas import yyyymm, get_overseas_state, save_overseas_state
 from app.models.common import CostEntry, CostEntryDetail
 
 BASIS_YEAR = 2026
@@ -190,7 +190,7 @@ def test_unregistered_months_survive_the_round_trip(db):
         .where(
             CostEntry.account_code == "overseas",
             CostEntry.version == "forecast",
-            CostEntry.yyyymm == _yyyymm(BASIS_YEAR, state.basis_month),
+            CostEntry.yyyymm == yyyymm(BASIS_YEAR, state.basis_month),
             CostEntry.scope_code == pk,
             CostEntry.category_code == cat,
             CostEntryDetail.period_type == "MONTH",

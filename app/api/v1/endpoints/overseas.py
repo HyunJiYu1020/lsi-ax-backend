@@ -45,6 +45,7 @@ from app.models import (
     Upload,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, category_label, resolve_leaves
+from app.core.periods import PERIOD_IX, QUARTER_END_IX, ym_month, ym_year, yyyymm
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.api.v1.endpoints.fx import _compute_applied_rows, _FxRateCache, _overseas_fx_default
@@ -201,7 +202,7 @@ def _current_basis_ym(db: Session) -> str:
         select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
     )
     if latest:
-        return f"{_ym_year(latest):04d}-{_ym_month(latest):02d}"
+        return f"{ym_year(latest):04d}-{ym_month(latest):02d}"
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
@@ -303,25 +304,13 @@ def _n(v: float | None) -> float:
     return 0.0 if v is None else float(v)
 
 
-def _yyyymm(year: int, month: int) -> str:
-    return f"{year:04d}{month:02d}"
-
-
-def _ym_year(yyyymm: str) -> int:
-    return int(yyyymm[:4])
-
-
-def _ym_month(yyyymm: str) -> int:
-    return int(yyyymm[4:6])
-
-
 def _basis_month(db: Session) -> int:
     """forecast(속보) 버전 중 가장 최근(yyyymm 최댓값)의 월 — 지금 편성 기준월.
     yyyymm이 "YYYYMM" 6자리 고정폭이라 문자열 최댓값이 곧 날짜순 최댓값과 같다."""
     latest = db.scalar(
         select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
     )
-    return _ym_month(latest) if latest else 0
+    return ym_month(latest) if latest else 0
 
 
 def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[float | None]]:
@@ -336,7 +325,7 @@ def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[
     entry_ids = [e.id for e in entries]
     if not entry_ids:
         return {}
-    base_year_by_id = {e.id: _ym_year(e.yyyymm) for e in entries}
+    base_year_by_id = {e.id: ym_year(e.yyyymm) for e in entries}
     by_entry: dict[int, dict[int, float]] = {}
     max_idx_by_entry: dict[int, int] = {}
     for r in db.scalars(
@@ -467,7 +456,7 @@ def _bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, 
             "cost_entry_id": id_by_key[(scope_code, category_code, yyyymm, version)],
             # months가 12개(기본)를 넘으면(12의 배수, 기간을 늘려 받는 경우) 12개씩 다음 연도로
             # 넘겨 저장한다 — upsert_cost_entry/_upsert_entry_months와 동일한 규칙.
-            "year": _ym_year(yyyymm) + i // 12, "period_type": "MONTH", "period": i % 12 + 1,
+            "year": ym_year(yyyymm) + i // 12, "period_type": "MONTH", "period": i % 12 + 1,
             "col_name": "", "amount": amount,
         }
         for (scope_code, version, category_code, yyyymm), months in dedup.items()
@@ -565,7 +554,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
 
     # cur("속보") = forecast 버전 중 지금 기준월(basis_month) 1건
     if basis_month:
-        forecast_yyyymm = _yyyymm(basis_year, basis_month)
+        forecast_yyyymm = yyyymm(basis_year, basis_month)
         forecast_entries = [
             entry
             for entry in db.scalars(
@@ -596,7 +585,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
     )
     if actual_rows:
         latest_yyyymm = max(e.yyyymm for e in actual_rows)
-        athru = _ym_month(latest_yyyymm)
+        athru = ym_month(latest_yyyymm)
         snap = ActualSnapshot(thru_month=athru, d={}, etc=[0.0] * 12)
         latest_actual_entries = [
             entry
@@ -799,7 +788,7 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     #    prev·prior는 actual 스냅샷에서 유도하는 값이라 따로 저장하지 않는다.
     # 행을 모아서 _bulk_upsert_*에 한 번에 넘긴다 — lab×category 조합마다 따로 upsert하면
     # 조합 수만큼 DB 왕복이 느는데, 해외연구소는 연구소×비용항목 조합이 많아서 영향이 크다.
-    forecast_yyyymm = _yyyymm(state.basis_year, state.basis_month) if state.basis_month else None
+    forecast_yyyymm = yyyymm(state.basis_year, state.basis_month) if state.basis_month else None
     cost_rows: list[tuple[str, str, str, str, list[float]]] = []
     plan_rows: list[tuple[str, str, int, list[float]]] = []
     for version, vd in state.V.items():
@@ -825,7 +814,7 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     # 1-1) "N월실적" 헤더로 업로드된 확정 실적 스냅샷 (있을 때만, 지금은 cur만 사용)
     actual_cost_rows: list[tuple[str, str, str, str, list[float]]] = []
     for version, snap in state.actualV.items():
-        actual_yyyymm = _yyyymm(state.basis_year, snap.thru_month)
+        actual_yyyymm = yyyymm(state.basis_year, snap.thru_month)
         for pk, cats in snap.d.items():
             for category_key, months in cats.items():
                 actual_cost_rows.append((pk, "actual", category_key, actual_yyyymm, months))
@@ -934,11 +923,6 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
 # 화면(분석 › 증감분석 › 계정별 증감분석 › 계정별 상세)의 인건비 행 아래 줄과 같은 계산이다.
 # frontend-html/shared/core.js의 ovLaborSplit / frontend/src/logic/calc.js의 ovLaborSplit와 같은 식을
 # 쓴다 — 챗봇이 말하는 금액과 사용자가 보는 표가 어긋나면 안 되므로 식을 바꿀 때 세 곳을 같이 고칠 것.
-_PERIOD_IX: dict[str, tuple[int, ...]] = {
-    "y": tuple(range(12)),
-    "q1": (0, 1, 2), "q2": (3, 4, 5), "q3": (6, 7, 8), "q4": (9, 10, 11),
-    **{f"m{m}": (m - 1,) for m in range(1, 13)},
-}
 _LABOR_LEAVES = tuple(resolve_leaves("labor"))
 
 
@@ -995,7 +979,7 @@ def get_labor_split(
 ) -> LaborSplitResult:
     if base_version not in ("prev", "prior", "plan"):
         raise HTTPException(400, "base_version은 prev(전실행) | prior(전년 실적) | plan(경영계획)만 쓸 수 있다.")
-    ix = _PERIOD_IX.get(period)
+    ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
@@ -1124,7 +1108,6 @@ def get_labor_split(
 _TOT_LEAVES = tuple(resolve_leaves("tot"))
 # 업로드 여부 판정에 보는 입력 칸(화면 OV_IN = 파생 아닌 모든 행 + 인력).
 _INPUT_KEYS = frozenset(_TOT_LEAVES) | {"hc"}
-_QUARTER_END_IX = (2, 5, 8, 11)
 _STEP_COUNT = 3
 
 
@@ -1192,7 +1175,7 @@ def get_overseas_summary(
 ) -> OverseasSummary:
     if version not in ("cur", "prev", "prior", "plan"):
         raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
-    ix = _PERIOD_IX.get(period)
+    ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
@@ -1219,15 +1202,15 @@ def get_overseas_summary(
     rate = _rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
 
     api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = _extra_row_months(db, _yyyymm(basis_year, basis_month), api_version)
+    extras = _extra_row_months(db, yyyymm(basis_year, basis_month), api_version)
     cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)
 
     total = labor = 0.0
     for lab in labs:
         if lab.lab_code == "CP":
             # CP만 PL 대신 계약 금액을 분기말에 넣는다(①).
-            total += sum(cp_total_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
-            labor += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
+            total += sum(cp_total_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
+            labor += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
             continue
         cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
         if not cats and not extra:
@@ -1337,7 +1320,7 @@ def get_vendor_by_project(
     period: str = "y",
     db: Session = Depends(get_db),
 ) -> VendorByProjectResult:
-    ix = _PERIOD_IX.get(period)
+    ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
     for v in (version, base_version):
@@ -1679,7 +1662,7 @@ def list_cost_entries(
     out: list[CostEntryOut] = []
     for entry in entries:
         months = months_by_entry[entry.id]
-        base_year = _ym_year(entry.yyyymm)
+        base_year = ym_year(entry.yyyymm)
         for i, amount in enumerate(months):
             out.append(
                 CostEntryOut(
@@ -1696,7 +1679,7 @@ def upsert_cost_entry(body: CostEntryIn, db: Session = Depends(get_db)) -> CostE
     _check_version(body.version)
     _check_category(db, body.category_key)
     entry_id = _get_or_create_entry(db, body.lab_pk, body.version, body.category_key, body.yyyymm)
-    base_year = _ym_year(body.yyyymm)
+    base_year = ym_year(body.yyyymm)
     year, period = base_year + (body.month - 1) // 12, (body.month - 1) % 12 + 1
     stmt = pg_insert(CostEntryDetail).values(
         cost_entry_id=entry_id, year=year, period_type="MONTH", period=period, col_name="", amount=body.amount,
@@ -2671,7 +2654,7 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
             )
         )
     else:
-        _upsert_entry_months(db, entry_id, _ym_year(body.yyyymm), body.v)
+        _upsert_entry_months(db, entry_id, ym_year(body.yyyymm), body.v)
     db.commit()
 
     result = ExtraRowOut(**body.model_dump())
@@ -2851,7 +2834,7 @@ def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> Extr
         )
     entry_id = _get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
     stmt = pg_insert(CostEntryDetail).values(
-        cost_entry_id=entry_id, year=_ym_year(body.yyyymm), period_type="CUSTOM", period=0, col_name=body.label,
+        cost_entry_id=entry_id, year=ym_year(body.yyyymm), period_type="CUSTOM", period=0, col_name=body.label,
         amount=body.value,
     )
     stmt = stmt.on_conflict_do_update(

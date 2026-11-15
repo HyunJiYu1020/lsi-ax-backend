@@ -28,15 +28,14 @@ from app.api.v1.endpoints.overseas import (
     _basis_month,
     _lab_views,
     _n,
-    _PERIOD_IX,
     _plan_entry_months_bulk,
     _entry_months_bulk,
     _rate_arrays,
     _source_hash,
-    _yyyymm,
     LabView,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
+from app.core.periods import PERIOD_IX, month_value, yyyymm
 from app.core.reason_translate import (
     MAX_LEN,
     draft_reason,
@@ -106,7 +105,7 @@ def _check_kind(kind: str) -> str:
 
 
 def _check_period(period: str) -> tuple[int, ...]:
-    ix = _PERIOD_IX.get(period)
+    ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
     return ix
@@ -190,10 +189,10 @@ def _prev_spec(db: Session, year: int, month: int, kind: str) -> tuple[int, int,
         target = (year, month - 1, "actual")
 
     ty, tm, tkind = target
-    if _has_cost_data(db, tkind, _yyyymm(ty, tm)):
+    if _has_cost_data(db, tkind, yyyymm(ty, tm)):
         return ty, tm, tkind, ""
 
-    cur_yyyymm = _yyyymm(year, month)
+    cur_yyyymm = yyyymm(year, month)
     for fb_kind in ("actual", "forecast"):
         latest = _latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
         if latest:
@@ -211,10 +210,10 @@ def _prior_spec(db: Session, year: int, month: int) -> tuple[int, int, str, str]
     """전년 = 전년 12월 실적. 없으면 최근 실적 → 최근 속보로 물러나고 그 사실을 문장으로 밝힌다
     ("전년 12월 실적이 없어 26.11 속보 기준으로 비교합니다.")."""
     ty, tm, tkind = year - 1, 12, "actual"
-    if _has_cost_data(db, tkind, _yyyymm(ty, tm)):
+    if _has_cost_data(db, tkind, yyyymm(ty, tm)):
         return ty, tm, tkind, ""
 
-    cur_yyyymm = _yyyymm(year, month)
+    cur_yyyymm = yyyymm(year, month)
     for fb_kind in ("actual", "forecast"):
         latest = _latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
         if latest:
@@ -248,7 +247,7 @@ def _plan_creation_prev(db: Session, year: int, plan_no: str) -> tuple[int, int,
     if row is None:
         return 0, 0, "", "경영계획 생성 시점에 열린 버전이 없어 전실행 대비 증감을 낼 수 없습니다."
     note = ""
-    if not _has_cost_data(db, row.kind, _yyyymm(row.year, row.month)):
+    if not _has_cost_data(db, row.kind, yyyymm(row.year, row.month)):
         note = f"{_ym_label(row.year, row.month, row.kind)}에 저장된 데이터가 없어 전실행 대비 증감을 낼 수 없습니다."
     return row.year, row.month, row.kind, note
 
@@ -400,7 +399,7 @@ def _load_basis(db: Session, spec, lab_pks: set[str]) -> dict[str, dict[str, lis
         return _load_plan_version(db, year, plan_no, lab_pks)
     if not kind:
         return {}
-    return _load_cost_version(db, kind, _yyyymm(year, month), lab_pks)
+    return _load_cost_version(db, kind, yyyymm(year, month), lab_pks)
 
 
 def _active_labs(db: Session, basis_year: int, basis_month: int) -> dict[str, LabView]:
@@ -475,8 +474,8 @@ def _variance_cells(
         for key, keys in leaves.items():
             cell = out[key]
             for j in ix:
-                uc = sum(_n(_month(cats_cur, leaf, j)) for leaf in keys)
-                ub = sum(_n(_month(cats_base, leaf, j)) for leaf in keys)
+                uc = sum(_n(month_value(cats_cur, leaf, j)) for leaf in keys)
+                ub = sum(_n(month_value(cats_base, leaf, j)) for leaf in keys)
                 if key == "hc":
                     # 인력은 금액이 아니라 명(月 평균)이다 — 환율을 곱하지 않고 기간 평균을 낸다.
                     cell["cur"] += uc / len(ix)
@@ -497,12 +496,6 @@ def _variance_cells(
                     cell["fx_usd"] += uc * (rc - rb) * 1000
                     cell["fx_outside"] += (uc - ub) * rb * 1000
     return out
-
-
-def _month(cats: dict[str, list], key: str, j: int):
-    """그 계정의 j월 값. 행 자체가 없거나 배열이 짧으면 미등록(None)이다."""
-    arr = cats.get(key)
-    return arr[j] if arr and j < len(arr) else None
 
 
 def _to_kdollar(local_amount: float, local_rate: float) -> float:
@@ -1306,7 +1299,7 @@ def get_actual_first(
             if view.lab_code != code:
                 continue
             cats = base_d.get(pk, {})
-            base_k += sum(_n(_month(cats, leaf, j)) for leaf in tot_leaves)
+            base_k += sum(_n(month_value(cats, leaf, j)) for leaf in tot_leaves)
         base_krw = base_k * rb * 1000
 
         # 세 칸의 합이 반드시 증감(krw - base_krw)과 같아야 한다 — 환차를 가른 뒤 남는 몫이 환차外다.
@@ -1417,7 +1410,7 @@ def get_actual_stage_shift(
     ix = (j,)
     local_curs = {lab.currency for lab in by_code.values() if lab.currency and lab.currency != "USD"}
     rate = _rate_arrays(db, basis_year, basis_month, "actual", local_curs, ix)
-    second_d = _load_cost_version(db, "actual", _yyyymm(basis_year, basis_month), set(labs))
+    second_d = _load_cost_version(db, "actual", yyyymm(basis_year, basis_month), set(labs))
     tot_leaves = resolve_leaves("tot")
 
     rows: list[ActualStageShift] = []
@@ -1439,7 +1432,7 @@ def get_actual_stage_shift(
             if view.lab_code != code:
                 continue
             cats = second_d.get(pk, {})
-            second_k += sum(_n(_month(cats, leaf, j)) for leaf in tot_leaves)
+            second_k += sum(_n(month_value(cats, leaf, j)) for leaf in tot_leaves)
         second_krw = second_k * rate["USD"][j] * 1000
 
         rows.append(
