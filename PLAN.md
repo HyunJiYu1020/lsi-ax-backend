@@ -259,7 +259,7 @@ close_account_stages (변경 후)
 - 같이 고친 것 ③: **`seed.py`가 연구소 통화를 아예 안 넣고 있었다.** 통화는 마이그레이션의 1회성 백필에만 의존해서, "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 컬럼 기본값 USD로 깔렸다 — 현지통화 연구소의 환차 분해(현지→$ 단계)가 통째로 사라지는 상태다. 통화는 환산의 입력이라 시드가 직접 책임지도록 `OVERSEAS_LABS`에 넣었다
 - 롤백: 테스트 추가 + 조회 정렬 2곳 (DB 무변경, `git revert`로 끝)
 
-**Phase 1 — 코드 배치 리팩토링 (DB 무변경)**
+**Phase 1 — 코드 배치 리팩토링 (DB 무변경)** — 🔄 진행 중 (3/6: periods · fxcalc · labs 완료)
 - `services/overseas/` 신설, 공유 헬퍼 이동 + 공개 이름 전환 (D1-A). endpoints의 교차 import를 services 참조로 교체, `overseas_aggregate`의 라우트 핸들러 직접 호출 제거
 - `_check_kind` 등 소소한 중복 통합, `core/periods.py` 추출
 - 이때 **분기·연간 재계산을 `services/overseas/entries.py`의 bulk upsert에 통합** (P1-3 해결 — 쓰기 경로가 하나로 모이는 시점이 유일한 해결 기회)
@@ -269,7 +269,7 @@ close_account_stages (변경 후)
 - `state_token` 발급·검증 (D2-B 1단계). 프런트: 409 수신 시 "다른 저장과 충돌 — 다시 불러오세요" 처리
 - 롤백: 서버가 토큰 검증만 끄면 됨(프런트는 토큰 없이도 동작하게 구현)
 
-**Phase 3 — 테이블 범용화 (D3-A, 리비전 7개를 2배치로)**
+**Phase 3 — 테이블 범용화 (D3-A)** — ✅ 2026-11-16 완료 (리비전 `e1a4c7b93d28` 하나로)
 - 배치 1 (저위험): `reason_translations` rename / `row_aliases`·`carry_defs`·`anomaly_rules`+`logs` rename+`account_key` 백필
 - 배치 2: `variance_reasons`·`variance_drivers` (uq 키 변경 포함)
 - 각 리비전: `ALTER TABLE RENAME` + `ADD COLUMN account_key NOT NULL` + uq 재생성. downgrade 대칭 구현
@@ -277,7 +277,7 @@ close_account_stages (변경 후)
 - API 경로·요청 모양 유지(핸들러가 account_key 주입) → 프런트·MCP 무변경. 모델·쿼리만 수정
 - 검증: 전체 테스트 + 챗봇 도구 스모크. 롤백: downgrade 2회
 
-**Phase 4 — actual_stages 병합 (2단계 배포로 롤백 안전)**
+**Phase 4 — actual_stages 병합** — ✅ 2026-11-16 완료 (리비전 `f3c8a21e6b47` 하나로)
 - **재시드 가능하므로 2단계 배포가 필요 없다**(열린 질문 1 결정) — 아래 4a/4b는 운영 데이터를 지키며 옮길 때의 절차였다. 한 리비전에서 `close_account_stages`에 `first_locked`·`first_locked_at`를 추가하고 `overseas_actual_stages`를 drop한 뒤 재시드한다
 - (운영 데이터가 생긴 뒤에 하게 되면) 4a: `close_account_stages`에 `first_locked`·`first_locked_at` 추가 + 데이터 복사 + **읽기 전환** (쓰기는 양쪽 기록). 문제 시 읽기만 원복
 - 4b: 한 사이클 검증 후 `overseas_actual_stages` 쓰기 중단·테이블 drop
