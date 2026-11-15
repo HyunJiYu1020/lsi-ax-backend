@@ -8,11 +8,11 @@ from sqlalchemy import select
 
 from app.api.v1.endpoints.overseas import (
     ACCOUNT_KEY,
-    _krw_months,
-    _n,
 )
 from app.models import CostEntry, CostEntryDetail
+from app.core.values import n
 from app.services.overseas.entries import bulk_upsert_cost_entries, entry_months_bulk
+from app.services.overseas.aggregate import krw_months
 
 TEST_YM = "209902"
 
@@ -67,13 +67,13 @@ def test_krw_months_adds_only_present_values():
     # 합계는 있는 값만 더해 진행한다 — 미등록 달이 섞여도 나머지 달은 그대로 계산된다.
     rate = [1000.0] * 12
     cats = {"sal": [1.0, None, 2.0] + [None] * 9}
-    got = _krw_months(cats, {}, {"sal"}, rate)
+    got = krw_months(cats, {}, {"sal"}, rate)
     assert got[0] == 1.0 * 1000 * 1000
     assert got[1] == 0.0  # 미등록 달은 더할 값이 없어 0
     assert got[2] == 2.0 * 1000 * 1000
 
 
 def test_n_helper_keeps_zero_distinct_from_none():
-    assert _n(None) == 0.0
-    assert _n(0.0) == 0.0
-    assert _n(3.5) == 3.5
+    assert n(None) == 0.0
+    assert n(0.0) == 0.0
+    assert n(3.5) == 3.5

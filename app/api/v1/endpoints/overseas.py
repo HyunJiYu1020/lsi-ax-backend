@@ -46,6 +46,18 @@ from app.models import (
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, category_label, resolve_leaves
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, ym_month, ym_year, yyyymm
+from app.core.values import n, source_hash
+from app.services.overseas.aggregate import (
+    INPUT_KEYS,
+    LABOR_TREE,
+    STEP_COUNT,
+    TOT_LEAVES,
+    TOT_TREE,
+    cp_quarter_amounts,
+    extra_row_months,
+    group_tree,
+    krw_months,
+)
 from app.services.overseas.entries import (
     bulk_upsert_cost_entries,
     bulk_upsert_plan_entries,
@@ -226,13 +238,6 @@ def _current_user_id() -> int | None:
     """로그인 인증이 아직 없어 항상 None을 돌려준다 — 인증이 붙으면 이 함수 하나만 요청의 로그인
     사용자 id를 읽어오도록 바꾸면, 호출부(created_by_id/updated_by_id를 쓰는 곳)는 그대로 둬도 된다."""
     return None
-
-
-def _n(v: float | None) -> float:
-    """미등록(None)을 0으로 바꿔 "계산에만" 쓴다. 응답으로 내려줄 때는 None을 그대로 둔다 —
-    공통 RULE: 미등록/미업로드 칸은 0이 아니라 빈칸이고, 합계는 있는 값만 더해 진행한다.
-    (None을 0으로 더하는 것과 "있는 값만 더하는 것"은 합계가 같으므로, 합계는 이 헬퍼로 충분하다.)"""
-    return 0.0 if v is None else float(v)
 
 
 def _basis_month(db: Session) -> int:
@@ -749,8 +754,8 @@ def get_labor_split(
         lc = lab.currency if lab.currency and lab.currency != "USD" else None
         amt_cur = amt_base = hc_cur = hc_base = 0.0
         for j in ix:
-            k_cur = sum(_n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
-            k_base = sum(_n(cats_base.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
+            k_cur = sum(n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
+            k_base = sum(n(cats_base.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
             rb = rate_base["USD"][j]
             lrc = rate_cur.get(lc, [0.0] * 12)[j] if lc else 0.0
             lrb = rate_base.get(lc, [0.0] * 12)[j] if lc else 0.0
@@ -760,8 +765,8 @@ def get_labor_split(
             else:
                 amt_cur += k_cur * rb * 1000
             amt_base += k_base * rb * 1000
-            hc_cur += _n(cats_cur.get("hc", [None] * 12)[j]) / len(ix)
-            hc_base += _n(cats_base.get("hc", [None] * 12)[j]) / len(ix)
+            hc_cur += n(cats_cur.get("hc", [None] * 12)[j]) / len(ix)
+            hc_base += n(cats_base.get("hc", [None] * 12)[j]) / len(ix)
         splittable = hc_cur > 0 and hc_base > 0
         p_base = amt_base / hc_base if splittable else 0.0
         p_cur = amt_cur / hc_cur if splittable else 0.0
@@ -813,65 +818,14 @@ def get_labor_split(
 #      3·6·9·12월에 넣는다) — core.js ovCPc.
 #   ② 연구소가 추가한 행(extra-rows)도 anchor_key가 가리키는 계정에 얹어서 합계에 들어간다 — ovCustExtra.
 #   ③ 원화 기타(_ETC)는 히어로 합계에 넣지 않는다(OV_ALLPK에 없음). 참고용으로 etc_total만 따로 준다.
-_TOT_LEAVES = tuple(resolve_leaves("tot"))
-# 업로드 여부 판정에 보는 입력 칸(화면 OV_IN = 파생 아닌 모든 행 + 인력).
-_INPUT_KEYS = frozenset(_TOT_LEAVES) | {"hc"}
-_STEP_COUNT = 3
 
 
-def _group_tree(key: str) -> set[str]:
-    """그 그룹과 그 아래 모든 하위 키(그룹·리프 전부). 추가 행이 어느 집계에 얹히는지 판정에 쓴다."""
-    out = {key}
-    for sub in GROUP_CALC.get(key, ()):
-        out |= _group_tree(sub)
-    return out
 
 
-_TOT_TREE = _group_tree("tot")
-_LABOR_TREE = _group_tree("labor")
-# 화면 OV_ELK에 있는 키(= 추가 행의 anchor_key로 받아들이는 키). 여기 없거나 인력(hc)이면 화면과
-# 똑같이 기타경비(misc)로 떨어뜨린다.
-_ANCHORABLE = frozenset(CATEGORY_LABELS) - {"hc"}
 
 
-def _cp_quarter_amounts(db: Session, year: int) -> tuple[float, float]:
-    """그 해 CP 계약의 분기 금액 (개발비 총액, 인건비) — 단위는 저장값과 같은 K$.
-    POC 헤더값(poc_total · poc_cost_sum)은 직급 행마다 반복 저장돼 있어 POC 단위로 접어서 더한다
-    (행마다 더하면 직급 수만큼 부풀려진다). 연 금액을 4로 나눠 분기 하나치를 만든다 — core.js ovCPc."""
-    pocs = {
-        (r.poc_type, r.poc_proj): (float(r.poc_total), float(r.poc_cost_sum))
-        for r in db.scalars(select(OverseasCpRow).where(OverseasCpRow.year == f"{year:04d}"))
-    }
-    total = sum(v[0] for v in pocs.values()) / 4 / 1000
-    labor = sum(v[1] for v in pocs.values()) / 4 / 1000
-    return total, labor
 
 
-def _extra_row_months(db: Session, yyyymm: str, version: str) -> dict[str, dict[str, list[float]]]:
-    """연구소 pk -> 얹힐 계정 키 -> 월별 금액(K$). 화면 ovCustExtra와 같은 규칙으로 anchor_key에 접는다."""
-    out: dict[str, dict[str, list[float]]] = {}
-    for row in list_extra_rows(yyyymm=yyyymm, version=version, db=db):
-        key = row.anchor_key if row.anchor_key in _ANCHORABLE else "misc"
-        bucket = out.setdefault(row.lab_pk, {}).setdefault(key, [0.0] * 12)
-        for j, v in enumerate(row.v[:12]):
-            bucket[j] += _n(v)
-    return out
-
-
-def _krw_months(
-    cats: dict[str, list[float | None]], extra: dict[str, list[float]], tree: set[str], rate: list[float]
-) -> list[float]:
-    """그 연구소의 월별 원화 금액. 저장값은 K$라 ×1000×(원/$)로 원화가 된다 — core.js ovAgg의 krw 모드."""
-    leaves = [k for k in tree if k not in GROUP_CALC]
-    return [
-        (
-            sum(_n(cats.get(leaf, [None] * 12)[j]) for leaf in leaves)
-            + sum(months[j] for key, months in extra.items() if key in tree)
-        )
-        * rate[j]
-        * 1000
-        for j in range(12)
-    ]
 
 
 @router.get("/overseas/summary", response_model=OverseasSummary)
@@ -910,8 +864,8 @@ def get_overseas_summary(
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
 
     api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = _extra_row_months(db, yyyymm(basis_year, basis_month), api_version)
-    cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)
+    extras = extra_row_months(list_extra_rows(yyyymm=yyyymm(basis_year, basis_month), version=api_version, db=db))
+    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
 
     total = labor = 0.0
     for lab in labs:
@@ -923,15 +877,15 @@ def get_overseas_summary(
         cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
         if not cats and not extra:
             continue
-        tot_m = _krw_months(cats, extra, _TOT_TREE, rate)
-        lab_m = _krw_months(cats, extra, _LABOR_TREE, rate)
+        tot_m = krw_months(cats, extra, TOT_TREE, rate)
+        lab_m = krw_months(cats, extra, LABOR_TREE, rate)
         total += sum(tot_m[j] for j in ix)
         labor += sum(lab_m[j] for j in ix)
     non_labor = total - labor
 
     # 원화 기타는 이미 원화(억원 단위 입력)라 환산하지 않는다. 화면 히어로는 이 값을 합계에 넣지
     # 않으므로(③) 여기서도 total에 더하지 않고 따로만 준다.
-    etc_total = sum(_n(vd.etc[j]) * 100_000_000 for j in ix)
+    etc_total = sum(n(vd.etc[j]) * 100_000_000 for j in ix)
 
     # 업로드 진척: 파트가 여러 개인 연구소는 파트가 모두 올라와야 1건으로 센다(화면 ovHas와 같다).
     by_code: dict[str, list[LabView]] = {}
@@ -945,7 +899,7 @@ def get_overseas_summary(
                 any(
                     v is not None
                     for key, months in (vd.d.get(p.pk) or {}).items()
-                    if key in _INPUT_KEYS
+                    if key in INPUT_KEYS
                     for v in months
                 )
                 for p in parts
@@ -974,8 +928,8 @@ def get_overseas_summary(
         basis_label=f"{basis_year % 100:02d}.{basis_month:02d}",
         period=period,
         version=version,
-        step=max(0, min(state.step - 1, _STEP_COUNT - 1)),
-        step_count=_STEP_COUNT,
+        step=max(0, min(state.step - 1, STEP_COUNT - 1)),
+        step_count=STEP_COUNT,
         total=total,
         etc_total=etc_total,
         labor=labor,
@@ -1487,10 +1441,6 @@ def upsert_note(body: NoteIn, db: Session = Depends(get_db)) -> NoteOut:
 # 다르게 번역되면 보고 문구가 흔들리기 때문에 "원문 1건 = 번역 1개"를 DB로 못 박는 구조다.
 
 
-def _source_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 @router.post("/overseas/reason-translate", response_model=ReasonTranslateResult)
 async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_db)) -> ReasonTranslateResult:
     """연구소가 영문으로 보낸 증감사유를 한국어로 번역한다(원문은 그대로 보관).
@@ -1524,14 +1474,14 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
         r.source_hash: r
         for r in db.scalars(
             select(TextTranslation).where(
-                TextTranslation.source_hash.in_([_source_hash(t) for t in sources])
+                TextTranslation.source_hash.in_([source_hash(t) for t in sources])
             )
         )
     }
     hit: dict[str, TextTranslation] = {}
     todo: list[str] = []
     for text in sources:
-        row = rows.get(_source_hash(text))
+        row = rows.get(source_hash(text))
         if row and not body.refresh:
             hit[text] = row
         elif text not in too_long:
@@ -1557,7 +1507,7 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
             # 같은 원문이 이미 있으면(refresh) 덮어쓴다 — source_hash가 unique라 insert는 못 한다.
             db.execute(
                 pg_insert(TextTranslation)
-                .values(source_hash=_source_hash(text), source_text=text, ko_text=ko, engine=label)
+                .values(source_hash=source_hash(text), source_text=text, ko_text=ko, engine=label)
                 .on_conflict_do_update(
                     index_elements=[TextTranslation.source_hash],
                     set_={"ko_text": ko, "engine": label, "updated_at": func.now()},
@@ -2232,9 +2182,9 @@ def _months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> 
         for i, v in enumerate(months_by_entry[e.id]):
             # 파생 행의 재료 — 미등록은 0으로 보고 더한다(있는 값만 더하는 것과 결과가 같다).
             if i < len(acc):
-                acc[i] += _n(v)
+                acc[i] += n(v)
             else:
-                acc.append(_n(v))
+                acc.append(n(v))
     return out
 
 
@@ -2525,7 +2475,7 @@ def list_cost_extras(
             if not col.formula:
                 continue
             for entry in entries_by_scope.get((col.scope_key, col.version), []):
-                value, basis = _eval_col_formula(col.formula, [_n(v) for v in months_by_entry[entry.id]])
+                value, basis = _eval_col_formula(col.formula, [n(v) for v in months_by_entry[entry.id]])
                 out.append(
                     ExtraValueOut(
                         lab_pk=entry.scope_code, version=entry.version, row_key=entry.category_code,

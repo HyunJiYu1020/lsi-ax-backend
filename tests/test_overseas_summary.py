@@ -1,7 +1,8 @@
 import pytest
+from app.services.overseas.aggregate import cp_quarter_amounts
 from fastapi import HTTPException
 
-from app.api.v1.endpoints.overseas import _cp_quarter_amounts, get_overseas_summary
+from app.api.v1.endpoints.overseas import get_overseas_summary
 
 BASIS_YEAR = 2026
 
@@ -32,7 +33,7 @@ def test_summary_quarters_add_up_to_year(db):
 
 def test_cp_contract_amount_is_folded_per_poc(db):
     """CP 계약은 POC 헤더값이 직급 행마다 반복 저장돼 있다 — 행마다 더하면 직급 수만큼 부풀려진다."""
-    total_q, labor_q = _cp_quarter_amounts(db, BASIS_YEAR)
+    total_q, labor_q = cp_quarter_amounts(db, BASIS_YEAR)
     assert total_q >= labor_q >= 0
     # 분기 하나치 = 연 계약액 ÷ 4라, 연 금액으로 되돌리면 K$ 단위의 계약 총액이 된다.
     assert total_q * 4 > 0

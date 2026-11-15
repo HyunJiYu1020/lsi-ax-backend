@@ -19,16 +19,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
+from app.core.values import n
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
+from app.services.overseas.aggregate import (
+    LABOR_TREE,
+    TOT_TREE,
+    cp_quarter_amounts,
+    extra_row_months,
+    krw_months,
+)
 from app.api.v1.endpoints.overseas import (
+    list_extra_rows,
     _basis_month,
-    _cp_quarter_amounts,
-    _extra_row_months,
-    _krw_months,
-    _n,
-    _LABOR_TREE,
-    _TOT_TREE,
     get_overseas_state,
 )
 from app.api.v1.endpoints.overseas_variance import check_variance_reasons
@@ -255,8 +258,10 @@ def get_labor_ratio(
     ]
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
     api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = _extra_row_months(db, yyyymm(basis_year, basis_month), api_version)
-    cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)
+    extras = extra_row_months(
+        list_extra_rows(yyyymm=yyyymm(basis_year, basis_month), version=api_version, db=db)
+    )
+    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
 
     by_code: dict[str, dict] = {}
     for lab in labs:
@@ -274,8 +279,8 @@ def get_labor_ratio(
         cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
         if not cats and not extra:
             continue
-        acc["tot"] += sum(_krw_months(cats, extra, _TOT_TREE, rate)[j] for j in ix)
-        acc["lab"] += sum(_krw_months(cats, extra, _LABOR_TREE, rate)[j] for j in ix)
+        acc["tot"] += sum(krw_months(cats, extra, TOT_TREE, rate)[j] for j in ix)
+        acc["lab"] += sum(krw_months(cats, extra, LABOR_TREE, rate)[j] for j in ix)
 
     def _row(code: str, name: str, tot: float, labor: float) -> OverseasLaborRatioRow:
         return OverseasLaborRatioRow(

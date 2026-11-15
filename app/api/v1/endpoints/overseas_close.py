@@ -26,10 +26,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.v1.endpoints.overseas import _n
 from app.api.v1.endpoints.overseas_variance import _active_labs, _load_cost_version
 from app.core.cost_groups import resolve_leaves
 from app.core.periods import month_value, yyyymm
+from app.core.values import n
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.core.voucher_match import match_rule, normalize, suggest_lab, suggest_rules
@@ -522,7 +522,7 @@ def _prev_lab_krw(db: Session, year: int, month: int) -> tuple[dict[str, float],
     out: dict[str, float] = {}
     for pk in labs:
         cats = data.get(pk, {})
-        k = sum(_n(month_value(cats, leaf, j)) for leaf in leaves)
+        k = sum(n(month_value(cats, leaf, j)) for leaf in leaves)
         out[pk] = k * usd_krw * 1000
     return out, sum(out.values())
 

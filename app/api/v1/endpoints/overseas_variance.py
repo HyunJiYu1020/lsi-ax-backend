@@ -25,11 +25,11 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.endpoints.overseas import (
     _basis_month,
-    _n,
-    _source_hash,
+    source_hash,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
 from app.core.periods import PERIOD_IX, month_value, yyyymm
+from app.core.values import n, source_hash
 from app.services.overseas.entries import entry_months_bulk, plan_entry_months_bulk
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
@@ -471,8 +471,8 @@ def _variance_cells(
         for key, keys in leaves.items():
             cell = out[key]
             for j in ix:
-                uc = sum(_n(month_value(cats_cur, leaf, j)) for leaf in keys)
-                ub = sum(_n(month_value(cats_base, leaf, j)) for leaf in keys)
+                uc = sum(n(month_value(cats_cur, leaf, j)) for leaf in keys)
+                ub = sum(n(month_value(cats_base, leaf, j)) for leaf in keys)
                 if key == "hc":
                     # 인력은 금액이 아니라 명(月 평균)이다 — 환율을 곱하지 않고 기간 평균을 낸다.
                     cell["cur"] += uc / len(ix)
@@ -815,7 +815,7 @@ async def make_variance_reason_draft(
     engine = engine_label(provider)
 
     cached = db.scalar(
-        select(TextTranslation).where(TextTranslation.source_hash == _source_hash(source))
+        select(TextTranslation).where(TextTranslation.source_hash == source_hash(source))
     )
     source_ko = cached.ko_text if cached and cached.ko_text else ""
     error = ""
@@ -855,7 +855,7 @@ def _cache_translation(db: Session, source: str, ko: str, engine: str) -> None:
     원문이 두 번역을 갖게 되어 "원문 1건 = 번역 1개"가 깨진다. ko_text가 String(600)이라 길면 자른다."""
     text = ko[:600]
     stmt = pg_insert(TextTranslation).values(
-        source_hash=_source_hash(source), source_text=source, ko_text=text, engine=engine
+        source_hash=source_hash(source), source_text=source, ko_text=text, engine=engine
     )
     db.execute(
         stmt.on_conflict_do_update(
@@ -1312,7 +1312,7 @@ def get_actual_first(
             if view.lab_code != code:
                 continue
             cats = base_d.get(pk, {})
-            base_k += sum(_n(month_value(cats, leaf, j)) for leaf in tot_leaves)
+            base_k += sum(n(month_value(cats, leaf, j)) for leaf in tot_leaves)
         base_krw = base_k * rb * 1000
 
         # 세 칸의 합이 반드시 증감(krw - base_krw)과 같아야 한다 — 환차를 가른 뒤 남는 몫이 환차外다.
@@ -1445,7 +1445,7 @@ def get_actual_stage_shift(
             if view.lab_code != code:
                 continue
             cats = second_d.get(pk, {})
-            second_k += sum(_n(month_value(cats, leaf, j)) for leaf in tot_leaves)
+            second_k += sum(n(month_value(cats, leaf, j)) for leaf in tot_leaves)
         second_krw = second_k * rate["USD"][j] * 1000
 
         rows.append(

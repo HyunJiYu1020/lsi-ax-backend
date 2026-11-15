@@ -20,13 +20,12 @@ import pytest
 
 from app.api.v1.endpoints.overseas import (
     _basis_month,
-    _group_tree,
-    _krw_months,
     yyyymm,
     get_labor_split,
     get_overseas_state,
 )
 from app.services.overseas.labs import lab_views
+from app.services.overseas.aggregate import group_tree, krw_months
 from app.core.cost_groups import GROUP_CALC, resolve_leaves
 from app.services.overseas.fxcalc import rate_arrays
 
@@ -169,7 +168,7 @@ def test_group_definitions_cover_the_same_keys():
 
 
 def test_krw_aggregation_matches_three_implementations():
-    """ovAgg(mode="krw") = _krw_months. 저장값 K$ × 1000 × (원/$)로 원화를 만드는 경로다.
+    """ovAgg(mode="krw") = krw_months. 저장값 K$ × 1000 × (원/$)로 원화를 만드는 경로다.
 
     연구소 2곳(USD · 현지통화)을 묶어서 집계한다 — pk 하나만 넣으면 "여러 연구소를 더하는 순서"에서
     나는 차이를 못 잡는다."""
@@ -180,12 +179,12 @@ def test_krw_aggregation_matches_three_implementations():
     )
 
     for k in keys:
-        tree = _group_tree(k)
+        tree = group_tree(k)
         backend = [0.0] * 12
         for pk in (PK_USD, PK_LOCAL):
             # 인력(hc)은 금액이 아니라 명수라 환율을 곱하지 않는다 — 프런트 ovAgg도 k==="hc"를 건너뛴다.
             rate = [1.0] * 12 if k == "hc" else RATE_KRW
-            months = _krw_months(d[pk], {}, tree, rate)
+            months = krw_months(d[pk], {}, tree, rate)
             for j in MONTHS:
                 backend[j] += months[j] if k != "hc" else months[j] / 1000
         for j in MONTHS:
