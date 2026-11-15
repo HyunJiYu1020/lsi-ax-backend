@@ -272,12 +272,14 @@ close_account_stages (변경 후)
 **Phase 3 — 테이블 범용화 (D3-A, 리비전 7개를 2배치로)**
 - 배치 1 (저위험): `reason_translations` rename / `row_aliases`·`carry_defs`·`anomaly_rules`+`logs` rename+`account_key` 백필
 - 배치 2: `variance_reasons`·`variance_drivers` (uq 키 변경 포함)
-- 각 리비전: `ALTER TABLE RENAME` + `ADD COLUMN account_key DEFAULT 'overseas'` 백필 + default 제거 + uq 재생성. downgrade 대칭 구현
+- 각 리비전: `ALTER TABLE RENAME` + `ADD COLUMN account_key NOT NULL` + uq 재생성. downgrade 대칭 구현
+- **데이터는 재시드한다**(열린 질문 1 결정) — 기존 행을 `'overseas'`로 백필하는 단계가 필요 없다. 스키마만 바꾸고 `app.db.seed`를 다시 돌린다. 덕분에 `DEFAULT 'overseas'` 임시 지정 → 백필 → default 제거의 3단 춤을 생략하고, `account_key`를 처음부터 기본값 없는 NOT NULL로 둘 수 있다(계정을 명시하지 않은 삽입을 DB가 바로 막는다)
 - API 경로·요청 모양 유지(핸들러가 account_key 주입) → 프런트·MCP 무변경. 모델·쿼리만 수정
 - 검증: 전체 테스트 + 챗봇 도구 스모크. 롤백: downgrade 2회
 
 **Phase 4 — actual_stages 병합 (2단계 배포로 롤백 안전)**
-- 4a: `close_account_stages`에 `first_locked`·`first_locked_at` 추가 + 데이터 복사 + **읽기 전환** (쓰기는 양쪽 기록). 문제 시 읽기만 원복
+- **재시드 가능하므로 2단계 배포가 필요 없다**(열린 질문 1 결정) — 아래 4a/4b는 운영 데이터를 지키며 옮길 때의 절차였다. 한 리비전에서 `close_account_stages`에 `first_locked`·`first_locked_at`를 추가하고 `overseas_actual_stages`를 drop한 뒤 재시드한다
+- (운영 데이터가 생긴 뒤에 하게 되면) 4a: `close_account_stages`에 `first_locked`·`first_locked_at` 추가 + 데이터 복사 + **읽기 전환** (쓰기는 양쪽 기록). 문제 시 읽기만 원복
 - 4b: 한 사이클 검증 후 `overseas_actual_stages` 쓰기 중단·테이블 drop
 - 롤백: 4a는 읽기 스위치 원복, 4b 이전엔 데이터 양쪽에 존재
 
@@ -294,7 +296,7 @@ close_account_stages (변경 후)
 
 ## 7. 결정이 필요한 질문
 
-1. **운영 데이터**: 지금 DB의 데이터(시드 + 테스트 입력)는 보존 대상인가, 재시드 가능한가? — 재시드 가능하면 Phase 3·4의 마이그레이션을 더 단순하게(백필 생략) 짤 수 있다
+1. ~~**운영 데이터**: 보존 대상인가, 재시드 가능한가?~~ — **2026-11-16 결정: 개발용 데이터라 재시드 가능.** Phase 3·4는 백필 없이 재시드 방식으로 짠다(아래 Phase 3·4 참조)
 2. **frontend-html(목업)의 수명**: React로 수렴할 계획과 시점은? — Phase 6의 범위가 2벌 수정이냐 1벌이냐로 갈린다. 목업을 곧 버린다면 대조 테스트도 calc.js·백엔드 2자 비교로 축소
 3. **다음에 구현할 계정 2~3개와 그 데이터 모양**(matrix / line_items / monthly_total): Phase 3에서 일반화한 테이블이 실제로 맞는지 두 번째 계정으로 검증하고 싶다 — 어느 계정이 먼저인가?
 4. **바꾸면 안 되는 API가 있는가**: 외부(타 시스템·ERP I/F)가 호출하는 엔드포인트가 있나? 없다면 Phase 5에서 경로 정리 자유도가 커진다
