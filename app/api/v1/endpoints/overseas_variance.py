@@ -23,14 +23,10 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.api.v1.endpoints.overseas import (
-    _basis_month,
-    source_hash,
-)
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
 from app.core.periods import PERIOD_IX, month_value, yyyymm
 from app.core.values import n, source_hash
-from app.services.overseas.entries import entry_months_bulk, plan_entry_months_bulk
+from app.services.overseas.entries import current_basis_month, entry_months_bulk, plan_entry_months_bulk
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.core.reason_translate import (
@@ -339,7 +335,7 @@ def get_variance_basis(
     있고 어디에 데이터가 들어왔는지에 달려 있다. 브라우저가 "기준월 - 1"로 추측하면 1월(연도 넘어감)
     과 데이터가 비어 있는 달에서 틀린 라벨을 보여준다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     if not 1 <= month <= 12:
         raise HTTPException(400, "basis_month는 1~12여야 한다.")
     return _resolve_bases(db, basis_year, month, kind, plan_no)
@@ -629,7 +625,7 @@ def get_variance(
     있다. 두 버전의 금액을 각자의 환율로 환산해 빼면 "실제로 비용이 늘어난 몫"과 "환율 때문에 늘어난
     몫"이 뭉개져서, 사용자가 보는 표와 다른 답이 나온다. 이 엔드포인트는 그 둘을 갈라서 준다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     _check_stage(stage, kind)
     return _compute_variance(
         db, basis_year, month, kind, base_version, period, lab_scope, plan_no, stage
@@ -713,7 +709,7 @@ def list_variance_reasons(
     보여줘야 담당자가 무엇을 다시 봐야 하는지 안다. needs_recheck 플래그만으로는 얼마나 바뀐 건지
     알 수 없다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     key = VarianceReasonIn(
         basis_year=basis_year, basis_month=month, kind=kind, stage=_check_stage(stage, kind),
         base_version=base_version, period=period, lab_scope=lab_scope, category_key="",
@@ -887,7 +883,7 @@ def check_variance_reasons(
     집계 행(개발비(매출)·개발비(A) 등)은 목록에서 뺀다 — 하위 계정의 합이라 같은 사유를 두 번 쓰게
     된다. 인력(명)·(%) 행도 금액 증감이 아니라서 뺀다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     stage = _check_stage(stage, kind)
     key = VarianceReasonIn(
         basis_year=basis_year, basis_month=month, kind=kind, stage=stage, base_version=base_version,
@@ -1049,7 +1045,7 @@ def list_variance_drivers(
     값을 저장하지 않고 매번 계산하는 이유: 연구소가 파일을 다시 올리면 동인 금액도 따라 바뀌어야
     한다. 저장해 두면 원본이 바뀐 뒤에도 옛 숫자가 그대로 남아 틀린 표가 된다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     rows = _visible_drivers(db, basis_year, month, kind, lab_scope)
     out = [_driver_out(r, basis_year, month, kind) for r in rows]
     if not out or not with_values:
@@ -1116,7 +1112,7 @@ def delete_variance_driver(
     """이 버전에 붙인 동인 표를 뗀다. 이전 버전에서 carry_over로 따라온 표는 여기서 지울 수 없다 —
     그건 그 버전의 자료라서, 끊고 싶으면 그 버전에서 carry_over를 끄는 게 맞다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     row = db.scalar(
         select(VarianceDriver).where(
             VarianceDriver.account_key == ACCOUNT_KEY,

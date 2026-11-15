@@ -17,8 +17,9 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.v1.endpoints import overseas_variance as ov
-from app.api.v1.endpoints.overseas import LabView, _basis_month
+from app.api.v1.endpoints.overseas import LabView
 from app.models import CloseAccountStage
+from app.services.overseas.entries import current_basis_month
 from app.schemas.overseas import (
     ActualFirstIn,
     ActualStageIn,
@@ -163,7 +164,7 @@ def test_headcount_is_averaged_not_rate_converted(monkeypatch):
 
 def test_variance_rows_internally_consistent(db):
     """실제 DB 데이터로도 모든 금액 행에서 증감 = 환차 + 환차外가 성립하고, 소계가 하위 합과 맞는다."""
-    month = _basis_month(db) or 9
+    month = current_basis_month(db) or 9
     try:
         r = ov.get_variance(2026, "prev", month, "forecast", "y", "ALL", None, "", db)
     except HTTPException as e:
@@ -179,7 +180,7 @@ def test_variance_rows_internally_consistent(db):
 def test_plan_comparison_cannot_split_fx(db):
     """경영계획은 속보/실적 환율 기준이 없어 환차를 가를 수 없다 — 환차 칸이 0이면 "환차가 없었다"로
     읽히므로, 응답 note에 그 사실을 적어 내려보낸다."""
-    month = _basis_month(db) or 9
+    month = current_basis_month(db) or 9
     try:
         r = ov.get_variance(2026, "plan", month, "forecast", "y", "ALL", None, "", db)
     except HTTPException as e:
@@ -282,7 +283,7 @@ def test_first_and_second_reasons_stored_separately(db):
 def test_reason_check_lists_only_big_moves_without_reason(db):
     """확정 경고는 증감률이 기준치를 넘었는데 사유가 없는 칸만 모은다. 집계 행(개발비(매출) 등)과
     인력·(%) 행은 빠진다 — 하위 계정의 합이라 같은 사유를 두 번 쓰게 된다."""
-    month = _basis_month(db) or 9
+    month = current_basis_month(db) or 9
     try:
         chk = ov.check_variance_reasons(2026, "prev", "y", month, "forecast", "", "ALL", None, 0.01, db)
     except HTTPException as e:

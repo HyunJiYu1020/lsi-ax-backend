@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
 from app.core.values import n
 from app.services.overseas.fxcalc import rate_arrays
+from app.services.overseas.entries import current_basis_month
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.services.overseas.aggregate import (
     LABOR_TREE,
@@ -31,7 +32,6 @@ from app.services.overseas.aggregate import (
 )
 from app.api.v1.endpoints.overseas import (
     list_extra_rows,
-    _basis_month,
     get_overseas_state,
 )
 from app.api.v1.endpoints.overseas_variance import check_variance_reasons
@@ -133,7 +133,7 @@ def check_overseas_confirm(
     실적 시뮬레이션(kind=actual)도 같은 점검을 하고, 거기서의 확정은 "해외연구소 실적 계정 완료"를
     뜻한다 — 보는 버전만 다르고 규칙은 같다."""
     _check_kind(kind)
-    month = basis_month or _basis_month(db) or 1
+    month = basis_month or current_basis_month(db) or 1
     version = _KIND_VERSION[kind]
     ym = yyyymm(basis_year, month)
 

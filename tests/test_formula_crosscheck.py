@@ -19,12 +19,12 @@ from pathlib import Path
 import pytest
 
 from app.api.v1.endpoints.overseas import (
-    _basis_month,
     yyyymm,
     get_labor_split,
     get_overseas_state,
 )
 from app.services.overseas.labs import lab_views
+from app.services.overseas.entries import current_basis_month
 from app.services.overseas.aggregate import group_tree, krw_months
 from app.core.cost_groups import GROUP_CALC, resolve_leaves
 from app.services.overseas.fxcalc import rate_arrays
@@ -306,7 +306,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
     (calc.js:93-101). 즉 core.js·백엔드는 "항상 월평균", calc.js는 "구간별 전환"이다. 수치 대조가
     아니라 설계가 갈린 지점이라 Phase 6(수식 백엔드 단일화)에서 맞춰야 한다 — 여기 기록만 남긴다.
     """
-    basis_month = _basis_month(db) or 1
+    basis_month = current_basis_month(db) or 1
     labs = lab_views(db, yyyymm(BASIS_YEAR, basis_month))
     local = {lab.currency for lab in labs if lab.currency and lab.currency != "USD"}
     if not local:

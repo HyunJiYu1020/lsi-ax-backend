@@ -13,11 +13,11 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.core.periods import ym_year
+from app.core.periods import ym_month, ym_year
 from app.models import (
     CostEntry,
     CostEntryDetail,
@@ -278,3 +278,12 @@ def upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months:
         set_={"amount": stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
     )
     db.execute(stmt)
+
+
+def current_basis_month(db: Session) -> int:
+    """forecast(속보) 버전 중 가장 최근(yyyymm 최댓값)의 월 — 지금 편성 기준월.
+    yyyymm이 "YYYYMM" 6자리 고정폭이라 문자열 최댓값이 곧 날짜순 최댓값과 같다."""
+    latest = db.scalar(
+        select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
+    )
+    return ym_month(latest) if latest else 0

@@ -59,6 +59,7 @@ from app.services.overseas.aggregate import (
     krw_months,
 )
 from app.services.overseas.entries import (
+    current_basis_month,
     bulk_upsert_cost_entries,
     bulk_upsert_plan_entries,
     ensure_plan_version,
@@ -240,13 +241,6 @@ def _current_user_id() -> int | None:
     return None
 
 
-def _basis_month(db: Session) -> int:
-    """forecast(속보) 버전 중 가장 최근(yyyymm 최댓값)의 월 — 지금 편성 기준월.
-    yyyymm이 "YYYYMM" 6자리 고정폭이라 문자열 최댓값이 곧 날짜순 최댓값과 같다."""
-    latest = db.scalar(
-        select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
-    )
-    return ym_month(latest) if latest else 0
 
 
 
@@ -292,7 +286,7 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
     step = progress.current_step_order if progress else 1
 
     V: dict[str, VersionData] = {v: VersionData(d={}, etc=[0.0] * 12) for v in ("cur", "prev", "prior", "plan")}
-    basis_month = _basis_month(db)
+    basis_month = current_basis_month(db)
 
     # 연구소가 직접 추가한 행(label이 있는 cost_entries 행)은 extra-rows 엔드포인트가 따로 내려주므로
     # d[pk]에서는 제외한다(두 군데서 중복·drift 방지).
