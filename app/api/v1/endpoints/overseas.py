@@ -1,5 +1,7 @@
+import hashlib
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9,6 +11,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core import anomaly, row_match
+from app.core.reason_translate import MAX_LEN, MAX_TEXTS, engine_label, normalize, resolve_provider, translate_batch
 from app.core.storage import upload_bytes
 from app.db.session import get_db
 from app.models import (
@@ -24,17 +28,23 @@ from app.models import (
     Memo,
     MemoCol,
     Note,
+    OverseasAnomalyRule,
+    OverseasAnomalyRuleLog,
+    OverseasCarryDef,
     OverseasCpRow,
     OverseasLab,
+    OverseasLabRevision,
     OverseasLabSheet,
     OverseasReasonRow,
+    OverseasReasonTranslation,
+    OverseasRowAlias,
     OverseasVendorRow,
     OverseasVendorRowDetail,
     OverseasFxRuleOverride,
     SheetRow,
     Upload,
 )
-from app.core.cost_groups import category_label, resolve_leaves
+from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, category_label, resolve_leaves
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.api.v1.endpoints.fx import _compute_applied_rows, _FxRateCache, _overseas_fx_default
@@ -66,7 +76,28 @@ from app.schemas.overseas import (
     NoteIn,
     NoteOut,
     OverseasState,
+    OverseasSummary,
+    OverseasSummaryLab,
     ReasonRow,
+    ReasonTranslateIn,
+    ReasonTranslateItem,
+    AnomalyFinding,
+    AnomalyRuleIn,
+    AnomalyRuleLogOut,
+    AnomalyRuleOut,
+    AnomalyScanIn,
+    AnomalyScanResult,
+    CarryDefIn,
+    CarryDefOut,
+    CarryForwardIn,
+    CarryForwardResult,
+    ReasonTranslateResult,
+    RowAliasIn,
+    RowAliasOut,
+    RowMatchIn,
+    RowMatchItem,
+    RowMatchResult,
+    RowMatchSuggestion,
     SheetRowIn,
     SheetRowOut,
     StepUpdate,
@@ -95,7 +126,127 @@ def _overseas_account(db: Session) -> Account:
 
 
 def _labs(db: Session) -> list[OverseasLab]:
+    """지금 값(overseas_labs) 그대로. 쓰기(수정·삭제)와 "pk가 실재하나" 검증에만 쓴다 —
+    버전별 숫자를 계산할 때는 _lab_views(as_of=...)로 그 시점 값을 읽어야 한다."""
     return list(db.scalars(select(OverseasLab)))
+
+
+# ---------- 연구소 기준정보를 "그 버전 시점"으로 읽기 ----------
+# 공통 RULE: 기준정보 변경은 변경한 버전부터 적용하고 지난 버전은 영향받지 않는다.
+# overseas_labs에는 "지금 값" 한 줄뿐이라 그대로 읽으면 과거 버전까지 새 값으로 다시 계산된다
+# (통화를 USD→ILS로 바꾸는 순간 이미 마감한 달의 환차 분해가 달라진다). 그래서 변경 이력
+# (overseas_lab_revisions)을 남기고, 버전이 보는 시점의 값으로 되돌려 읽는다.
+# fx가 기본 환산 기준을 바꿀 때 과거 달에 예외를 심어 고정하는 것과 같은 방식이다.
+
+LAB_EPOCH = "0000-01"  # "처음부터" — 기준정보가 처음 바뀌기 전 구간을 가리키는 effective_from
+
+
+@dataclass(frozen=True)
+class LabView:
+    """as_of 시점으로 읽은 연구소 기준정보. 필드 이름을 OverseasLab과 맞춰 놔서 읽기만 하는
+    호출부는 둘 중 아무거나 받아도 된다(쓰기는 ORM 객체인 _labs 쪽을 써야 한다)."""
+
+    pk: str
+    lab_code: str
+    part_code: str | None
+    name: str
+    country: str
+    sort_order: int
+    currency: str
+    is_active: bool
+
+
+def _lab_views(db: Session, as_of: str | None = None) -> list[LabView]:
+    """as_of("YYYY-MM") 시점의 기준정보. as_of가 없으면 지금 값 그대로 본다.
+
+    그 시점 값 = effective_from이 as_of 이하인 이력 중 가장 최근 행. 한 번도 안 바뀐 연구소는
+    이력이 없어서 overseas_labs를 그대로 쓴다(바뀐 적이 없으니 시점과 무관하게 같은 값이다)."""
+    labs = _labs(db)
+    part_count: dict[str, int] = {}
+    for lab in labs:
+        part_count[lab.lab_code] = part_count.get(lab.lab_code, 0) + 1
+
+    at: dict[str, OverseasLabRevision] = {}
+    if as_of is not None:
+        for rev in db.scalars(
+            select(OverseasLabRevision)
+            .where(OverseasLabRevision.effective_from <= as_of)
+            .order_by(OverseasLabRevision.lab_code, OverseasLabRevision.effective_from)
+        ):
+            at[rev.lab_code] = rev  # 정렬돼 있으므로 마지막으로 덮어쓴 것이 가장 최근 이력
+
+    out: list[LabView] = []
+    for lab in labs:
+        rev = at.get(lab.lab_code)
+        out.append(
+            LabView(
+                pk=lab.pk,
+                lab_code=lab.lab_code,
+                part_code=lab.part_code,
+                # SARC처럼 파트가 여러 개면 이름이 파트마다 달라서 이력의 단일 이름으로 덮어쓰지
+                # 않는다 — save_labs/upsert_lab이 저장할 때 쓰는 규칙과 같다.
+                name=rev.name if rev and part_count[lab.lab_code] == 1 else lab.name,
+                country=lab.country,
+                sort_order=rev.sort_order if rev else lab.sort_order,
+                currency=rev.currency if rev else lab.currency,
+                is_active=rev.is_active if rev else lab.is_active,
+            )
+        )
+    return out
+
+
+def _current_basis_ym(db: Session) -> str:
+    """지금 편성 중인 기준연월 "YYYY-MM" — 기준정보를 바꿀 때 기본 적용 시점(= "이 버전부터")."""
+    latest = db.scalar(
+        select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
+    )
+    if latest:
+        return f"{_ym_year(latest):04d}-{_ym_month(latest):02d}"
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _record_lab_revision(db: Session, lab_code: str, before: dict, after: dict, effective_from: str) -> None:
+    """기준정보가 실제로 바뀔 때만 이력 두 줄을 남긴다.
+
+    1) 바뀌기 전 값을 '0000-01'(처음부터)로 한 번 박아서 지난 버전 전부를 옛 값으로 고정하고,
+    2) 새 값을 effective_from으로 넣는다(같은 달에 또 고치면 그 줄을 덮어쓴다).
+    1)은 이미 있으면 건드리지 않는다 — 처음 고정해 둔 "원래 값"이 두 번째 변경 때 덮이면
+    과거가 다시 흔들린다."""
+    if before == after:
+        return
+    db.execute(
+        pg_insert(OverseasLabRevision)
+        .values(lab_code=lab_code, effective_from=LAB_EPOCH, **before)
+        .on_conflict_do_nothing(index_elements=["lab_code", "effective_from"])
+    )
+    stmt = pg_insert(OverseasLabRevision).values(lab_code=lab_code, effective_from=effective_from, **after)
+    db.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["lab_code", "effective_from"],
+            set_={k: stmt.excluded[k] for k in after},
+        )
+    )
+
+
+def _check_effective_from(value: str | None, db: Session) -> str:
+    """기준정보 변경이 적용되기 시작하는 연월. 안 주면 지금 편성 중인 기준월(= "이 버전부터")."""
+    if not value:
+        return _current_basis_ym(db)
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        raise HTTPException(400, f'effective_from은 "YYYY-MM" 형식이어야 한다: {value!r}')
+    return value
+
+
+def _lab_attrs(labs: list[OverseasLab]) -> dict:
+    """이력에 남길 값 묶음. 파트가 여러 개면 이름은 파트마다 다르므로 대표(첫 파트) 이름을 쓴다 —
+    되돌려 읽을 때도 파트가 여럿이면 이름은 안 덮어쓰므로 비교·복원에 영향이 없다."""
+    head = labs[0]
+    return {
+        "name": head.name,
+        "currency": head.currency,
+        "is_active": head.is_active,
+        "sort_order": head.sort_order,
+    }
 
 
 # 집계 화면의 파생 행이 쓰는 "전체 연구소 합산" 범위. cost_entries.scope_code 주석에 이미 적혀 있는
@@ -145,6 +296,13 @@ def _current_user_id() -> int | None:
     return None
 
 
+def _n(v: float | None) -> float:
+    """미등록(None)을 0으로 바꿔 "계산에만" 쓴다. 응답으로 내려줄 때는 None을 그대로 둔다 —
+    공통 RULE: 미등록/미업로드 칸은 0이 아니라 빈칸이고, 합계는 있는 값만 더해 진행한다.
+    (None을 0으로 더하는 것과 "있는 값만 더하는 것"은 합계가 같으므로, 합계는 이 헬퍼로 충분하다.)"""
+    return 0.0 if v is None else float(v)
+
+
 def _yyyymm(year: int, month: int) -> str:
     return f"{year:04d}{month:02d}"
 
@@ -166,11 +324,15 @@ def _basis_month(db: Session) -> int:
     return _ym_month(latest) if latest else 0
 
 
-def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[float]]:
+def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[float | None]]:
     """엔트리별 월 값을 한 번의 쿼리로 모아 돌려준다 (호출부가 엔트리마다 따로 조회하지 않도록).
     기본은 12개월(그 헤더의 yyyymm 연도)이지만, 다음 연도치(year+1)까지 저장돼 있으면 24개월(그다음도
     저장돼 있으면 36개월…, 항상 12의 배수)로 이어 붙여 돌려준다 — 기간을 12개월 너머로 늘려 받을 때
-    쓰는 확장 지점."""
+    쓰는 확장 지점.
+
+    디테일 행이 아예 없는 달은 0이 아니라 None(미등록)으로 돌려준다 — 0으로 채우면 "0원으로 올라온
+    달"과 "아직 안 올라온 달"이 구분되지 않는다(공통 RULE: 빈칸 처리). 계산에 쓸 때는 _n()으로 0으로
+    바꿔 더한다."""
     entry_ids = [e.id for e in entries]
     if not entry_ids:
         return {}
@@ -185,15 +347,18 @@ def _entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[
         idx = (r.year - base_year_by_id[r.cost_entry_id]) * 12 + (r.period - 1)  # 0-based: 0~11=1년차, 12~23=2년차…
         by_entry.setdefault(r.cost_entry_id, {})[idx] = float(r.amount)
         max_idx_by_entry[r.cost_entry_id] = max(max_idx_by_entry.get(r.cost_entry_id, -1), idx)
-    out: dict[int, list[float]] = {}
+    out: dict[int, list[float | None]] = {}
     for eid in entry_ids:
-        n = ((max_idx_by_entry.get(eid, -1) // 12) + 1) * 12
+        # 디테일이 하나도 없어도(= 행은 있지만 아직 한 달도 안 올라옴) 12칸은 돌려준다 — 빈 배열을
+        # 주면 받는 쪽이 월 인덱스로 집으려다 터진다. 그 12칸은 전부 None(미등록)이다.
+        n = max(12, ((max_idx_by_entry.get(eid, -1) // 12) + 1) * 12)
         vals = by_entry.get(eid, {})
-        out[eid] = [vals.get(i, 0.0) for i in range(n)]
+        out[eid] = [vals.get(i) for i in range(n)]
     return out
 
 
-def _plan_entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list[float]]:
+def _plan_entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list[float | None]]:
+    """경영계획 월 값. _entry_months_bulk와 같이 디테일이 없는 달은 None(미등록)이다."""
     if not entry_ids:
         return {}
     by_entry: dict[int, dict[int, float]] = {}
@@ -203,7 +368,7 @@ def _plan_entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list
         )
     ):
         by_entry.setdefault(r.plan_entry_id, {})[r.period] = float(r.amount)
-    return {eid: [by_entry.get(eid, {}).get(m, 0.0) for m in range(1, 13)] for eid in entry_ids}
+    return {eid: [by_entry.get(eid, {}).get(m) for m in range(1, 13)] for eid in entry_ids}
 
 
 def _latest_uploads_stmt(lab_pks: set[str], versions: list[str]):
@@ -242,23 +407,26 @@ def _get_or_create_entry(db: Session, scope_code: str, version: str, category_co
     )
 
 
-def _upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months: list[float]) -> None:
+def _upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months: list[float | None]) -> None:
     """months는 12개(1년치)가 기본이지만 12의 배수(24·36…)면 2년차부터 base_year+1, base_year+2…로
     이어서 저장한다 — 기간을 12개월 너머로 늘려 받을 때 쓰는 확장 지점.
 
     월마다 따로 실행하면 행 하나 저장에 12번(24개월이면 24번) DB 왕복이 나서, 디테일 전체를
-    한 문장으로 모아 upsert한다(_bulk_upsert_cost_entries와 같은 이유)."""
-    if not months:
+    한 문장으로 모아 upsert한다(_bulk_upsert_cost_entries와 같은 이유).
+
+    None인 달은 아예 쓰지 않는다 — 미등록은 "0으로 등록됨"이 아니라 "행이 없음"이어야 조회할 때
+    다시 빈칸으로 나온다(공통 RULE: 빈칸 처리)."""
+    values = [
+        {
+            "cost_entry_id": cost_entry_id, "year": base_year + i // 12, "period_type": "MONTH",
+            "period": i % 12 + 1, "col_name": "", "amount": amount,
+        }
+        for i, amount in enumerate(months)
+        if amount is not None
+    ]
+    if not values:
         return
-    stmt = pg_insert(CostEntryDetail).values(
-        [
-            {
-                "cost_entry_id": cost_entry_id, "year": base_year + i // 12, "period_type": "MONTH",
-                "period": i % 12 + 1, "col_name": "", "amount": amount,
-            }
-            for i, amount in enumerate(months)
-        ]
-    )
+    stmt = pg_insert(CostEntryDetail).values(values)
     stmt = stmt.on_conflict_do_update(
         index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
         set_={"amount": stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
@@ -266,12 +434,12 @@ def _upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months
     db.execute(stmt)
 
 
-def _bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, list[float]]]) -> None:
+def _bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, list[float | None]]]) -> None:
     """(scope_code, version, category_code, yyyymm, months) 목록을 헤더·디테일 각각 단일 upsert
     문으로 한 번에 처리한다 — save_overseas_state가 행마다 _get_or_create_entry+월별 insert를
     따로 호출하면 (lab×category 조합 수)×14번 왕복이 나서, 그걸 피하려고 모아서 처리한다.
     같은 키가 두 번 들어오면 (호출부가 겹쳐 보낸 경우) 마지막 값이 이긴다 — 기존의 순차 upsert와 동일한 규칙."""
-    dedup: dict[tuple[str, str, str, str], list[float]] = {
+    dedup: dict[tuple[str, str, str, str], list[float | None]] = {
         (scope_code, version, category_code, yyyymm): months
         for scope_code, version, category_code, yyyymm, months in rows
     }
@@ -293,19 +461,22 @@ def _bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, 
     ).returning(CostEntry.id, CostEntry.scope_code, CostEntry.category_code, CostEntry.yyyymm, CostEntry.version)
     id_by_key = {(r.scope_code, r.category_code, r.yyyymm, r.version): r.id for r in db.execute(header_stmt)}
 
-    detail_stmt = pg_insert(CostEntryDetail).values(
-        [
-            {
-                "cost_entry_id": id_by_key[(scope_code, category_code, yyyymm, version)],
-                # months가 12개(기본)를 넘으면(12의 배수, 기간을 늘려 받는 경우) 12개씩 다음 연도로
-                # 넘겨 저장한다 — upsert_cost_entry/_upsert_entry_months와 동일한 규칙.
-                "year": _ym_year(yyyymm) + i // 12, "period_type": "MONTH", "period": i % 12 + 1,
-                "col_name": "", "amount": amount,
-            }
-            for (scope_code, version, category_code, yyyymm), months in dedup.items()
-            for i, amount in enumerate(months)
-        ]
-    )
+    # amount가 None인 달은 건너뛴다 — 미등록을 0으로 저장하면 다시 읽을 때 빈칸이 아니라 0이 된다.
+    detail_values = [
+        {
+            "cost_entry_id": id_by_key[(scope_code, category_code, yyyymm, version)],
+            # months가 12개(기본)를 넘으면(12의 배수, 기간을 늘려 받는 경우) 12개씩 다음 연도로
+            # 넘겨 저장한다 — upsert_cost_entry/_upsert_entry_months와 동일한 규칙.
+            "year": _ym_year(yyyymm) + i // 12, "period_type": "MONTH", "period": i % 12 + 1,
+            "col_name": "", "amount": amount,
+        }
+        for (scope_code, version, category_code, yyyymm), months in dedup.items()
+        for i, amount in enumerate(months)
+        if amount is not None
+    ]
+    if not detail_values:
+        return
+    detail_stmt = pg_insert(CostEntryDetail).values(detail_values)
     detail_stmt = detail_stmt.on_conflict_do_update(
         index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
         set_={"amount": detail_stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
@@ -323,7 +494,7 @@ def _ensure_plan_version(db: Session, year: int) -> None:
         db.flush()
 
 
-def _bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[float]]]) -> None:
+def _bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[float | None]]]) -> None:
     """(scope_code, category_code, year, months) 목록을 헤더·디테일 각각 단일 upsert 문으로 처리한다
     (_bulk_upsert_cost_entries와 같은 이유)."""
     dedup = {(r[0], r[1], r[2]): r[3] for r in rows}
@@ -347,16 +518,19 @@ def _bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[
     ).returning(ManagementPlanEntry.id, ManagementPlanEntry.scope_code, ManagementPlanEntry.category_code, ManagementPlanEntry.year)
     id_by_key = {(r.scope_code, r.category_code, r.year): r.id for r in db.execute(header_stmt)}
 
-    detail_stmt = pg_insert(ManagementPlanEntryDetail).values(
-        [
-            {
-                "plan_entry_id": id_by_key[(scope_code, category_code, year)],
-                "year": year, "period_type": "MONTH", "period": m, "col_name": "", "amount": amount,
-            }
-            for (scope_code, category_code, year), months in dedup.items()
-            for m, amount in enumerate(months, start=1)
-        ]
-    )
+    # 미등록(None)인 달은 저장하지 않는다 — _bulk_upsert_cost_entries와 같은 이유.
+    detail_values = [
+        {
+            "plan_entry_id": id_by_key[(scope_code, category_code, year)],
+            "year": year, "period_type": "MONTH", "period": m, "col_name": "", "amount": amount,
+        }
+        for (scope_code, category_code, year), months in dedup.items()
+        for m, amount in enumerate(months, start=1)
+        if amount is not None
+    ]
+    if not detail_values:
+        return
+    detail_stmt = pg_insert(ManagementPlanEntryDetail).values(detail_values)
     detail_stmt = detail_stmt.on_conflict_do_update(
         index_elements=["plan_entry_id", "year", "period_type", "period", "col_name"],
         set_={"amount": detail_stmt.excluded.amount},
@@ -525,7 +699,20 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
             cur_label=r.cur_label,
             source_file=r.source_file,
         )
-        for r in db.scalars(select(OverseasReasonRow).where(OverseasReasonRow.lab_code.in_(lab_codes)))
+        # 정렬 키는 유니크 키(lab_code, version, category_key, block)와 같게 둔다 — 정렬을 안 하면
+        # 같은 요청이 매번 다른 순서를 돌려준다(upsert가 행을 건드리면 물리 순서가 바뀐다). 화면의
+        # 증감사유 표가 새로 고칠 때마다 섞이고, 챗봇이 "위에서 세 번째 줄"처럼 위치로 말할 때도
+        # 어긋난다. 외주용역(아래)은 처음부터 order_by가 있었다.
+        for r in db.scalars(
+            select(OverseasReasonRow)
+            .where(OverseasReasonRow.lab_code.in_(lab_codes))
+            .order_by(
+                OverseasReasonRow.lab_code,
+                OverseasReasonRow.version,
+                OverseasReasonRow.category_key,
+                OverseasReasonRow.block,
+            )
+        )
     ]
 
     # 외주용역 상세 — 마스터(행) + 디테일(월 금액)을 12개월 배열로 합쳐 내려준다.
@@ -572,9 +759,17 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
             poc_total=float(r.poc_total),
             source_file=r.source_file,
         )
-        # NOTE: 연도 필터가 없어 모든 연도의 CP 행을 내려보낸다. basis_year로 좁히면 쿼리가 가벼워지지만
-        # 화면이 다른 연도 CP를 같이 보는지 확인이 필요해 그대로 둔다(저장은 보낸 연도만 교체한다).
-        for r in db.scalars(select(OverseasCpRow))
+        # 화면은 기준연도의 CP만 그리므로(core.js가 r.year === 기준연도로 거른다) 그 연도만 내려보낸다.
+        # 저장은 보낸 연도만 교체하므로 다른 연도 행은 영향받지 않는다.
+        # 정렬은 증감사유와 같은 이유로 유니크 키 순서로 고정한다 — 연도 단위로 전체를 지우고 다시
+        # 넣는 경로라(아래 4-3) 순서가 보장되지 않으면 POC·직급 표가 저장할 때마다 섞인다.
+        for r in db.scalars(
+            select(OverseasCpRow)
+            .where(OverseasCpRow.year == f"{basis_year:04d}")
+            .order_by(
+                OverseasCpRow.year, OverseasCpRow.poc_type, OverseasCpRow.poc_proj, OverseasCpRow.title
+            )
+        )
     ]
 
     return OverseasState(
@@ -812,11 +1007,14 @@ def get_labor_split(
         label = {"prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[base_version]
         raise HTTPException(404, f"{label} 데이터가 저장돼 있지 않아 인건비 증감을 나눌 수 없다.")
 
+    basis_month = state.basis_month or 1
     # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 — 넣으면
     # SARC가 CPU+GPU+TOTAL로 두 번 세어져 인원과 금액이 정확히 두 배가 된다(실제로 그렇게 나왔다).
     # 화면도 같은 규칙이다(core.js의 ovPks는 파트 목록에 TOTAL을 두지 않는다).
+    # 기준정보는 "당월 속보 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한 환차 분해가
+    # 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).
     labs = {
-        lab.pk: lab for lab in _labs(db)
+        lab.pk: lab for lab in _lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     }
     scope = (lab_scope or "ALL").strip()
@@ -828,7 +1026,6 @@ def get_labor_split(
         if not pks:
             raise HTTPException(404, f"그런 연구소가 없다: {scope!r}")
 
-    basis_month = state.basis_month or 1
     cur_spec = (basis_year, basis_month, "forecast")
     if base_version == "prev":
         snap = state.actualV.get("cur")
@@ -860,8 +1057,8 @@ def get_labor_split(
         lc = lab.currency if lab.currency and lab.currency != "USD" else None
         amt_cur = amt_base = hc_cur = hc_base = 0.0
         for j in ix:
-            k_cur = sum(float(cats_cur.get(leaf, [0.0] * 12)[j]) for leaf in _LABOR_LEAVES)
-            k_base = sum(float(cats_base.get(leaf, [0.0] * 12)[j]) for leaf in _LABOR_LEAVES)
+            k_cur = sum(_n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
+            k_base = sum(_n(cats_base.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
             rb = rate_base["USD"][j]
             lrc = rate_cur.get(lc, [0.0] * 12)[j] if lc else 0.0
             lrb = rate_base.get(lc, [0.0] * 12)[j] if lc else 0.0
@@ -871,8 +1068,8 @@ def get_labor_split(
             else:
                 amt_cur += k_cur * rb * 1000
             amt_base += k_base * rb * 1000
-            hc_cur += float(cats_cur.get("hc", [0.0] * 12)[j]) / len(ix)
-            hc_base += float(cats_base.get("hc", [0.0] * 12)[j]) / len(ix)
+            hc_cur += _n(cats_cur.get("hc", [None] * 12)[j]) / len(ix)
+            hc_base += _n(cats_base.get("hc", [None] * 12)[j]) / len(ix)
         splittable = hc_cur > 0 and hc_base > 0
         p_base = amt_base / hc_base if splittable else 0.0
         p_cur = amt_cur / hc_cur if splittable else 0.0
@@ -913,6 +1110,197 @@ def get_labor_split(
         ),
     )
 
+
+# ---------- 히어로 카드(화면 맨 위 편성 현황) ----------
+# frontend-html/shared/core.js의 ovRender 히어로 블록과 같은 식이다. 그쪽이 브라우저에서 내던 숫자를
+# 서버에서 그대로 재현한다 — 챗봇·MCP가 말하는 총액과 사용자가 보는 카드가 어긋나면 안 되므로 식을
+# 바꿀 때는 core.js(ovAgg · ovCPc · ovCustExtra)도 같이 고칠 것.
+#
+# 화면과 맞추기 위해 꼭 지켜야 하는 세 가지(하나라도 빠지면 카드 숫자와 달라진다):
+#   ① CP는 업로드된 PL이 아니라 기준정보 › CP 계약 금액을 쓴다(분기 정산 계약이라 연 금액 ÷ 4를
+#      3·6·9·12월에 넣는다) — core.js ovCPc.
+#   ② 연구소가 추가한 행(extra-rows)도 anchor_key가 가리키는 계정에 얹어서 합계에 들어간다 — ovCustExtra.
+#   ③ 원화 기타(_ETC)는 히어로 합계에 넣지 않는다(OV_ALLPK에 없음). 참고용으로 etc_total만 따로 준다.
+_TOT_LEAVES = tuple(resolve_leaves("tot"))
+# 업로드 여부 판정에 보는 입력 칸(화면 OV_IN = 파생 아닌 모든 행 + 인력).
+_INPUT_KEYS = frozenset(_TOT_LEAVES) | {"hc"}
+_QUARTER_END_IX = (2, 5, 8, 11)
+_STEP_COUNT = 3
+
+
+def _group_tree(key: str) -> set[str]:
+    """그 그룹과 그 아래 모든 하위 키(그룹·리프 전부). 추가 행이 어느 집계에 얹히는지 판정에 쓴다."""
+    out = {key}
+    for sub in GROUP_CALC.get(key, ()):
+        out |= _group_tree(sub)
+    return out
+
+
+_TOT_TREE = _group_tree("tot")
+_LABOR_TREE = _group_tree("labor")
+# 화면 OV_ELK에 있는 키(= 추가 행의 anchor_key로 받아들이는 키). 여기 없거나 인력(hc)이면 화면과
+# 똑같이 기타경비(misc)로 떨어뜨린다.
+_ANCHORABLE = frozenset(CATEGORY_LABELS) - {"hc"}
+
+
+def _cp_quarter_amounts(db: Session, year: int) -> tuple[float, float]:
+    """그 해 CP 계약의 분기 금액 (개발비 총액, 인건비) — 단위는 저장값과 같은 K$.
+    POC 헤더값(poc_total · poc_cost_sum)은 직급 행마다 반복 저장돼 있어 POC 단위로 접어서 더한다
+    (행마다 더하면 직급 수만큼 부풀려진다). 연 금액을 4로 나눠 분기 하나치를 만든다 — core.js ovCPc."""
+    pocs = {
+        (r.poc_type, r.poc_proj): (float(r.poc_total), float(r.poc_cost_sum))
+        for r in db.scalars(select(OverseasCpRow).where(OverseasCpRow.year == f"{year:04d}"))
+    }
+    total = sum(v[0] for v in pocs.values()) / 4 / 1000
+    labor = sum(v[1] for v in pocs.values()) / 4 / 1000
+    return total, labor
+
+
+def _extra_row_months(db: Session, yyyymm: str, version: str) -> dict[str, dict[str, list[float]]]:
+    """연구소 pk -> 얹힐 계정 키 -> 월별 금액(K$). 화면 ovCustExtra와 같은 규칙으로 anchor_key에 접는다."""
+    out: dict[str, dict[str, list[float]]] = {}
+    for row in list_extra_rows(yyyymm=yyyymm, version=version, db=db):
+        key = row.anchor_key if row.anchor_key in _ANCHORABLE else "misc"
+        bucket = out.setdefault(row.lab_pk, {}).setdefault(key, [0.0] * 12)
+        for j, v in enumerate(row.v[:12]):
+            bucket[j] += _n(v)
+    return out
+
+
+def _krw_months(
+    cats: dict[str, list[float | None]], extra: dict[str, list[float]], tree: set[str], rate: list[float]
+) -> list[float]:
+    """그 연구소의 월별 원화 금액. 저장값은 K$라 ×1000×(원/$)로 원화가 된다 — core.js ovAgg의 krw 모드."""
+    leaves = [k for k in tree if k not in GROUP_CALC]
+    return [
+        (
+            sum(_n(cats.get(leaf, [None] * 12)[j]) for leaf in leaves)
+            + sum(months[j] for key, months in extra.items() if key in tree)
+        )
+        * rate[j]
+        * 1000
+        for j in range(12)
+    ]
+
+
+@router.get("/overseas/summary", response_model=OverseasSummary)
+def get_overseas_summary(
+    basis_year: int,
+    version: str = "cur",
+    period: str = "y",
+    db: Session = Depends(get_db),
+) -> OverseasSummary:
+    if version not in ("cur", "prev", "prior", "plan"):
+        raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
+    ix = _PERIOD_IX.get(period)
+    if ix is None:
+        raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
+
+    state = get_overseas_state(basis_year=basis_year, db=db)
+    vd = state.V[version]
+    if not vd.d:
+        label = {"cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[version]
+        raise HTTPException(404, f"{basis_year}년 {label} 데이터가 없다.")
+
+    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 두 번 세지 않는다
+    # (labor-split과 같은 규칙 — 화면 ovPks도 파트 목록에 TOTAL을 두지 않는다).
+    basis_month = state.basis_month or 1
+    # 환율 기준은 화면과 같이 "그 버전의 속보 시점". prior만 작년 마감 실적을 본다.
+    if version == "prior":
+        rate_year, rate_month, rate_kind = basis_year - 1, 12, "actual"
+    else:
+        rate_year, rate_month, rate_kind = basis_year, basis_month, "forecast"
+    # 기준정보(통화·사용여부·이름)도 환율과 같은 시점으로 본다 — 지금 값으로 과거 버전을 다시
+    # 계산하면 이미 마감해서 보고한 숫자가 바뀐다(공통 RULE: 변경한 버전부터 적용, 지난 버전 무영향).
+    labs = [
+        lab for lab in _lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
+        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+    ]
+    rate = _rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
+
+    api_version = "actual" if version in ("prev", "prior") else "forecast"
+    extras = _extra_row_months(db, _yyyymm(basis_year, basis_month), api_version)
+    cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)
+
+    total = labor = 0.0
+    for lab in labs:
+        if lab.lab_code == "CP":
+            # CP만 PL 대신 계약 금액을 분기말에 넣는다(①).
+            total += sum(cp_total_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
+            labor += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in _QUARTER_END_IX)
+            continue
+        cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
+        if not cats and not extra:
+            continue
+        tot_m = _krw_months(cats, extra, _TOT_TREE, rate)
+        lab_m = _krw_months(cats, extra, _LABOR_TREE, rate)
+        total += sum(tot_m[j] for j in ix)
+        labor += sum(lab_m[j] for j in ix)
+    non_labor = total - labor
+
+    # 원화 기타는 이미 원화(억원 단위 입력)라 환산하지 않는다. 화면 히어로는 이 값을 합계에 넣지
+    # 않으므로(③) 여기서도 total에 더하지 않고 따로만 준다.
+    etc_total = sum(_n(vd.etc[j]) * 100_000_000 for j in ix)
+
+    # 업로드 진척: 파트가 여러 개인 연구소는 파트가 모두 올라와야 1건으로 센다(화면 ovHas와 같다).
+    by_code: dict[str, list[LabView]] = {}
+    for lab in labs:
+        by_code.setdefault(lab.lab_code, []).append(lab)
+    lab_rows = [
+        OverseasSummaryLab(
+            lab_code=code,
+            name=re.sub(r"\s*·.*$", "", parts[0].name),
+            uploaded=all(
+                any(
+                    v is not None
+                    for key, months in (vd.d.get(p.pk) or {}).items()
+                    if key in _INPUT_KEYS
+                    for v in months
+                )
+                for p in parts
+            ),
+        )
+        for code, parts in sorted(by_code.items(), key=lambda kv: kv[1][0].sort_order)
+    ]
+
+    # 공통 RULE(상단 현황): 미업로드 연구소는 빼고 "n개 중 m개 기준"이라고 밝힌다. 합계는 이미
+    # 올라온 값만 더하고 있으므로(없는 달은 더할 게 없다) 숫자는 그대로고, 그 사실을 말로 붙인다.
+    missing_names = [r.name for r in lab_rows if not r.uploaded]
+    coverage_note = (
+        f"{len(lab_rows)}개 연구소가 모두 올라온 기준이다."
+        if not missing_names
+        else (
+            f"{len(lab_rows)}개 중 {len(lab_rows) - len(missing_names)}개 기준이다 — 아직 안 올라온 "
+            f"연구소({', '.join(missing_names)})는 빼고 더했으니, 이 금액을 연구소 전체 합계라고 "
+            f"말하면 안 된다."
+        )
+    )
+
+    mix = total or 1.0
+    return OverseasSummary(
+        basis_year=basis_year,
+        basis_month=basis_month,
+        basis_label=f"{basis_year % 100:02d}.{basis_month:02d}",
+        period=period,
+        version=version,
+        step=max(0, min(state.step - 1, _STEP_COUNT - 1)),
+        step_count=_STEP_COUNT,
+        total=total,
+        etc_total=etc_total,
+        labor=labor,
+        non_labor=non_labor,
+        labor_pct=labor / mix * 100,
+        non_labor_pct=non_labor / mix * 100,
+        uploaded=sum(1 for r in lab_rows if r.uploaded),
+        lab_count=len(lab_rows),
+        labs=lab_rows,
+        coverage_note=coverage_note,
+        note=(
+            "화면 히어로 카드(해외연구소 편성 현황)와 같은 식이다. CP는 업로드 PL이 아니라 CP 계약 "
+            "금액을 분기말에 넣고(분기 정산 계약), 연구소가 추가한 행도 anchor_key가 가리키는 계정에 "
+            "얹어서 센다. 원화 기타(etc_total)는 화면과 같이 total에 넣지 않는다."
+        ),
+    )
 
 # ---------- 외주용역비 과제별 집계 ----------
 # "과제 기준으로 분석해줘"는 비용 본체로는 할 수 없다 — cost_entries의 키는 연월·계정과목·연구소·
@@ -1052,9 +1440,14 @@ def update_overseas_step(body: StepUpdate, db: Session = Depends(get_db)) -> Ste
 
 
 @router.get("/overseas/labs", response_model=list[LabOut])
-def list_labs(db: Session = Depends(get_db)) -> list[LabOut]:
+def list_labs(as_of: str | None = None, db: Session = Depends(get_db)) -> list[LabOut]:
     """연구소·파트 기준정보. 프론트는 이 목록을 lab_code로 묶어 탭을 그리므로,
-    여기 행만 추가하면(배포 없이) 새 연구소 탭이 화면에 나타난다."""
+    여기 행만 추가하면(배포 없이) 새 연구소 탭이 화면에 나타난다.
+
+    as_of("YYYY-MM")를 주면 그 시점에 쓰던 기준정보를 돌려준다 — 기준정보를 바꿔도 지난 버전은
+    옛 값으로 계산되므로(공통 RULE), "그때는 통화가 뭐였나"를 확인할 때 쓴다. 안 주면 지금 값."""
+    if as_of is not None:
+        as_of = _check_effective_from(as_of, db)
     return [
         LabOut(
             pk=lab.pk,
@@ -1066,7 +1459,7 @@ def list_labs(db: Session = Depends(get_db)) -> list[LabOut]:
             currency=lab.currency,
             is_active=lab.is_active,
         )
-        for lab in sorted(_labs(db), key=lambda lab: (lab.sort_order, lab.pk))
+        for lab in sorted(_lab_views(db, as_of), key=lambda lab: (lab.sort_order, lab.pk))
         if lab.pk != "_ETC"
     ]
 
@@ -1089,7 +1482,14 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
 
     for order, row in enumerate(body):
         existing = by_code.get(row.lab_code, [])
+        # 기준정보 변경은 "이 버전부터" 적용된다 — 지난 버전은 바뀌기 전 값으로 계산되도록
+        # 이력을 남긴다(공통 RULE). effective_from을 안 주면 지금 편성 중인 기준월부터.
+        effective_from = _check_effective_from(row.effective_from, db)
+        after = {"name": row.name, "currency": row.currency, "is_active": row.is_active, "sort_order": order * 10}
         if not existing:
+            # 새로 만든 연구소는 "그 전에는 없던 것"(is_active=False)으로 고정한다 — 안 그러면
+            # 과거 버전의 집계·업로드 진척에 방금 만든 연구소가 끼어든다.
+            _record_lab_revision(db, row.lab_code, {**after, "is_active": False}, after, effective_from)
             db.add(
                 OverseasLab(
                     pk=row.lab_code,
@@ -1103,6 +1503,7 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
                 )
             )
             continue
+        _record_lab_revision(db, row.lab_code, _lab_attrs(existing), after, effective_from)
         # SARC처럼 lab_code 하나에 파트(pk)가 여러 개면 이름은 파트별로 다르므로
         # 화면에서 준 단일 이름으로 덮어쓰지 않는다(통화·사용여부·순서만 공통 적용).
         for lab in existing:
@@ -1142,8 +1543,12 @@ def upsert_lab(body: LabIn, db: Session = Depends(get_db)) -> LabOut:
     예외적으로 `PUT /overseas/labs`를 그대로 쓴다 — 그 화면은 "그리드에서 지운 행 = 삭제"라는 동작이
     필요하기 때문이다."""
     existing = list(db.scalars(select(OverseasLab).where(OverseasLab.lab_code == body.lab_code)))
+    # save_labs와 같은 규칙 — 바뀐 값은 effective_from 버전부터만 적용되고 지난 버전은 그대로다.
+    effective_from = _check_effective_from(body.effective_from, db)
     if not existing:
         next_order = (db.scalar(select(func.max(OverseasLab.sort_order))) or 0) + 10
+        after = {"name": body.name, "currency": body.currency, "is_active": body.is_active, "sort_order": next_order}
+        _record_lab_revision(db, body.lab_code, {**after, "is_active": False}, after, effective_from)
         db.add(
             OverseasLab(
                 pk=body.lab_code, lab_code=body.lab_code, part_code=None, name=body.name,
@@ -1151,6 +1556,17 @@ def upsert_lab(body: LabIn, db: Session = Depends(get_db)) -> LabOut:
             )
         )
     else:
+        _record_lab_revision(
+            db,
+            body.lab_code,
+            _lab_attrs(existing),
+            {
+                "name": body.name, "currency": body.currency, "is_active": body.is_active,
+                # 순서는 이 API로 바꾸지 않으므로 지금 값을 그대로 이력에 남긴다.
+                "sort_order": existing[0].sort_order,
+            },
+            effective_from,
+        )
         # SARC처럼 lab_code 하나에 파트(pk)가 여러 개면 이름은 파트별로 다르므로
         # 단일 이름으로 덮어쓰지 않는다(통화·사용여부만 공통 적용) — save_labs와 동일한 규칙.
         for lab in existing:
@@ -1374,6 +1790,560 @@ def upsert_note(body: NoteIn, db: Session = Depends(get_db)) -> NoteOut:
     return NoteOut(**body.model_dump())
 
 
+# ---------- 증감사유 번역 (영문 회신 → 보고용 한국어) ----------
+# 번역 자체는 app/core/reason_translate.py(프롬프트 · 공급자 호출)가 하고, 여기는 캐시만 맡는다:
+# 이미 번역한 원문은 DB 값을 그대로 돌려주고, 처음 보는 원문만 LLM에 묻는다. 같은 원문이 매번
+# 다르게 번역되면 보고 문구가 흔들리기 때문에 "원문 1건 = 번역 1개"를 DB로 못 박는 구조다.
+
+
+def _source_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@router.post("/overseas/reason-translate", response_model=ReasonTranslateResult)
+async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_db)) -> ReasonTranslateResult:
+    """연구소가 영문으로 보낸 증감사유를 한국어로 번역한다(원문은 그대로 보관).
+
+    같은 원문이 여러 번 들어와도 LLM에는 한 번만 묻고, 한 번 번역한 원문은 다음 호출부터
+    overseas_reason_translations에서 바로 꺼낸다. refresh=true면 캐시를 무시하고 다시 번역해 덮어쓴다.
+
+    LLM 호출이 실패해도 200으로 답한다 — 증감분석 화면은 번역이 없어도 원문으로 그려져야 하고,
+    여기서 502를 던지면 화면이 "사유 자체가 없는" 것처럼 보인다. 실패 이유는 error에 담아 보낸다."""
+    provider = resolve_provider(body.provider)
+    # 중복 제거하되 요청 순서는 지킨다(화면이 받은 순서대로 칸에 꽂는다). 길이 상한을 넘는 원문은
+    # 자르지 않고 그대로 번역에 보낸다 — remark_* 컬럼이 500자라 실제로는 걸리지 않고, 혹시 더 긴
+    # 값이 오면 번역을 포기하는 게 뒤가 잘린 사유를 보여주는 것보다 안전하다.
+    seen: dict[str, None] = {}
+    too_long: set[str] = set()
+    for raw in body.texts:
+        text = normalize(raw)
+        if not text:
+            continue
+        seen.setdefault(text, None)
+        if len(text) > MAX_LEN:
+            too_long.add(text)
+    sources = list(seen)
+    if len(sources) > MAX_TEXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"한 번에 번역할 수 있는 원문은 {MAX_TEXTS}건까지입니다 (요청 {len(sources)}건). 나눠서 보내주세요.",
+        )
+
+    rows = {
+        r.source_hash: r
+        for r in db.scalars(
+            select(OverseasReasonTranslation).where(
+                OverseasReasonTranslation.source_hash.in_([_source_hash(t) for t in sources])
+            )
+        )
+    }
+    hit: dict[str, OverseasReasonTranslation] = {}
+    todo: list[str] = []
+    for text in sources:
+        row = rows.get(_source_hash(text))
+        if row and not body.refresh:
+            hit[text] = row
+        elif text not in too_long:
+            todo.append(text)
+
+    fresh: dict[str, str] = {}
+    error = ""
+    if todo:
+        try:
+            result = await translate_batch(todo, provider)
+        except HTTPException as e:
+            # 키 없음 · 크레딧 · 연결 실패 — 번역만 못 하고 나머지(캐시된 번역)는 그대로 돌려준다.
+            result = [None] * len(todo)
+            error = str(e.detail)
+        label = engine_label(provider)
+        for text, raw_ko in zip(todo, result):
+            if not raw_ko:
+                continue
+            # ko_text가 String(600)이라 그보다 긴 번역은 잘라서 넣는다(원문이 500자 이하라 실제로는
+            # 안 걸리지만, 모델이 설명을 덧붙여 길게 내놨을 때 저장 자체가 실패하는 걸 막는다).
+            ko = raw_ko[:600]
+            fresh[text] = ko
+            # 같은 원문이 이미 있으면(refresh) 덮어쓴다 — source_hash가 unique라 insert는 못 한다.
+            db.execute(
+                pg_insert(OverseasReasonTranslation)
+                .values(source_hash=_source_hash(text), source_text=text, ko_text=ko, engine=label)
+                .on_conflict_do_update(
+                    index_elements=[OverseasReasonTranslation.source_hash],
+                    set_={"ko_text": ko, "engine": label, "updated_at": func.now()},
+                )
+            )
+        db.commit()
+
+    items = [
+        ReasonTranslateItem(
+            source=text,
+            ko=fresh.get(text) or (hit[text].ko_text if text in hit else None),
+            engine=engine_label(provider) if text in fresh else (hit[text].engine if text in hit else ""),
+            cached=text in hit and text not in fresh,
+        )
+        for text in sources
+    ]
+    failed = sum(1 for i in items if not i.ko)
+    if too_long:
+        error = (error + " " if error else "") + f"{len(too_long)}건은 원문이 {MAX_LEN}자를 넘어 번역하지 않았습니다."
+    return ReasonTranslateResult(
+        items=items,
+        provider=provider,
+        translated=len(fresh),
+        cached=sum(1 for i in items if i.cached),
+        failed=failed,
+        error=error,
+    )
+
+
+@router.get("/overseas/reason-translations", response_model=list[ReasonTranslateItem])
+def list_reason_translations(q: str | None = None, limit: int = 200, db: Session = Depends(get_db)) -> list[ReasonTranslateItem]:
+    """저장된 원문 · 번역 쌍 목록(최근 순). 오역을 찾거나 모델을 바꾼 뒤 어떤 번역이 옛 모델로
+    만들어졌는지 훑어볼 때 쓴다 — q를 주면 원문 · 번역 양쪽을 부분 일치로 찾는다."""
+    stmt = select(OverseasReasonTranslation).order_by(OverseasReasonTranslation.updated_at.desc()).limit(max(1, min(limit, 1000)))
+    if q:
+        like = f"%{q.strip()}%"
+        stmt = stmt.where(OverseasReasonTranslation.source_text.ilike(like) | OverseasReasonTranslation.ko_text.ilike(like))
+    return [
+        ReasonTranslateItem(source=r.source_text, ko=r.ko_text, engine=r.engine, cached=True) for r in db.scalars(stmt)
+    ]
+
+
+# ---------- 이상 감지 (반영 전 "이거 맞나요?") ----------
+# 판정 규칙은 app/core/anomaly.py, 기준값은 overseas_anomaly_rules에 있다. 여기는 그 둘을 붙이고
+# 비교 대상(전실행)을 DB에서 꺼내 오는 일을 한다. 반영을 막지 않는다 — 알리기만 한다.
+
+
+def _rule_rows(db: Session) -> list[OverseasAnomalyRule]:
+    return list(db.scalars(select(OverseasAnomalyRule)))
+
+
+def _rule_out(key: str, r: dict) -> AnomalyRuleOut:
+    # desc는 "지금 값이 들어간 설명"이다 — 화면·챗봇이 기준을 말로 옮길 때 숫자를 따로 조립하지
+    # 않게(두 곳이 다르게 적는 걸 막으려고) 서버가 완성해서 준다.
+    fmt = {
+        "pct": f"{r['pct']:g}" if r.get("pct") is not None else "",
+        "amount": f"${r['amount']:,.1f}K".replace(".0K", "K") if r.get("amount") is not None else "",
+        "ratio": f"{r['ratio']:g}" if r.get("ratio") is not None else "",
+    }
+    return AnomalyRuleOut(
+        rule_key=key, label=r["label"], enabled=r["enabled"], pct=r.get("pct"), amount=r.get("amount"),
+        ratio=r.get("ratio"), desc=r["desc"].format(**fmt),
+    )
+
+
+def _rules_out(db: Session, overrides: dict | None = None) -> list[AnomalyRuleOut]:
+    merged = anomaly.merged_rules(_rule_rows(db), overrides)
+    return [_rule_out(k, merged[k]) for k in anomaly.RULE_KEYS]
+
+
+@router.get("/overseas/anomaly-rules", response_model=list[AnomalyRuleOut])
+def list_anomaly_rules(db: Session = Depends(get_db)) -> list[AnomalyRuleOut]:
+    """지금 적용 중인 이상 감지 기준 4개. 해외연구소 전체에 같이 적용된다."""
+    return _rules_out(db)
+
+
+@router.put("/overseas/anomaly-rules", response_model=list[AnomalyRuleOut])
+def upsert_anomaly_rule(body: AnomalyRuleIn, db: Session = Depends(get_db)) -> list[AnomalyRuleOut]:
+    """기준 하나를 바꾼다(보낸 항목만). reset=true면 그 기준을 기본값으로 되돌린다.
+
+    바꾼 내역은 overseas_anomaly_rule_logs에 before/after로 남긴다 — 기준이 바뀌면 경고 개수가
+    달라져서, 나중에 "지난달엔 왜 이게 안 걸렸지"에 답할 수 있어야 한다."""
+    key = anomaly.RULE_ALIASES.get(body.rule_key.strip(), body.rule_key.strip())
+    if key not in anomaly.RULE_KEYS:
+        raise HTTPException(
+            status_code=400, detail=f"없는 기준입니다: {body.rule_key!r} (가능: {', '.join(anomaly.RULE_KEYS)})"
+        )
+    if body.pct is not None and not (0 < body.pct <= 10000):
+        raise HTTPException(status_code=400, detail="비율(pct)은 0보다 크고 10000 이하여야 합니다.")
+    if body.amount is not None and body.amount < 0:
+        raise HTTPException(status_code=400, detail="금액(amount)은 0 이상이어야 합니다.")
+    if body.ratio is not None and body.ratio <= 1:
+        raise HTTPException(status_code=400, detail="배수(ratio)는 1보다 커야 합니다.")
+
+    row = db.scalar(select(OverseasAnomalyRule).where(OverseasAnomalyRule.rule_key == key))
+    before = anomaly.merged_rules(_rule_rows(db))[key]
+    before_snap = {k: before[k] for k in ("enabled", "pct", "amount", "ratio")}
+    if not row:
+        row = OverseasAnomalyRule(rule_key=key)
+        db.add(row)
+    if body.reset:
+        d = anomaly.DEFAULTS[key]
+        row.enabled, row.pct, row.amount, row.ratio = d["enabled"], d["pct"], d["amount"], d["ratio"]
+    else:
+        # None은 "안 건드림"이다 — 그 기준이 원래 안 쓰는 파라미터를 NULL로 지우는 것과 구분한다.
+        if body.enabled is not None:
+            row.enabled = body.enabled
+        if body.pct is not None:
+            row.pct = body.pct
+        if body.amount is not None:
+            row.amount = body.amount
+        if body.ratio is not None:
+            row.ratio = body.ratio
+    db.flush()
+    after = anomaly.merged_rules(_rule_rows(db))[key]
+    after_snap = {k: after[k] for k in ("enabled", "pct", "amount", "ratio")}
+    if before_snap != after_snap:
+        db.add(
+            OverseasAnomalyRuleLog(
+                rule_key=key, before=before_snap, after=after_snap,
+                source="reset" if body.reset else (body.source or "screen")[:10], note=body.note.strip()[:200],
+            )
+        )
+    db.commit()
+    return _rules_out(db)
+
+
+@router.get("/overseas/anomaly-rules/history", response_model=list[AnomalyRuleLogOut])
+def list_anomaly_rule_history(limit: int = 50, db: Session = Depends(get_db)) -> list[AnomalyRuleLogOut]:
+    """기준 변경 이력(최근 순). "언제 누가 급변 기준을 올렸나"를 되짚을 때 본다."""
+    rows = db.scalars(
+        # id까지 내림차순으로 정렬한다 — 한 트랜잭션에서 두 번 바꾸면 now()가 같은 값이라
+        # changed_at만으로는 어느 게 최신인지 가려지지 않는다.
+        select(OverseasAnomalyRuleLog)
+        .order_by(OverseasAnomalyRuleLog.changed_at.desc(), OverseasAnomalyRuleLog.id.desc())
+        .limit(max(1, min(limit, 500)))
+    )
+    return [
+        AnomalyRuleLogOut(
+            rule_key=r.rule_key, before=r.before, after=r.after, source=r.source, note=r.note, changed_at=r.changed_at
+        )
+        for r in rows
+    ]
+
+
+@router.post("/overseas/anomaly-scan", response_model=AnomalyScanResult)
+def scan_anomalies(body: AnomalyScanIn, db: Session = Depends(get_db)) -> AnomalyScanResult:
+    """업로드 값(또는 이미 저장된 값)을 기준에 걸어 본다. 반영을 막지 않고 목록만 돌려준다.
+
+    vals를 주면 그 값으로 검사하고(반영 대기 중인 파일), 안 주면 DB에 저장된 값으로 검사한다
+    ([계정 확정] 전에 "아직 남아 있는 이상"을 세는 경로). 비교할 전실행(base_*)을 안 주면
+    급변·단위(배수) 검사는 건너뛰고 그 사실을 skipped로 알린다 — 조용히 빠지면 "이상 없음"으로
+    읽힌다."""
+    _check_lab_pk(db, body.lab_pk, allow_all=True)
+    _check_version(body.version)
+    vals = body.vals
+    if vals is None:
+        vals = _months_by_category(db, body.lab_pk, body.version, body.yyyymm)
+    base_vals = None
+    skipped: list[str] = []
+    if body.base_yyyymm and body.base_version:
+        _check_version(body.base_version)
+        base_vals = _months_by_category(db, body.lab_pk, body.base_version, body.base_yyyymm)
+        if not base_vals:
+            base_vals = None
+    if base_vals is None:
+        skipped.append("급변·단위(배수) — 비교할 전실행 값이 없습니다")
+
+    rules = anomaly.merged_rules(_rule_rows(db), body.overrides)
+    findings = anomaly.detect(
+        vals={k: list(v or []) for k, v in vals.items()},
+        base_vals=base_vals,
+        sums=body.sums,
+        reasons=body.reasons,
+        rules=rules,
+        group_calc=GROUP_CALC,
+        label_of=category_label,
+        leaves_of=resolve_leaves,
+    )
+    if not body.sums and rules["sum_mismatch"]["enabled"]:
+        skipped.append("합계 불일치 — 파일에 소계·합계 행이 없습니다")
+    counts: dict[str, int] = {}
+    for f in findings:
+        counts[f["rule"]] = counts.get(f["rule"], 0) + 1
+    return AnomalyScanResult(
+        lab_pk=body.lab_pk,
+        findings=[AnomalyFinding(**f) for f in findings],
+        counts=counts,
+        rules=[_rule_out(k, rules[k]) for k in anomaly.RULE_KEYS],
+        skipped=skipped,
+    )
+
+
+# ---------- 집계 파생 행·열의 "다음 버전에도 유지" ----------
+# 파생 행·열은 버전×기준연월 단위로 저장돼서 새 버전을 열면 사라진다. 매달 보는 지표는 따라가야
+# 하고 그 달만 보려고 만든 건 따라가면 안 되므로, 만들 때 한 번 묻고 승인한 것만 복제한다
+# (overseas_carry_defs). 복제하는 건 계산식뿐이다 — 값은 새 버전 업로드 값으로 다시 계산된다.
+
+
+@router.get("/overseas/carry-defs", response_model=list[CarryDefOut])
+def list_carry_defs(db: Session = Depends(get_db)) -> list[CarryDefOut]:
+    """다음 버전에도 유지하기로 승인한 파생 행·열 목록."""
+    rows = db.scalars(select(OverseasCarryDef).order_by(OverseasCarryDef.kind, OverseasCarryDef.label))
+    return [CarryDefOut(kind=r.kind, def_key=r.def_key, label=r.label) for r in rows]
+
+
+@router.put("/overseas/carry-defs", response_model=list[CarryDefOut])
+def upsert_carry_def(body: CarryDefIn, db: Session = Depends(get_db)) -> list[CarryDefOut]:
+    """유지 승인을 넣거나(carry=true) 뺀다(carry=false). 바뀐 뒤 전체 목록을 돌려준다 —
+    화면이 "유지 중" 표시를 바로 갱신할 수 있게."""
+    if body.kind not in ("row", "col"):
+        raise HTTPException(status_code=400, detail="kind는 row 또는 col이어야 합니다.")
+    key = body.def_key.strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="def_key가 비어 있습니다.")
+    if body.carry:
+        db.execute(
+            pg_insert(OverseasCarryDef)
+            .values(kind=body.kind, def_key=key, label=body.label.strip() or key)
+            .on_conflict_do_update(
+                index_elements=[OverseasCarryDef.kind, OverseasCarryDef.def_key],
+                set_={"label": body.label.strip() or key},
+            )
+        )
+    else:
+        db.execute(
+            delete(OverseasCarryDef).where(OverseasCarryDef.kind == body.kind, OverseasCarryDef.def_key == key)
+        )
+    db.commit()
+    return list_carry_defs(db)
+
+
+@router.post("/overseas/carry-forward", response_model=CarryForwardResult)
+def carry_forward_defs(body: CarryForwardIn, db: Session = Depends(get_db)) -> CarryForwardResult:
+    """유지 승인한 파생 행·열의 정의를 from 버전 → to 버전으로 복제한다(새 버전을 열 때 호출).
+
+    이미 to 버전에 같은 행·열이 있으면 건너뛴다 — 덮어쓰면 새 버전에서 사람이 고친 계산식이
+    지난 버전 것으로 되돌아간다. 두 번 호출해도 결과가 같다(새 버전을 여러 번 열어도 안전)."""
+    _check_version(body.from_version)
+    _check_version(body.to_version)
+    if (body.from_yyyymm, body.from_version) == (body.to_yyyymm, body.to_version):
+        raise HTTPException(status_code=400, detail="같은 버전으로는 복제할 수 없습니다.")
+    defs = list(db.scalars(select(OverseasCarryDef)))
+    row_keys = {d.def_key for d in defs if d.kind == "row"}
+    col_labels = {d.def_key for d in defs if d.kind == "col"}
+    rows = cols = 0
+    skipped: list[str] = []
+
+    if row_keys:
+        src_rows = db.scalars(
+            select(CostEntry).where(
+                CostEntry.account_code == ACCOUNT_KEY,
+                CostEntry.scope_code == ALL_SCOPE,
+                CostEntry.version == body.from_version,
+                CostEntry.yyyymm == body.from_yyyymm,
+                CostEntry.is_derived.is_(True),
+                CostEntry.category_code.in_(row_keys),
+            )
+        )
+        for src in src_rows:
+            exists = db.scalar(
+                select(CostEntry).where(
+                    CostEntry.account_code == ACCOUNT_KEY, CostEntry.scope_code == ALL_SCOPE,
+                    CostEntry.version == body.to_version, CostEntry.yyyymm == body.to_yyyymm,
+                    CostEntry.category_code == src.category_code,
+                )
+            )
+            if exists is not None:
+                skipped.append(src.label or src.category_code)
+                continue
+            entry_id = _get_or_create_entry(db, ALL_SCOPE, body.to_version, src.category_code, body.to_yyyymm)
+            db.execute(
+                update(CostEntry).where(CostEntry.id == entry_id)
+                .values(
+                    label=src.label, label_en=src.label_en, anchor_key=src.anchor_key,
+                    is_derived=True, formula=src.formula,
+                )
+            )
+            rows += 1
+
+    if col_labels:
+        src_cols = db.scalars(
+            select(ExtraCol).where(
+                ExtraCol.account_key == ACCOUNT_KEY,
+                ExtraCol.scope_key == ALL_SCOPE,
+                ExtraCol.version == body.from_version,
+                ExtraCol.yyyymm == body.from_yyyymm,
+                ExtraCol.is_derived.is_(True),
+                ExtraCol.label.in_(col_labels),
+            )
+        )
+        for src in src_cols:
+            exists = db.scalar(
+                select(ExtraCol).where(
+                    ExtraCol.account_key == ACCOUNT_KEY, ExtraCol.scope_key == ALL_SCOPE,
+                    ExtraCol.version == body.to_version, ExtraCol.yyyymm == body.to_yyyymm,
+                    ExtraCol.label == src.label,
+                )
+            )
+            if exists is not None:
+                skipped.append(src.label)
+                continue
+            db.add(
+                ExtraCol(
+                    account_key=ACCOUNT_KEY, scope_key=ALL_SCOPE, version=body.to_version,
+                    yyyymm=body.to_yyyymm, label=src.label, is_derived=True, formula=src.formula,
+                )
+            )
+            cols += 1
+
+    db.commit()
+    return CarryForwardResult(rows=rows, cols=cols, skipped=skipped)
+
+
+# ---------- 업로드 행 이름 맞추기 (Travel Exp ↔ Travel Expense) ----------
+# 판정 규칙은 app/core/row_match.py에 있다. 여기는 "무엇과 비교할지"(후보 목록)와 "사람이 답한
+# 결과"(overseas_row_aliases)를 맡는다. 자동으로 합치지 않는다 — 후보만 돌려주고, 합칠지는 화면이
+# 사람에게 묻는다. 한 번 답한 이름은 다음 업로드부터 resolved로 바로 내려가서 다시 묻지 않는다.
+
+
+def _alias_rows(db: Session, norms: list[str]) -> dict[str, OverseasRowAlias]:
+    if not norms:
+        return {}
+    return {a.alias_norm: a for a in db.scalars(select(OverseasRowAlias).where(OverseasRowAlias.alias_norm.in_(norms)))}
+
+
+def _match_candidates(db: Session, yyyymm: str, version: str | None) -> list[dict]:
+    """비교 대상: ① 고정 비용항목(집계로 계산되는 그룹 행은 제외 — 거기에 값을 꽂을 수 없다),
+    ② 그 달에 이미 쓰이는 추가 행(연구소 전체에서 모은 이름, 어느 연구소가 쓰는지까지)."""
+    out: list[dict] = [
+        {"kind": "category", "key": key, "label": label, "label_en": CATEGORY_LABELS_EN.get(key, "")}
+        for key, label in CATEGORY_LABELS.items()
+        if key not in GROUP_CALC and key != "pct"
+    ]
+
+    stmt = select(CostEntry).where(
+        CostEntry.account_code == ACCOUNT_KEY,
+        CostEntry.label.is_not(None),
+        CostEntry.yyyymm == yyyymm,
+        CostEntry.is_derived.is_(False),
+    )
+    if version:
+        stmt = stmt.where(CostEntry.version == _check_version(version))
+    by_norm: dict[str, dict] = {}
+    for entry in db.scalars(stmt):
+        label = (entry.label or "").strip()
+        if not label:
+            continue
+        norm = row_match.normalize(label)
+        row = by_norm.setdefault(
+            norm, {"kind": "extra_row", "key": norm, "label": label, "label_en": entry.label_en or "", "labs": []}
+        )
+        if not row["label_en"] and entry.label_en:
+            row["label_en"] = entry.label_en
+        if entry.scope_code != ALL_SCOPE and entry.scope_code not in row["labs"]:
+            row["labs"].append(entry.scope_code)
+    return out + list(by_norm.values())
+
+
+@router.post("/overseas/row-match", response_model=RowMatchResult)
+def match_row_labels(body: RowMatchIn, db: Session = Depends(get_db)) -> RowMatchResult:
+    """업로드 파일에서 계정 목록에 없던 행 이름들을 "이미 있는 행"과 맞춰본다.
+
+    - 전에 사람이 답해 둔 이름이면 `resolved`로 내려간다(그 답이 "별개 행"이었으면 kind="distinct").
+    - 처음 보는 이름이면 비슷한 후보를 `suggestions`로 내려주고, 묻는 건 화면이 한다.
+    - 비슷한 게 없으면 둘 다 비어서 내려간다 — 그냥 새 행으로 들어갈 이름이다."""
+    labels, seen = [], set()
+    for raw in body.labels:
+        label = str(raw or "").strip()
+        norm = row_match.normalize(label)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        labels.append(label)
+    if not labels:
+        return RowMatchResult(items=[])
+
+    aliases = _alias_rows(db, [row_match.normalize(x) for x in labels])
+    candidates = _match_candidates(db, body.yyyymm, body.version)
+    items: list[RowMatchItem] = []
+    for label in labels:
+        alias = aliases.get(row_match.normalize(label))
+        if alias:
+            items.append(
+                RowMatchItem(
+                    label=label,
+                    resolved=RowMatchSuggestion(
+                        kind=alias.target_kind,
+                        key=alias.target_key,
+                        label=alias.target_label,
+                        # 전에 사람이 확정한 답이라 점수를 매기지 않는다(1.0 = 확정).
+                        score=1.0,
+                    ),
+                )
+            )
+            continue
+        # 자기 자신(이름이 같은 후보)은 후보로 올리지 않는다 — 이미 그 행으로 들어갈 이름이다.
+        sugg = [s for s in row_match.rank(label, candidates) if s["score"] < 1.0]
+        items.append(RowMatchItem(label=label, suggestions=[RowMatchSuggestion(**s) for s in sugg]))
+    return RowMatchResult(items=items)
+
+
+@router.get("/overseas/row-aliases", response_model=list[RowAliasOut])
+def list_row_aliases(db: Session = Depends(get_db)) -> list[RowAliasOut]:
+    """사람이 답해 둔 행 이름 매핑 전체(최근 답한 것 먼저). 잘못 합친 걸 찾을 때 본다."""
+    rows = db.scalars(select(OverseasRowAlias).order_by(OverseasRowAlias.updated_at.desc()))
+    return [
+        RowAliasOut(
+            alias_norm=a.alias_norm,
+            alias_label=a.alias_label,
+            target_kind=a.target_kind,
+            target_key=a.target_key,
+            target_label=a.target_label,
+        )
+        for a in rows
+    ]
+
+
+@router.put("/overseas/row-aliases", response_model=RowAliasOut)
+def upsert_row_alias(body: RowAliasIn, db: Session = Depends(get_db)) -> RowAliasOut:
+    """"같은 행"(category | extra_row) 또는 "별개 행"(distinct)이라고 답한 결과를 저장한다.
+    같은 이름에 다시 답하면 덮어쓴다 — 전에 잘못 합쳤더라도 다시 답하면 그때부터 새 답을 따른다
+    (이미 그 답으로 들어간 과거 데이터는 바뀌지 않는다 — 그건 업로드로 다시 올려야 한다)."""
+    if body.target_kind not in ("category", "extra_row", "distinct"):
+        raise HTTPException(status_code=400, detail="target_kind는 category | extra_row | distinct만 가능합니다.")
+    norm = row_match.normalize(body.alias_label)
+    if not norm:
+        raise HTTPException(status_code=400, detail="alias_label이 비어 있습니다.")
+    if body.target_kind == "category" and body.target_key not in CATEGORY_LABELS:
+        raise HTTPException(status_code=400, detail=f"없는 비용항목입니다: {body.target_key!r}")
+    if body.target_kind == "distinct":
+        key, label = "", ""
+    else:
+        key = body.target_key or row_match.normalize(body.target_label)
+        label = body.target_label or CATEGORY_LABELS.get(body.target_key, "")
+        if not label:
+            raise HTTPException(status_code=400, detail="target_label(합쳐 넣을 정식 이름)이 필요합니다.")
+    # 이름을 그 자신에게 거는 건 막는다 — 매칭할 때 자기 자신을 가리켜 무한히 되돌게 된다.
+    if body.target_kind == "extra_row" and key == norm:
+        raise HTTPException(status_code=400, detail="같은 이름을 자기 자신에게 연결할 수 없습니다.")
+    db.execute(
+        pg_insert(OverseasRowAlias)
+        .values(
+            alias_norm=norm,
+            alias_label=body.alias_label.strip(),
+            target_kind=body.target_kind,
+            target_key=key,
+            target_label=label,
+        )
+        .on_conflict_do_update(
+            index_elements=[OverseasRowAlias.alias_norm],
+            set_={
+                "alias_label": body.alias_label.strip(),
+                "target_kind": body.target_kind,
+                "target_key": key,
+                "target_label": label,
+                "updated_at": func.now(),
+            },
+        )
+    )
+    db.commit()
+    return RowAliasOut(
+        alias_norm=norm, alias_label=body.alias_label.strip(), target_kind=body.target_kind, target_key=key, target_label=label
+    )
+
+
+@router.delete("/overseas/row-aliases")
+def delete_row_alias(alias_label: str, db: Session = Depends(get_db)) -> dict:
+    """답을 지운다 — 다음 업로드에서 그 이름을 다시 물어본다(잘못 답한 걸 되돌릴 때)."""
+    norm = row_match.normalize(alias_label)
+    deleted = db.execute(delete(OverseasRowAlias).where(OverseasRowAlias.alias_norm == norm)).rowcount
+    db.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"저장된 답이 없습니다: {alias_label!r}")
+    return {"deleted": deleted, "alias_label": alias_label}
+
+
 # ---------- 연구소가 직접 추가한 행 · 메모 열 · 메모 셀 ----------
 # 행 = label이 있는 cost_entries 행(그 자체가 존재·이름·값을 다 가짐 — 별도 레지스트리 불필요).
 # 열(메모 전용 열)은 비용 데이터에 home이 없어서 memo_cols에 따로 둔다.
@@ -1548,10 +2518,11 @@ def _months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> 
     for e in entries:
         acc = out.setdefault(e.category_code, [])
         for i, v in enumerate(months_by_entry[e.id]):
+            # 파생 행의 재료 — 미등록은 0으로 보고 더한다(있는 값만 더하는 것과 결과가 같다).
             if i < len(acc):
-                acc[i] += v
+                acc[i] += _n(v)
             else:
-                acc.append(v)
+                acc.append(_n(v))
     return out
 
 
@@ -1842,7 +2813,7 @@ def list_cost_extras(
             if not col.formula:
                 continue
             for entry in entries_by_scope.get((col.scope_key, col.version), []):
-                value, basis = _eval_col_formula(col.formula, months_by_entry[entry.id])
+                value, basis = _eval_col_formula(col.formula, [_n(v) for v in months_by_entry[entry.id]])
                 out.append(
                     ExtraValueOut(
                         lab_pk=entry.scope_code, version=entry.version, row_key=entry.category_code,

@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, SmallInteger, String, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, SmallInteger, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -38,3 +38,41 @@ class Version(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
     )
     updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="마지막으로 수정한 사용자 (users.id)")
+
+
+class VersionAccountStatus(Base):
+    """버전 × 계정의 "계정 확정" 상태와 그 일시.
+
+    버전 전체의 확정(versions.status·confirmed_at)과는 다른 층이다 — 19개 계정 담당자가 각자
+    자기 계정을 먼저 확정하고, 전부 완료되면 버전을 확정한다. 누가 언제 확정했는지는 여러 사람이
+    같이 보는 값이라 브라우저(localStorage)에 두면 안 된다(화면을 지우면 사라지고, 옆자리에서는
+    다른 상태가 보인다). 그래서 상태·일시를 서버에 둔다.
+
+    note는 "무엇을 알고도 확정했는지"를 남기는 칸이다 — 미업로드 연구소가 있는데도 확정했다면
+    "미업로드 2개 포함 확정"이 남아야, 나중에 그 총액을 전체 합계로 오해하지 않는다. 확정을
+    취소하면 일시와 함께 지운다(공통 RULE: 완료 후 수정 시 작성중 + 일자 삭제).
+
+    행이 없으면 "작성 중"이다 — 계정 19개 × 버전마다 미리 행을 만들지 않는다."""
+
+    __tablename__ = "version_account_status"
+    __table_args__ = (
+        UniqueConstraint("version_id", "account_code", name="uq_version_account_status_key"),
+        CheckConstraint("status IN ('drafting', 'done')", name="ck_version_account_status_status"),
+        {"comment": "버전×계정의 계정 확정 상태·확정 일시·확정 당시 단서(note). 행이 없으면 작성 중."},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("versions.id", ondelete="CASCADE"), comment="versions.id (버전을 지우면 계정 상태도 같이 지운다)"
+    )
+    account_code: Mapped[str] = mapped_column(String(32), comment="accounts.key (overseas, dep, outsource ...)")
+    status: Mapped[str] = mapped_column(String(10), default="drafting", comment="drafting(작성 중) | done(완료)")
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), comment="완료로 바꾼 시각. 작성중으로 되돌리면 NULL로 지운다"
+    )
+    note: Mapped[str] = mapped_column(
+        String(200), default="", comment='확정 당시 단서("미업로드 2개 포함 확정" 등). 작성중으로 되돌리면 비운다'
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
+    )

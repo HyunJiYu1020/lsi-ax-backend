@@ -1,12 +1,18 @@
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models import Version
-from app.schemas.version import VersionIn, VersionOut, VersionStatusUpdate
+from app.models import Account, Version, VersionAccountStatus
+from app.schemas.version import (
+    VersionAccountStatusOut,
+    VersionAccountStatusUpdate,
+    VersionIn,
+    VersionOut,
+    VersionStatusUpdate,
+)
 
 router = APIRouter()
 
@@ -69,3 +75,68 @@ def delete_version(year: int, month: int, kind: str, db: Session = Depends(get_d
     db.delete(v)
     db.commit()
     return {"status": "ok"}
+
+
+# ---------- 버전 × 계정의 "계정 확정" ----------
+# 버전 전체의 확정(위 update_version_status)과는 다른 층이다 — 계정 담당자가 각자 자기 계정을 먼저
+# 확정하고, 전부 완료되면 버전을 확정한다. 행이 없으면 "작성 중"이라서 미리 만들어 두지 않는다.
+
+
+def _version_or_404(year: int, month: int, kind: str, db: Session) -> Version:
+    v = db.scalar(select(Version).where(Version.year == year, Version.month == month, Version.kind == kind))
+    if not v:
+        raise HTTPException(status_code=404, detail=f"열린 버전이 없습니다: {year}-{month:02d}-{kind}")
+    return v
+
+
+@router.get("/versions/{year}/{month}/{kind}/accounts", response_model=list[VersionAccountStatusOut])
+def list_version_accounts(year: int, month: int, kind: str, db: Session = Depends(get_db)) -> list[VersionAccountStatusOut]:
+    """그 버전에서 확정 처리된 계정들. 행이 없는 계정은 아직 작성 중이라 목록에 안 나온다."""
+    v = _version_or_404(year, month, kind, db)
+    rows = db.scalars(
+        select(VersionAccountStatus)
+        .where(VersionAccountStatus.version_id == v.id)
+        .order_by(VersionAccountStatus.account_code)
+    )
+    return [
+        VersionAccountStatusOut(
+            account_code=r.account_code, status=r.status, confirmed_at=r.confirmed_at, note=r.note
+        )
+        for r in rows
+    ]
+
+
+@router.put("/versions/{year}/{month}/{kind}/accounts/{account_code}", response_model=VersionAccountStatusOut)
+def update_version_account(
+    year: int,
+    month: int,
+    kind: str,
+    account_code: str,
+    body: VersionAccountStatusUpdate,
+    db: Session = Depends(get_db),
+) -> VersionAccountStatusOut:
+    """계정 확정 / 확정 취소. 완료로 바꾸는 순간 확정 일시를 찍고, 작성중으로 되돌리면 일시와
+    note를 같이 지운다 — 되돌렸는데 "미업로드 2개 포함 확정"이 남아 있으면 그게 지금 상태인 줄
+    오해한다(공통 RULE: 완료 후 수정 시 작성중 + 일자 삭제)."""
+    if body.status not in ("drafting", "done"):
+        raise HTTPException(status_code=400, detail="status는 drafting 또는 done이어야 합니다.")
+    if not db.scalar(select(Account).where(Account.key == account_code)):
+        raise HTTPException(status_code=404, detail=f"없는 계정입니다: {account_code!r}")
+    v = _version_or_404(year, month, kind, db)
+    row = db.scalar(
+        select(VersionAccountStatus).where(
+            VersionAccountStatus.version_id == v.id, VersionAccountStatus.account_code == account_code
+        )
+    )
+    if not row:
+        row = VersionAccountStatus(version_id=v.id, account_code=account_code)
+        db.add(row)
+    done = body.status == "done"
+    row.status = body.status
+    row.confirmed_at = datetime.now(timezone.utc) if done else None
+    row.note = body.note.strip()[:200] if done else ""
+    db.commit()
+    db.refresh(row)
+    return VersionAccountStatusOut(
+        account_code=row.account_code, status=row.status, confirmed_at=row.confirmed_at, note=row.note
+    )

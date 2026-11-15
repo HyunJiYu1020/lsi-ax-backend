@@ -8,7 +8,7 @@
 ```
 S.LSI/
 ├── backend/          FastAPI 서버 (:8000) — 이 저장소
-├── frontend/          React/Vite 프로토타입 — ⚠ 백엔드 미연결 (아래 2-3 참고)
+├── frontend/          React/Vite — 기준정보 › 버전만 백엔드 연결, 나머지는 localStorage (아래 2-2 참고)
 ├── frontend-html/      정적 HTML/JS — 실제로 백엔드와 통신하는 유일한 프론트
 └── .mcp.json          MCP 클라이언트(Claude Code 등)용 서버 등록 파일
 ```
@@ -42,6 +42,14 @@ const PLAN_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/mana
 | `ovApiLoad` / `ovApiFlush` | `GET/PUT /overseas/state` | 로드 시 1회 / 단계전환·블러 시 |
 | `ovLabsApiLoad` / `ovLabsApiFlush` | `GET/PUT /overseas/labs` | 로드 시 / 연구소 기준정보 저장 시 |
 | `ovUploadRaw` | `POST /overseas/uploads/file` | 엑셀 업로드할 때마다(파싱 성패 무관, fire-and-forget) |
+| `ovTrFlush` | `POST /overseas/reason-translate` | 증감사유 원문이 화면에 처음 보일 때(한 렌더 분량을 모아 250ms 디바운스, 묶음당 40건) |
+| `ovRowMatchLoad` | `POST /overseas/row-match` | 엑셀을 읽은 직후(계정 목록에 없던 행 이름이 있을 때) |
+| `ovAnomScan` | `POST /overseas/anomaly-scan` | 엑셀을 읽은 직후(반영 대기 값 검사) |
+| `ovAnomLoad` | `POST /overseas/anomaly-scan` | 증감분석 화면을 그릴 때(저장된 값으로 남은 건수 — 버전 단위 캐시) |
+| `ovRowAliasSave` | `PUT /overseas/row-aliases` | 대기 카드에서 고른 "같은 행 / 새 행" 답을 [반영]할 때 |
+| `verAcctApiLoad` / `verAcctApiSave` | `GET/PUT /versions/{y}/{m}/{kind}/accounts` | 로드 시 / [계정 확정]·[확정 취소] 누를 때(해외연구소만) |
+| `ovCarryLoad` / `ovCarrySet` | `GET/PUT /overseas/carry-defs` | 집계 ① 탭 파생 행·열 목록을 그릴 때 / [다음 버전에도] 체크할 때 |
+| `ovCarryForward` | `POST /overseas/carry-forward` | 새 버전을 열 때(`ovVerCopy`) — 유지 승인한 파생 행·열만 복제 |
 | (추가 행 조회/저장/삭제) | `GET/PUT/DELETE /overseas/extra-rows` | 사용자가 행 추가·수정·삭제할 때 |
 | (추가 열 조회/삭제) | `GET/DELETE /overseas/extra-cols` | 추가 열 목록 조회·열 삭제 시 |
 | (추가 열 값 조회/저장) | `GET/PUT /overseas/cost-extras` | 추가 열 칸 값 입력 시 |
@@ -50,6 +58,7 @@ const PLAN_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/mana
 | `fxApiLoad` / `fxApiFlush` | `GET/PUT /fx/state` | 로드 시 / 환율 저장 시 |
 | `verApi*` | `GET/POST/PUT/DELETE /versions` | 연월×속보·실적 버전 열기·완료·삭제 시 |
 | `verPlanApi*` | `GET/POST/PUT/DELETE /management-plan/versions` | 경영계획 버전(P00~) 만들기·확정·삭제 시 |
+| `ovclApiFirst` | `PUT /close/stages` | 실적결산 2단계에서 해외연구소 [1차 완료]·[1차 완료 취소] 누를 때 |
 
 **`ovCostApiBatch`는 중복 저장이다** — `overseas_cost_entries` 테이블이 있던 시절, 공용 테이블
 (`cost_entries`)로 데이터를 옮기는 동안 "새 테이블에도 같이 쌓기"용으로 넣은 병행 호출인데, 지금은
@@ -63,16 +72,59 @@ const PLAN_API = (window.OV_API_BASE || "http://localhost:8000") + "/api/v1/mana
 **외주용역 시트**는 `/overseas/state`의 `vendor` 필드로 연구소×버전 단위 전체 교체로 저장되고,
 DB는 마스터(`overseas_vendor_rows`) + 월별 디테일(`overseas_vendor_row_details`)로 나뉘어 있다
 (`cost_entries`/`cost_entry_details`와 같은 모양). 증감사유는 `reason` 필드 ↔ `overseas_reason_rows`.
+그 사유의 한국어 번역은 따로 쌓인다 — `POST /overseas/reason-translate`가 원문 1건당 1행으로
+`overseas_reason_translations`에 원문·번역을 같이 저장하고, 화면(`ovTrKo`)은 그 값을 우선 쓴다.
+서버 번역이 아직 안 왔거나 실패했을 때만 목업 시절 사전(`OV_KO`·`ovTrRule`)으로 폴백한다.
 
 **위 외의 `/overseas/*` 엔드포인트**(`memo-cols`, `memos`, `sheet-rows`, `notes`, `cost-entries`,
-`lab-sheets`, `step`)는 화면에 전용 버튼이 없고, **AI 플로팅 챗봇을 통해서만** 호출된다 — 4절 참고.
+`lab-sheets`, `step`, `reason-translations`)는 화면에 전용 버튼이 없고, **AI 플로팅 챗봇을 통해서만** 호출된다 — 4절 참고.
 
-### 2-2. `frontend` (React/Vite) — 백엔드 미연결
+### 2-2. `frontend` (React/Vite) — 일부 연결
 
-`src/` 전체를 검색해도 `fetch`/`axios`/API 베이스 URL이 하나도 없다. 지금은 `data/seed.js`의 더미 데이터와
-`logic/calc.js`의 순수 클라이언트 계산만으로 동작하는 독립 프로토타입이다. 나중에 이 쪽을 실제 백엔드에 붙이려면
-`frontend-html`의 `OV_API_BASE` 패턴을 참고해 `VITE_API_BASE` 같은 Vite 환경변수를 새로 만들어야 한다 — 현재는
-그 배선 자체가 존재하지 않는다는 점이 핵심.
+API 호출 층은 `src/api/client.js` 하나다. 베이스 주소는 `frontend-html`과 같은 규칙을 쓴다:
+
+```js
+// src/api/client.js
+const BASE = (import.meta.env.VITE_API_BASE || window.OV_API_BASE || "http://localhost:8000") + "/api/v1";
+```
+
+**실제로 `fetch`하는 경로** (base: `/api/v1`):
+
+| 호출부 | 엔드포인트 | 시점 |
+|---|---|---|
+| `components/VersionPage.jsx` | `GET/POST /versions`, `PUT/DELETE /versions/{y}/{m}/{kind}` | 기준정보 › 버전 화면 진입·연도 변경·열기/확정/되돌리기/닫기 |
+| `state/store.jsx` (`reloadVersions`) | `GET /versions` | 앱 시작 시 1회 — 편성 화면이 "열린 버전만" 고르게 하려고 |
+| `state/store.jsx` (`touchVersion`) | `PUT /versions/{y}/{m}/{kind}` | 완료된 버전의 값을 고칠 때(→ 작성중, 확정일 삭제) |
+| `steps/VarianceStep.jsx` | `GET /overseas/variance-basis` | 증감분석 진입·기준월·속보/실적·경영계획 차수 변경 시 |
+| `steps/VarianceStep.jsx` | `GET /overseas/variance-reasons`, `GET /overseas/variance-reason-check` | 비교 기준·기간·연구소·1차/2차를 바꿀 때마다 |
+| `components/ReasonCell.jsx` → `store.jsx` | `PUT /overseas/variance-reasons` | 사유 [저장] 누를 때 / 회신 원문 입력칸에서 포커스가 빠질 때 |
+| `components/ReasonCell.jsx` → `store.jsx` | `POST /overseas/variance-reason-draft` | [✦ 번역 + AI 초안] 누를 때 |
+| `components/DriverPanel.jsx` → `VarianceStep` | `POST /chat`, `GET/PUT/DELETE /overseas/variance-drivers` | 동인 요청 / 목록 조회 / [다음 버전에도 유지]·[표 삭제] |
+| `components/AskPanel.jsx` | `POST /chat`, `POST /chat/confirm` | 분석 질의 보낼 때 / 쓰기 승인·취소 |
+| `steps/ActualFirstPanel.jsx` | `GET/PUT /overseas/actual-first`, `GET/PUT /overseas/actual-stage` | 실적 1차 탭 진입·값/사유 저장·[1차 고정] 토글 |
+| `components/StageShiftBar.jsx` | `GET /overseas/actual-stage-shift` | 실적 2차 탭 진입 시 |
+| `steps/AggregateStep.jsx` → `store.jsx` (`ovLoadCpc`) | `GET /overseas/cp-contract` | 집계 진입·기준월/속보실적 변경 시 — CP 계약이 없으면 ④ CP 보정의 정산 칸을 빈칸으로 두고 알린다 |
+| `steps/AggregateStep.jsx` | `GET /overseas/confirm-check` | [계정 확정] 누른 직후 — 환율 미등록 월이면 막고, 미업로드·사유 미작성은 경고 후 진행(단서 문장을 note로 저장) |
+| `steps/AggregateStep.jsx` → `store.jsx` (`ovLoadAcct` · `ovSetAcctStatus`) | `GET/PUT /versions/{y}/{m}/{kind}/accounts` | 집계 진입 시 상태 읽기 / [계정 확정]·[작성중으로] |
+| `state/store.jsx` (`touchVersion`) | `PUT /versions/{y}/{m}/{kind}/accounts/overseas` | 확정 후 값을 고칠 때(→ 작성중, 확정일·단서 삭제) |
+| `steps/AggregateStep.jsx` → `store.jsx` (`ovSetFxRule`) | `PUT /fx/overseas-rule/override` · `/default` | 실적 월 환산 기준을 [실적 평균]으로 바꿀 때(이번 버전만) / "앞으로도?"를 승인할 때(기본값 변경) |
+| `components/VersionPage.jsx` | `GET /versions/{y}/{m}/{kind}/accounts` | 기준정보 › 버전 화면에서 열린 버전마다 — "해외연구소 완료 · 11.15"를 상태 아래 줄에 보여준다 |
+
+왜 이것들만인가: **여러 사람이 같이 보는 값**은 브라우저에 들고 있으면 안 된다. 버전 상태·확정일이
+그렇고, 증감분석 화면에서 새로 붙은 것들도 같은 이유다 — 증감사유는 보고서에 실리는 문장이고,
+실적 1차 값·[1차 고정]은 이미 보고한 숫자이고, 동인 표의 "다음 버전에도 유지" 승인은 다음 달 화면을
+바꾼다. 비교 기준 해석은 성격이 조금 다른데, DB에 어떤 버전이 열려 있고 어디에 데이터가 들어왔는지를
+봐야 알 수 있어서 브라우저가 계산할 수 없다(1월 속보의 전실행은 전년 12월 실적이다).
+
+반면 편성 금액 자체(해외연구소 3단계 표·환율·대시보드)는 아직 `data/seed.js`의 더미 데이터 +
+`logic/calc.js`의 클라이언트 계산 + `localStorage`로 돈다. 그래서 **서버가 안 떠 있어도 표는 그대로
+그려진다** — 증감분석 화면도 라벨과 사유 저장만 못 하고 숫자는 계속 보인다(`ApiError.status === 0`을
+각 패널이 안내 문구로 처리한다). 화면 계산과 서버 계산이 어긋나면 안 되므로, `logic/calc.js`의
+환차 분해 식을 고칠 때는 `app/api/v1/endpoints/overseas_variance.py`의 `_variance_cells`도 같이 고친다.
+
+**[계정 확정] 버튼은 해외연구소 편성 화면에 두지 않는다.** 계정 확정은 계정 담당자가 전체 현황에서
+하는 결정이라, 편성 화면에 같은 버튼을 또 두면 어느 쪽이 진짜인지 알 수 없다 — 이 화면은 상태
+뱃지(작성중/완료)만 읽어서 보여준다.
 
 ### 2-3. CORS (`app/main.py`)
 
@@ -160,3 +212,31 @@ import해서 `mcp.list_tools()` / `mcp.call_tool()`을 직접 호출한다(4-1�
 있다 — 2026-11-04에 `error_logs`/`fx_applied_rates`(수동 API 테스트)와 `memos`/`memo_cols`/
 `notes`(챗봇으로 넣은 "테스트 메모"·"테스트 사유"·중복 더미 행)에서 실제로 발견되어 정리했다.
 운영 전환 시 이 경로로 들어간 데이터를 주기적으로 점검할 것.
+
+---
+
+## 5. 실적결산 화면(`#/close`)의 해외연구소 탭 — 지금 어디까지 붙어 있나
+
+화면은 `shared/core.js` 맨 뒤의 "해외연구소 실적결산" 절에 있다. 기존 실적결산 코드를 고치지 않고
+**뒤에서 감싸는 방식**으로 붙였다(`const _ovclStep1=clsStep1; clsStep1=function(...)`) — core.js가
+이미 쓰는 후방 확장 관용구와 같고, 한 파일을 여러 사람이 동시에 고칠 때 충돌이 안 난다.
+
+| 화면 동작 | 지금 | 서버 엔드포인트 |
+|---|---|---|
+| 1단계 전표 업로드 · ERP I/F | 예시 전표(`ovclSeedVou`) + localStorage | `POST /close/vouchers` (연결 대기) |
+| 2단계 연구소 매핑 · 제외 · 이관 | 브라우저에서 계산·저장 | `GET/PUT /close/overseas/mapping` (연결 대기) |
+| AI 다시 매칭 | 브라우저(`ovclAI`) | `POST /close/overseas/rematch` (연결 대기) |
+| AI 규칙 등록 | 브라우저(`D.rules`) | `GET/POST /close/match-rules` (연결 대기) |
+| **[1차 완료] / 취소** | **서버 저장** | `PUT /close/stages` ✅ |
+
+**[1차 완료]만 먼저 서버에 붙인 이유**: 그 값은 혼자 쓰는 값이 아니다 — 증감분석 화면의 [1차 분석]
+탭을 열지 말지가 `overseas_actual_stages.close_first_done`에 달려 있어서, 브라우저에만 두면 결산
+담당자와 증감분석 담당자가 서로 다른 상태를 본다. 나머지(전표·매핑)는 아직 예시 전표로 도는 화면이라
+서버에 쌓을 실제 자료가 없다. 실패는 조용히 삼키고 로그에만 남긴다(`log()`) — 화면은 서버 없이도
+돌아가야 한다.
+
+**해외연구소만 완료가 두 층이다.** 다른 계정은 [매핑 완료]가 곧 계정 확정이지만, 해외연구소의 전표
+매핑은 ERP 약식 **1차**일 뿐이다. 그래서 이 화면은 [1차 완료]까지만 하고, 계정 완료는 편성 화면의
+실적 시뮬레이션 [확정](`PUT /versions/{y}/{m}/actual/accounts/overseas`, `verAcctApiSave`)으로만 된다.
+3단계 확정 표의 해외연구소 줄이 "1차 완료 / 완료"를 가려 보여주는 게 그 구분이다 — 상태를 하나로
+묶으면 1차만 끝난 달을 "결산 끝"으로 읽는다. 1차 없이도 2차를 진행할 수 있다.

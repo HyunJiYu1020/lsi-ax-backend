@@ -32,7 +32,17 @@ READ_PREFIXES = ("list_", "get_")
 # set_display_unit·set_labor_split은 이름이 set_*이지만 저장된 데이터를 전혀 건드리지 않는다 —
 # 화면의 표시 단위(K$ vs $)나 인건비 분해 줄의 펼침 여부만 바꾸는 도구라 승인 팝업 없이 바로
 # 실행한다(보는 방식을 바꾸는 데 매번 승인을 받으면, 숫자를 눈으로 비교하려는 흐름이 그때마다 끊긴다).
-SAFE_NON_PREFIXED_TOOLS = {"calculate", "combine_series", "set_display_unit", "set_labor_split"}
+# translate_reasons도 이름이 list_/get_이 아니지만 승인 없이 바로 실행한다 — 연구소가 보낸 사유를
+# 한국어로 읽어주는 것뿐이고, 편성 값이나 사유 원문을 바꾸지 않는다(번역문을 캐시 테이블에 쌓을
+# 뿐이다). "이 사유 뭐라고 쓴 거야"에 매번 승인 팝업이 뜨면 읽는 흐름이 끊긴다.
+# match_row_labels도 저장하지 않는다 — 비슷한 이름 후보만 돌려준다(합치는 건 사용자가 답한 뒤
+# upsert_row_alias, 그건 승인 대상이다). 후보를 보려는 것뿐인데 승인을 받으면 질문이 두 번이 된다.
+SAFE_NON_PREFIXED_TOOLS = {
+    "calculate", "combine_series", "set_display_unit", "set_labor_split", "translate_reasons", "match_row_labels",
+    # scan_anomalies도 저장하지 않는다 — 기준에 걸어 본 결과만 돌려준다(기준을 바꾸는 건
+    # set_anomaly_rule이고 그건 승인 대상이다). 결과를 보려는 것뿐인데 승인을 받으면 흐름이 끊긴다.
+    "scan_anomalies",
+}
 # 데이터를 지우는 도구 — 쓰기 승인(한 번) 위에 "정말 지울까요?"를 한 번 더 받게 하려고 따로 표시한다.
 # 값을 덮어쓰는 upsert_*는 잘못돼도 다시 덮어쓰면 되지만, delete_*는 되돌릴 방법이 없어서 구분한다.
 DESTRUCTIVE_PREFIXES = ("delete_",)

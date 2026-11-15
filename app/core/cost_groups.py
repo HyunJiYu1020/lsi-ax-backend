@@ -22,6 +22,26 @@ CATEGORY_LABELS: dict[str, str] = {
     "outs": "외주용역비", "A": "개발비", "tot": "개발비(매출)", "labor": "인건비", "B": "MARK UP",
 }
 
+# 업로드 파일은 영문 양식으로 온다 — 행 이름을 맞출 때(app/core/row_match.py) 한글명만으로는
+# `Travel Exp` 같은 파일 표기를 알아볼 수 없어서 영문명도 같이 둔다. core.js OV_EL의 en 필드와
+# 1:1로 맞출 것(계정이 늘어나면 양쪽을 같이 고친다).
+CATEGORY_LABELS_EN: dict[str, str] = {
+    "hc": "Headcount", "tot": "Development Expense Total (A+B)", "A": "Development Expense (A)",
+    "hr": "HR related", "labor": "Labor Cost", "sal": "Salaries & Wages", "bonus": "Bonus (MBO etc)",
+    "welf": "Welfare, Health Insurance", "edu": "Education & Trainning Exp", "travel": "Travel Exp",
+    "asset": "Asset related Exp", "dep": "Depreciation Exp", "amort": "Amortization Exp",
+    "rent": "Rent Exp", "repair": "Repair & Maintenance Exp", "ins": "Insurance Exp",
+    "direct": "Direct R&D Exp", "supp": "Product Supplies Exp", "test": "Test Exp",
+    "ord": "Ordinary R&D Exp", "gen": "General Operation Exp", "comm": "Commision & Service Exp",
+    "it": "IT Expense", "cons": "Consumable Supplies Expense", "util": "Light&Fuel Exp",
+    "car": "Car R&M Exp", "tel": "Telecom Exp", "pub": "Publishing Exp", "oth": "others",
+    "mgr": "Managerial Exp", "conv": "Convention Exp", "event": "Event Exp", "social": "Social Exp",
+    "misc": "Misc.", "tax": "Taxes and Duties", "nonop": "Non-operational", "B": "Margin (B)",
+    "itx": "IT Expenses", "eda": "EDA Tool", "emu": "Emulator", "swl": "SW/License Purchase",
+    "svr": "Rent for SVR/Storage", "itoth": "Other IT Expenses",
+    "outs": "Outsourcing Expense(Only for R&D)",
+}
+
 # 그리드의 "구분"에 보이는 집계 행(개발비(A) 등)은 그 자체로 저장된 값이 아니라 리프 여러 개를
 # 더한 값이다. 이 정의로 리프까지 재귀 전개해서 계산한다 — LLM이 직접 더하다 리프를 빠뜨리는
 # 사고(실제 사례: 27개 리프를 손으로 더해 1,934.5 대신 1,607.7을 답함)를 원천 차단하기 위함.
@@ -63,3 +83,49 @@ def resolve_leaves(group_key: str) -> list[str]:
 def category_label(key: str) -> str:
     """계정 코드의 한글명. 등록되지 않은 키(사용자가 추가한 행 등)는 코드를 그대로 돌려준다."""
     return CATEGORY_LABELS.get(key, key)
+
+
+# 증감분석 표의 행 순서·들여쓰기·단위. 화면(frontend/src/data/overseasConstants.js의 OV_EL)과 1:1로
+# 맞춰야 한다 — 서버가 내려주는 증감분석 표(/overseas/variance)와 화면 표의 행 순서가 다르면,
+# 챗봇이 "위에서 세 번째 줄"처럼 위치로 말할 때 어긋나고 엑셀 다운로드와도 대조가 안 된다.
+# unit: krw(원화 금액) | hc(명, 월평균) | pct(%, B÷A)
+VARIANCE_ROWS: tuple[tuple[str, int, str], ...] = (
+    ("hc", 0, "hc"),
+    ("tot", 0, "krw"),
+    ("A", 0, "krw"),
+    ("hr", 1, "krw"),
+    ("labor", 2, "krw"),
+    ("sal", 3, "krw"),
+    ("bonus", 3, "krw"),
+    ("welf", 3, "krw"),
+    ("edu", 2, "krw"),
+    ("travel", 2, "krw"),
+    ("asset", 1, "krw"),
+    ("dep", 2, "krw"),
+    ("amort", 2, "krw"),
+    ("rent", 2, "krw"),
+    ("repair", 2, "krw"),
+    ("ins", 2, "krw"),
+    ("direct", 1, "krw"),
+    ("supp", 2, "krw"),
+    ("test", 2, "krw"),
+    ("ord", 2, "krw"),
+    ("gen", 1, "krw"),
+    ("comm", 2, "krw"),
+    ("it", 2, "krw"),
+    ("cons", 2, "krw"),
+    ("util", 2, "krw"),
+    ("car", 2, "krw"),
+    ("tel", 2, "krw"),
+    ("pub", 2, "krw"),
+    ("oth", 2, "krw"),
+    ("mgr", 1, "krw"),
+    ("conv", 2, "krw"),
+    ("event", 2, "krw"),
+    ("social", 2, "krw"),
+    ("misc", 1, "krw"),
+    ("tax", 1, "krw"),
+    ("nonop", 1, "krw"),
+    ("B", 0, "krw"),
+    ("pct", 0, "pct"),
+)

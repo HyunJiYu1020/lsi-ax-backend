@@ -76,9 +76,13 @@ async def _delete(path: str, params: dict[str, Any]) -> Any:
 
 
 @mcp.tool()
-async def list_labs() -> Any:
-    """해외연구소(연구소·파트) 기준정보 목록을 반환한다. 연구소가 늘어나면 이 목록도 같이 늘어난다."""
-    return await _get("/overseas/labs")
+async def list_labs(as_of: str | None = None) -> Any:
+    """해외연구소(연구소·파트) 기준정보 목록을 반환한다. 연구소가 늘어나면 이 목록도 같이 늘어난다.
+
+    as_of("YYYY-MM")를 주면 그 시점에 쓰던 기준정보를 돌려준다. 기준정보를 바꿔도 지난 버전은
+    바뀌기 전 값으로 계산되므로, "지난달 보고서에서 그 연구소 통화가 뭐였나"처럼 과거 기준을
+    물어보면 as_of를 넣어 조회해라. 안 주면 지금 값이다."""
+    return await _get("/overseas/labs", {"as_of": as_of} if as_of else None)
 
 
 @mcp.tool(
@@ -92,13 +96,20 @@ async def list_labs() -> Any:
         "새 연구소인데 사용자가 코드를 말하지 않았으면 되묻지 말고 말한 이름에서 lab_code를 정해 "
         "제안해라(단, list_labs로 같은 연구소가 이미 있는지는 반드시 먼저 확인해라). "
         "그 연구소가 어떤 시트(비용·증감사유·외주용역)를 내는지 바꾸는 건 이 도구가 아니라 "
-        "upsert_lab_sheet/delete_lab_sheet다."
+        "upsert_lab_sheet/delete_lab_sheet다.\n"
+        "기준정보 변경은 '변경한 버전부터' 적용되고 지난 버전은 바뀌지 않는다 — effective_from을 "
+        "비워 두면 지금 편성 중인 기준월부터 적용되고, 이미 마감한 과거 달은 바뀌기 전 값으로 "
+        "그대로 남는다(통화를 바꿔도 지난달 보고 숫자가 소급해서 달라지지 않는다). 사용자가 "
+        "'예전 것도 다 바꿔줘'라고 하면 그때만 effective_from에 더 이른 \"YYYY-MM\"을 넣어라."
     )
 )
-async def upsert_lab(lab_code: str, name: str, currency: str, is_active: bool = True) -> Any:
-    return await _put(
-        "/overseas/labs/one", {"lab_code": lab_code, "name": name, "currency": currency, "is_active": is_active}
-    )
+async def upsert_lab(
+    lab_code: str, name: str, currency: str, is_active: bool = True, effective_from: str | None = None
+) -> Any:
+    body: dict[str, Any] = {"lab_code": lab_code, "name": name, "currency": currency, "is_active": is_active}
+    if effective_from:
+        body["effective_from"] = effective_from
+    return await _put("/overseas/labs/one", body)
 
 
 @mcp.tool()
@@ -375,6 +386,74 @@ async def upsert_note(
             "note_text": note_text,
         },
     )
+
+
+@mcp.tool(
+    description=(
+        "연구소가 영문으로 보낸 증감사유를 한국어 보고 문구로 번역한다(원문은 그대로 보관된다). "
+        "같은 원문은 한 번만 번역해서 저장해 두고 다음부터는 저장된 번역을 쓰므로, 같은 문장을 다시 "
+        "넣어도 번역이 달라지지 않는다. texts에 원문을 그대로 넣어라(여러 건 한 번에, 최대 40건). "
+        "번역을 못 한 건은 결과의 ko가 null로 온다 — 그때는 지어내지 말고 원문을 그대로 전하고 "
+        "번역하지 못했다고 말해라. 이미 한국어로 적힌 사유는 번역할 필요가 없으니 넣지 마라."
+    )
+)
+async def translate_reasons(texts: list[str], refresh: bool = False) -> Any:
+    """증감사유 영문 원문 → 한국어. refresh=True면 저장된 번역을 무시하고 다시 번역한다."""
+    return await _post("/overseas/reason-translate", {"texts": texts, "refresh": refresh})
+
+
+@mcp.tool(
+    description=(
+        "지금까지 저장된 증감사유 원문 · 한국어 번역 쌍을 최근 순으로 조회한다. "
+        "q를 주면 원문 · 번역 양쪽에서 그 말이 들어간 것만 찾는다(오역을 찾을 때 쓴다)."
+    )
+)
+async def list_reason_translations(q: str | None = None, limit: int = 200) -> Any:
+    """저장된 증감사유 번역 목록(원문 + 번역 + 번역한 모델)."""
+    return await _get("/overseas/reason-translations", {"q": q, "limit": limit})
+
+
+@mcp.tool(
+    description=(
+        "업로드 파일의 행 이름이 이미 있는 행과 같은 행인지 맞춰본다('Travel Expense' → 고정 계정 "
+        "출장비('Travel Exp')). 돌려주는 값에서 resolved가 있으면 사람이 전에 확정해 둔 답이고, "
+        "suggestions는 후보일 뿐이다 — 후보를 보고 네가 대신 확정하지 마라. 반드시 사용자에게 "
+        "\"같은 행인가요?\"를 묻고, 답을 들은 뒤에만 upsert_row_alias로 저장해라. "
+        "yyyymm은 \"YYYYMM\"(예: \"202609\"), version은 forecast|actual."
+    )
+)
+async def match_row_labels(labels: list[str], yyyymm: str, version: str | None = None) -> Any:
+    """업로드 행 이름 → 이미 있는 행 후보 찾기(합치지는 않는다)."""
+    return await _post("/overseas/row-match", {"labels": labels, "yyyymm": yyyymm, "version": version})
+
+
+@mcp.tool()
+async def list_row_aliases() -> Any:
+    """사람이 답해 둔 행 이름 매핑 전체(어떤 이름을 어느 행과 같다고 했는지)."""
+    return await _get("/overseas/row-aliases", {})
+
+
+@mcp.tool(
+    description=(
+        "\"이 행 이름은 저 행과 같다\"는 사용자의 답을 저장한다(다음 업로드부터 안 묻는다). "
+        "target_kind: category(고정 계정과 같은 행 — target_key에 비용항목 키), "
+        "extra_row(이미 있는 추가 행과 같은 행 — target_label에 그 행의 정식 이름), "
+        "distinct(별개 행이라고 답했을 때 — 이것도 저장해야 다시 묻지 않는다). "
+        "사용자가 직접 답한 경우에만 호출해라 — 후보 점수가 높다는 이유로 네가 정하면 안 된다."
+    )
+)
+async def upsert_row_alias(alias_label: str, target_kind: str, target_key: str = "", target_label: str = "") -> Any:
+    """업로드 행 이름 매핑 저장(덮어쓰기)."""
+    return await _put(
+        "/overseas/row-aliases",
+        {"alias_label": alias_label, "target_kind": target_kind, "target_key": target_key, "target_label": target_label},
+    )
+
+
+@mcp.tool()
+async def delete_row_alias(alias_label: str) -> Any:
+    """저장된 행 이름 매핑을 지운다 — 다음 업로드에서 그 이름을 다시 물어본다(잘못 답한 걸 되돌릴 때)."""
+    return await _delete("/overseas/row-aliases", {"alias_label": alias_label})
 
 
 @mcp.tool(
@@ -853,6 +932,124 @@ async def update_version_status(year: int, month: int, kind: str, status: str) -
 
 @mcp.tool(
     description=(
+        "그 버전에서 '계정 확정'이 된 계정들을 조회한다(계정별 상태 · 확정 시각 · 확정 당시 단서). "
+        "목록에 없는 계정은 아직 작성 중이라는 뜻이다 — 행이 없는 게 정상이니 '데이터 없음'이라고 "
+        "답하지 마라. note에 '미업로드 2개 포함 확정'처럼 적혀 있으면, 그 계정 총액이 전체 합계가 "
+        "아니라는 뜻이니 금액을 말할 때 그 사실을 같이 전해라."
+    )
+)
+async def list_version_accounts(year: int, month: int, kind: str) -> Any:
+    """버전×계정의 계정 확정 상태 목록. kind: forecast|actual."""
+    return await _get(f"/versions/{year}/{month}/{kind}/accounts", {})
+
+
+@mcp.tool(
+    description=(
+        "한 계정의 '계정 확정'을 처리하거나 취소한다. status: done(확정 — 확정 시각이 찍힌다) | "
+        "drafting(확정 취소 — 확정 시각과 note가 지워진다). account_code는 계정 코드(overseas 등).\n"
+        "해외연구소는 화면에서 확정 전에 환율 누락·미업로드를 검사한다 — 네가 이 도구로 바로 확정하면 "
+        "그 검사를 건너뛴다. 그래서 사용자가 분명히 확정해달라고 한 경우에만 부르고, 미업로드가 있는 "
+        "걸 알고 있다면 note에 '미업로드 N개 포함 확정'처럼 남겨라."
+    )
+)
+async def update_version_account(year: int, month: int, kind: str, account_code: str, status: str, note: str = "") -> Any:
+    """계정 확정 / 확정 취소."""
+    return await _put(f"/versions/{year}/{month}/{kind}/accounts/{account_code}", {"status": status, "note": note})
+
+
+@mcp.tool()
+async def list_anomaly_rules() -> Any:
+    """업로드 값 이상 감지 기준 4개(급변·합계 불일치·사유 누락·단위 의심)와 지금 값. desc 문장을 그대로 인용해서 설명해라."""
+    return await _get("/overseas/anomaly-rules", {})
+
+
+@mcp.tool(
+    description=(
+        "이상 감지 기준을 바꾼다(해외연구소 전체 공통, 저장된다). rule_key: jump(급변) | "
+        "sum_mismatch(합계 불일치) | missing_reason(사유 누락) | unit_suspect(단위 의심) — "
+        "'급변'·'합계'·'사유'·'단위' 같은 한국어도 받는다.\n"
+        "보낸 항목만 바뀐다: 비율만 바꿔달라면 pct만 넣어라(amount까지 보내면 사용자가 말하지 않은 "
+        "금액 하한이 덮인다). 끄려면 enabled=false, 기본값으로 되돌리려면 reset=true. "
+        "source='chat', note에는 사용자가 한 말을 그대로 넣어라(변경 이력에 남는다).\n"
+        "'이번만 50%로 봐줘'처럼 한 번만 보려는 요청에는 이 도구를 쓰지 마라 — scan_anomalies의 "
+        "overrides를 써라(저장되지 않는다)."
+    )
+)
+async def set_anomaly_rule(
+    rule_key: str,
+    pct: float | None = None,
+    amount: float | None = None,
+    ratio: float | None = None,
+    enabled: bool | None = None,
+    reset: bool = False,
+    note: str = "",
+) -> Any:
+    """이상 감지 기준 변경(저장)."""
+    return await _put(
+        "/overseas/anomaly-rules",
+        {
+            "rule_key": rule_key, "pct": pct, "amount": amount, "ratio": ratio,
+            "enabled": enabled, "reset": reset, "source": "chat", "note": note,
+        },
+    )
+
+
+@mcp.tool()
+async def list_anomaly_rule_history(limit: int = 50) -> Any:
+    """이상 감지 기준 변경 이력(최근 순, before/after). "언제 급변 기준이 올라갔나"를 되짚을 때 쓴다."""
+    return await _get("/overseas/anomaly-rules/history", {"limit": limit})
+
+
+@mcp.tool(
+    description=(
+        "저장된 값에 이상 감지 기준을 걸어 본다(아무것도 저장하지 않는다). lab_pk는 연구소 pk 또는 "
+        "'ALL', version은 forecast|actual, yyyymm은 \"YYYYMM\". 급변을 보려면 비교할 전실행도 "
+        "같이 줘라(base_yyyymm·base_version) — 없으면 급변·단위(배수) 검사를 건너뛰고 skipped에 "
+        "그 사실이 담겨 온다. 그때 findings가 비었다고 '이상 없음'이라고 답하지 마라.\n"
+        "overrides로 이번 조회에만 다른 기준을 쓸 수 있다(예: {\"jump\": {\"pct\": 50}}) — "
+        "'이번만 50%로 봐줘'가 이 경로다. 반영을 막는 기능이 아니라 알리는 기능이다."
+    )
+)
+async def scan_anomalies(
+    lab_pk: str,
+    version: str,
+    yyyymm: str,
+    base_yyyymm: str | None = None,
+    base_version: str | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> Any:
+    """이상 감지 검사(저장된 값 기준)."""
+    return await _post(
+        "/overseas/anomaly-scan",
+        {
+            "lab_pk": lab_pk, "version": version, "yyyymm": yyyymm,
+            "base_yyyymm": base_yyyymm, "base_version": base_version, "overrides": overrides,
+        },
+    )
+
+
+@mcp.tool()
+async def list_carry_defs() -> Any:
+    """집계에서 만든 파생 행·열 중 '다음 버전에도 유지'로 승인된 것들(kind: row|col)."""
+    return await _get("/overseas/carry-defs", {})
+
+
+@mcp.tool(
+    description=(
+        "집계 파생 행·열의 '다음 버전에도 유지'를 설정하거나(carry=true) 해제한다(carry=false). "
+        "kind: row(파생 행 — def_key는 row_key) | col(파생 열 — def_key는 열 이름). "
+        "유지로 설정하면 새 버전을 열 때 그 계산 행·열이 자동으로 만들어진다(값은 그 버전 숫자로 "
+        "다시 계산된다). 그 달만 보려고 만든 지표에까지 걸면 매달 끌려다니니, 사용자가 '계속 보겠다'고 "
+        "한 것만 설정해라."
+    )
+)
+async def set_carry_def(kind: str, def_key: str, label: str = "", carry: bool = True) -> Any:
+    """파생 행·열의 다음 버전 유지 설정."""
+    return await _put("/overseas/carry-defs", {"kind": kind, "def_key": def_key, "label": label, "carry": carry})
+
+
+@mcp.tool(
+    description=(
         "경영계획 버전 목록(연도별 P00·P01…)을 조회한다. is_confirmed는 확정 여부, is_final은 그 연도의 "
         "'대비 기준이 되는 공식 버전'인지다(연도당 하나). '올해 경영계획 몇 차까지 있어?'·'확정된 "
         "경영계획 어느 거야?' 같은 질문에 쓴다."
@@ -1084,6 +1281,210 @@ async def combine_series(series: list[list[float]], op: str) -> Any:
         num, den = series
         return {"result": [round(a / b, 4) if b != 0 else None for a, b in zip(num, den)]}
     return {"error": f"알 수 없는 op: {op} (sum_elementwise|div_elementwise 중 하나)"}
+
+
+@mcp.tool(
+    description=(
+        "해외연구소 계정별 증감분석 표를 그대로 조회한다 — 'SARC 인건비 왜 늘었어?'·'전년 대비 "
+        "출장비 얼마나 늘었어?'처럼 증감의 원인·금액을 묻는 질문에 쓰는 근거 데이터다.\n"
+        "(절대 하지 마라) list_cost_entries·list_cost_across_labs로 두 버전 금액을 받아서 네가 빼는 "
+        "방식으로 증감을 답하지 마라 — 그 차이에는 환율이 움직여서 변한 몫(환차)이 섞여 있어서 "
+        "사용자가 보는 화면 표와 다른 숫자가 나온다. 이 도구는 그 둘을 갈라서 준다.\n"
+        "basis_year(필수)·basis_month에는 '현재 화면' 정보의 'year'·'month' 키 값을 넣어라. "
+        "kind: forecast(속보, 기본값) | actual(실적). base_version: prev(전실행, 기본값) | prior(전년) | "
+        "plan(경영계획). period: y(연간, 기본값)|q1~q4|m1~m12. lab_scope: 'ALL'(전체, 기본값) | 연구소 "
+        "코드('SARC'면 파트 합계) | pk('SARC:CPU'). plan_no: 경영계획 차수(생략하면 ★ 기본 차수).\n"
+        "행마다 오는 값(금액은 전부 원, hc는 명, pct는 %): base(비교 기준) · cur(지금 버전) · diff(증감) · "
+        "diff_pct(증감률 %, 기준이 0이면 null) · fx(환차 계) · fx_local(환차 현지→$) · fx_usd(환차 $→원) · "
+        "fx_outside(환차外 = 금액 자체의 증감). 행마다 diff = fx + fx_outside가 성립한다.\n"
+        "답할 때 반드시 환차와 환차外를 갈라서 말해라 — '환율 때문에 얼마, 실제 비용 증가로 얼마'가 "
+        "이 질문의 핵심이다. USD가 아닌 통화를 쓰는 연구소만 fx_local이 0이 아니고, USD 연구소는 "
+        "현지→$ 단계가 없어 항상 0이다. base_label은 '25.12 실적'처럼 실제 비교 대상이니 그 말을 써라 "
+        "('prev' 같은 내부 코드를 노출하지 마라).\n"
+        "인건비가 왜 늘었는지를 인원/단가로 더 쪼개야 하면 이 도구 다음에 get_labor_split을 써라.\n"
+        "경영계획은 속보/실적 환율 기준이 없어 환차를 가를 수 없다 — 그때는 fx 칸이 0이고 증감 전부가 "
+        "환차外로 들어간다(응답 note에 적혀 온다). 그 0을 '환차가 없었다'로 말하지 마라. 비교 기준에 "
+        "저장된 데이터가 없으면 404가 나는데, 그때는 숫자를 지어내지 말고 그대로 설명해라."
+    )
+)
+async def get_variance(
+    basis_year: int,
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    base_version: str = "prev",
+    period: str = "y",
+    lab_scope: str = "ALL",
+    plan_no: str | None = None,
+) -> Any:
+    return await _get(
+        "/overseas/variance",
+        {
+            "basis_year": basis_year, "basis_month": basis_month, "kind": kind,
+            "base_version": base_version, "period": period, "lab_scope": lab_scope, "plan_no": plan_no,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "증감분석 화면의 비교 기준 세 칸이 실제로 무엇과 비교하는지 조회한다 — '전실행이 뭐랑 "
+        "비교하는 거야?'·'경영계획 몇 차 기준이야?'처럼 비교 대상 자체를 묻는 질문에 쓴다.\n"
+        "비교 기준은 이름만으로 뜻이 통하지 않는다: 전실행은 직전 버전이라 1월 속보에서는 전년 12월 "
+        "실적이고(연도를 넘어간다), 실적 버전에서는 같은 달 속보다. 전년은 전년 12월 실적인데 그게 "
+        "없으면 최근 실적/속보로 물러난다. 네가 '기준월 - 1'로 추측하지 말고 반드시 이 도구로 확인해라.\n"
+        "basis_year(필수)·basis_month에는 '현재 화면' 정보의 'year'·'month' 값을 넣어라. "
+        "kind: forecast(기본값) | actual | plan.\n"
+        "bases 배열의 각 항목: key(prev|prior|plan) · label(전실행|전년|경영계획) · resolved_label(실제 "
+        "비교 대상, 예 '25.12 실적') · has_data(그 버전에 데이터가 있는지) · fallback_note(원래 기준이 "
+        "없어 대체했을 때의 안내 문장). plan_revisions는 경영계획 차수 목록이고 ★(is_final)이 기본값이다.\n"
+        "사용자에게 말할 때는 resolved_label을 그대로 써라. has_data가 false면 그 기준으로는 증감을 "
+        "낼 수 없다는 뜻이니, fallback_note를 풀어서 설명하고 숫자를 지어내지 마라."
+    )
+)
+async def get_variance_basis(
+    basis_year: int, basis_month: int | None = None, kind: str = "forecast", plan_no: str | None = None
+) -> Any:
+    return await _get(
+        "/overseas/variance-basis",
+        {"basis_year": basis_year, "basis_month": basis_month, "kind": kind, "plan_no": plan_no},
+    )
+
+
+@mcp.tool(
+    description=(
+        "증감률이 큰데 증감사유가 비어 있거나, 사유를 저장한 뒤 금액이 바뀌어 재확인이 필요한 항목을 "
+        "조회한다 — '확정해도 돼?'·'사유 안 쓴 데 있어?'처럼 확정 전 점검을 묻는 질문에 쓴다.\n"
+        "threshold_pct(기본 10)보다 증감률 절댓값이 큰 항목만 본다. missing은 사유가 아예 없는 항목, "
+        "stale은 사유는 있지만 저장 뒤 금액이 바뀐 항목(화면에 '재확인 필요'로 뜬다)이다.\n"
+        "집계 행(개발비(매출)·개발비(A) 등)과 인력·(%) 행은 목록에서 빠진다 — 하위 계정의 합이라 "
+        "사유를 따로 쓰지 않는다.\n"
+        "이 결과로 확정을 막지 마라(서버도 막지 않는다). '이대로 확정하면 이 항목들이 사유 없이 "
+        "보고된다'고 알려주고 결정은 사용자가 하게 해라. 사유를 네가 지어내서 저장하지 마라 — "
+        "사유는 연구소 회신을 근거로 담당자가 쓰는 문장이다."
+    )
+)
+async def check_variance_reasons(
+    basis_year: int,
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    base_version: str = "prev",
+    period: str = "y",
+    lab_scope: str = "ALL",
+    threshold_pct: float = 10.0,
+) -> Any:
+    return await _get(
+        "/overseas/variance-reason-check",
+        {
+            "basis_year": basis_year, "basis_month": basis_month, "kind": kind,
+            "base_version": base_version, "period": period, "lab_scope": lab_scope,
+            "threshold_pct": threshold_pct,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "증감분석 화면에 '증감 동인' 분해 표를 붙인다 — '인건비를 인력수 × 인당 단가로 쪼개서 "
+        "보여줘'처럼 어떤 계정의 증감을 구성 요소로 갈라 보고 싶다는 요청에 쓴다.\n"
+        "금액이 아니라 계산식(factors)을 저장한다 — 연구소가 파일을 다시 올리면 동인 금액도 따라 "
+        "바뀌어야 하기 때문이다. 네가 combine_series로 숫자를 구해서 그 숫자를 넣지 마라.\n"
+        "factors 한 줄 모양: {\"label\":\"인당 인건비\", \"op\":\"div_elementwise\", "
+        "\"operands\":[\"labor\",\"hc\"], \"unit\":\"krw\"}. op: ref(그 항목 그대로, operands 1개) | "
+        "div_elementwise(나누기, operands 정확히 2개 [분자, 분모]) | sub(첫 항목 − 나머지) | sum(합). "
+        "operands에는 계정 키와 집계 그룹 키(labor·A·tot 등)를 쓸 수 있다. unit: krw | usd | hc | pct.\n"
+        "driver_key는 같은 버전 안에서 유일한 영문 식별자(예 'labor_hc_rate')로 네가 정해라. "
+        "target_key는 분해 대상 계정 키(labor 등)다.\n"
+        "(반드시 지켜라) 처음 붙일 때는 carry_over=False로 두고, 사용자에게 '이 표를 다음 버전에도 "
+        "유지할까요?'라고 물어라. 승인하면 같은 driver_key로 carry_over=True로 다시 호출해라. "
+        "묻지 않고 True로 저장하면, 그 달만 보려던 분해가 매달 따라붙는다.\n"
+        "basis_year·basis_month·kind에는 '현재 화면' 정보의 값을 그대로 넣어라 — 다른 버전에 붙으면 "
+        "사용자 화면에는 아무것도 안 생긴 것처럼 보인다."
+    )
+)
+async def upsert_variance_driver(
+    basis_year: int,
+    driver_key: str,
+    title: str,
+    target_key: str,
+    factors: list[dict[str, Any]],
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    lab_scope: str = "ALL",
+    requested_text: str = "",
+    carry_over: bool = False,
+) -> Any:
+    return await _put(
+        "/overseas/variance-drivers",
+        {
+            "basis_year": basis_year, "basis_month": basis_month, "kind": kind, "lab_scope": lab_scope,
+            "driver_key": driver_key, "title": title, "target_key": target_key, "factors": factors,
+            "requested_text": requested_text, "carry_over": carry_over,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "이 버전에 붙어 있는 증감 동인 분해 표들과 그 계산 결과(기준·당월·증감·근거)를 조회한다. "
+        "'동인 표 뭐 붙어 있어?'·'인당 단가 효과 얼마야?' 같은 질문에 쓰고, 새 표를 붙이기 전에 "
+        "같은 분해가 이미 있는지 확인할 때도 쓴다(중복으로 붙이지 않도록).\n"
+        "created_here=false인 표는 이전 버전에서 carry_over로 따라온 것이다 — 그건 이 버전에서 지울 수 "
+        "없으니, 끊고 싶다면 그 표를 만든 버전(created_basis)에서 carry_over를 끄라고 안내해라.\n"
+        "rows의 basis_text에 '인당 인건비 = 인건비 ÷ 인력 = 184,761,819'처럼 계산 근거가 들어 있으니 "
+        "숫자만 말하지 말고 이 근거를 같이 보여줘라."
+    )
+)
+async def list_variance_drivers(
+    basis_year: int,
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    lab_scope: str = "ALL",
+    base_version: str = "prev",
+    period: str = "y",
+) -> Any:
+    return await _get(
+        "/overseas/variance-drivers",
+        {
+            "basis_year": basis_year, "basis_month": basis_month, "kind": kind, "lab_scope": lab_scope,
+            "base_version": base_version, "period": period,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "실적 1차 분석(ERP 약식) 표를 조회한다 — 연구소 총액만 있고 계정 상세·외주용역은 없다"
+        "(ERP가 그것까지 주지 않는다. 계정별로 보려면 2차(PL) 쪽인 get_variance를 써라).\n"
+        "행마다: currency(현지통화) · local_amount(현지통화 총액) · usd_amount(K$) · krw_amount(원) · "
+        "base_krw(비교 기준, 원) · diff · fx_local(환차 현지→$) · fx_usd(환차 $→원) · fx_outside · "
+        "reason_text(1차 사유). 1차 사유는 2차 사유와 별도로 저장된다.\n"
+        "stage.close_first_done이 false면 실적결산 1차가 아직 안 끝나서 가져올 ERP 값이 없다는 뜻이다. "
+        "stage.first_locked가 true면 [1차 고정] 상태라 값·사유를 고칠 수 없다 — 그때 수정 요청이 오면 "
+        "먼저 고정을 해제해야 한다고 설명해라(네가 임의로 해제하지 마라).\n"
+        "합계의 현지통화 칸은 통화가 섞여 뜻이 없어 비어 있다 — 0으로 읽거나 합산해서 말하지 마라."
+    )
+)
+async def get_actual_first(basis_year: int, basis_month: int, base_version: str = "prev") -> Any:
+    return await _get(
+        "/overseas/actual-first",
+        {"basis_year": basis_year, "basis_month": basis_month, "base_version": base_version},
+    )
+
+
+@mcp.tool(
+    description=(
+        "실적 2차(PL) 화면 맨 위의 '1차 → 2차 변동'을 조회한다 — '1차랑 2차 왜 달라?'·'1차 대비 "
+        "얼마 바뀌었어?' 같은 질문에 쓴다.\n"
+        "1차는 ERP 약식이고 2차는 PL이라 금액이 다른 게 정상이다. 환산은 양쪽 모두 그 달 실적 환율을 "
+        "써서 환율 차이가 아니라 금액 차이만 남긴다.\n"
+        "has_first=false면 1차 데이터가 없어(실적결산 1차 미완료) 변동을 낼 수 없다 — 그때는 0이라고 "
+        "답하지 말고 1차가 없다고 그대로 말해라."
+    )
+)
+async def get_actual_stage_shift(basis_year: int, basis_month: int) -> Any:
+    return await _get(
+        "/overseas/actual-stage-shift", {"basis_year": basis_year, "basis_month": basis_month}
+    )
 
 
 @mcp.tool()
