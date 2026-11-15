@@ -21,6 +21,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    false,
     CheckConstraint,
     Date,
     DateTime,
@@ -253,8 +254,9 @@ class CloseAccountStage(Base):
     시뮬레이션 화면의 [확정]으로만 된다. 그래서 여기서 '1차 완료'까지만 표시하고 계정 완료는
     건드리지 않는다(first_done_at이 그 1차 완료 시각이다).
 
-    해외연구소의 first_done_at은 overseas_actual_stages.close_first_done과 짝이다 — 여기서 1차를
-    끝내면 증감분석 화면의 [1차 분석] 탭이 열린다.
+    "1차 완료"의 진실은 mapping_done 하나다 — 예전에는 overseas_actual_stages.close_first_done이
+    같은 사실을 따로 들고 있어서 애플리케이션이 둘을 맞춰 줘야 했다(한쪽만 바뀌면 [1차 분석] 탭은
+    열렸는데 값이 없는 상태가 된다). PLAN.md Phase 4로 그 테이블을 흡수했다.
     """
 
     __tablename__ = "close_account_stages"
@@ -277,6 +279,15 @@ class CloseAccountStage(Base):
         DateTime(timezone=True), comment="매핑 완료(해외연구소는 1차 완료) 시각. 되돌리면 NULL로 지운다"
     )
     note: Mapped[str] = mapped_column(String(200), default="", comment="완료 당시 메모(미매핑 n건 남김 등)")
+    first_locked: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(),
+        comment="True면 [1차 고정] — 1차 값·사유 쓰기를 거부한다(해제해야 수정 가능). "
+        "versions.status와 무관하다: 1차 고정과 버전 확정은 다른 층의 결정이라 1차를 고정해도 "
+        "버전은 작성중 그대로다(2차 작업이 남아 있다)",
+    )
+    first_locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), comment="[1차 고정]을 누른 시각. 해제하면 NULL로 지운다"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막으로 고친 시각"
     )

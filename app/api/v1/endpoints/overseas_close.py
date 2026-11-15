@@ -17,7 +17,7 @@ overseas.py / overseas_variance.py와 가른 이유: 그 둘은 "편성 양식 �
   승인한 것만 규칙으로 등록한다(서버가 조용히 규칙을 만들지 않는다).
 - **해외연구소의 완료는 '1차 완료'까지다.** 전표 매핑이 끝나도 그건 ERP 약식 1차일 뿐이고, 계정
   완료는 PL이 나온 뒤 실적 시뮬레이션 화면의 [확정]으로만 된다. 그래서 여기서 versions 쪽
-  계정 상태를 건드리지 않고, overseas_actual_stages.close_first_done만 켠다(증감분석 1차 탭이 열린다).
+  계정 상태를 건드리지 않고 close_account_stages.mapping_done만 켠다(증감분석 1차 탭이 열린다).
 """
 
 from datetime import date, datetime, timezone
@@ -41,7 +41,6 @@ from app.models import (
     CloseMatchRule,
     CloseVoucher,
     CloseVoucherMap,
-    OverseasActualStage,
     Version,
     VersionAccountStatus,
 )
@@ -1013,8 +1012,8 @@ def list_stages(basis_year: int, basis_month: int, db: Session = Depends(get_db)
 def put_stage(body: StageIn, db: Session = Depends(get_db)) -> StageOut:
     """매핑 완료 토글. **해외연구소는 여기서 '1차 완료'까지만** 한다 — 계정 완료는 PL이 나온 뒤
     실적 시뮬레이션 화면의 [확정]으로만 되고, 1차 없이도 2차를 진행할 수 있다. 그래서 versions 쪽
-    계정 상태(version_account_status)를 건드리지 않고, 증감분석 [1차 분석] 탭을 여는
-    overseas_actual_stages.close_first_done만 같이 켠다.
+    계정 상태(version_account_status)를 건드리지 않는다. 증감분석 [1차 분석] 탭은 이 행의
+    mapping_done을 보고 열린다 — "1차 완료"의 진실은 그 컬럼 하나다(PLAN.md Phase 4).
 
     다른 계정은 매핑 완료가 곧 계정 확정이지만, 그 토글은 아직 이 엔드포인트가 하지 않는다 —
     전표매핑 계정 화면이 붙을 때 같이 넣어야 중간 상태가 안 생긴다."""
@@ -1027,27 +1026,17 @@ def put_stage(body: StageIn, db: Session = Depends(get_db)) -> StageOut:
             basis_year=body.basis_year, basis_month=body.basis_month, account_key=body.account_key
         )
         db.add(row)
+    # 1차를 고정해 둔 달은 되돌릴 수 없다 — 보고까지 끝낸 1차 값·사유가 조용히 열리면 안 된다.
+    # 고정 플래그가 같은 행에 있으므로 다른 테이블을 들여다볼 필요가 없다(PLAN.md Phase 4).
+    if body.account_key == ACCOUNT_KEY and not body.mapping_done and row.first_locked:
+        raise HTTPException(
+            409,
+            f"{body.basis_year}년 {body.basis_month}월 1차가 고정돼 있어 1차 완료를 되돌릴 수 없다. "
+            "증감분석 화면에서 [1차 고정]을 먼저 해제하라.",
+        )
     row.mapping_done = body.mapping_done
     row.first_done_at = datetime.now(timezone.utc) if body.mapping_done else None
     row.note = body.note
-
-    if body.account_key == ACCOUNT_KEY:
-        stage = db.scalar(
-            select(OverseasActualStage).where(
-                OverseasActualStage.basis_year == body.basis_year,
-                OverseasActualStage.basis_month == body.basis_month,
-            )
-        )
-        if stage is None:
-            stage = OverseasActualStage(basis_year=body.basis_year, basis_month=body.basis_month)
-            db.add(stage)
-        if not body.mapping_done and stage.first_locked:
-            raise HTTPException(
-                409,
-                f"{body.basis_year}년 {body.basis_month}월 1차가 고정돼 있어 1차 완료를 되돌릴 수 없다. "
-                "증감분석 화면에서 [1차 고정]을 먼저 해제하라.",
-            )
-        stage.close_first_done = body.mapping_done
     db.commit()
     return _stage_out(db, body.basis_year, body.basis_month, body.account_key)
 

@@ -44,11 +44,11 @@ from app.core.reason_translate import (
 )
 from app.db.session import get_db
 from app.models import (
+    CloseAccountStage,
     CostEntry,
     ManagementPlanEntry,
     ManagementPlanVersion,
     OverseasActualFirstRow,
-    OverseasActualStage,
     TextTranslation,
     VarianceDriver,
     VarianceReason,
@@ -1136,10 +1136,14 @@ def delete_variance_driver(
 
 
 # ---------- 실적 1차/2차 ----------
-def _stage_row(db: Session, basis_year: int, basis_month: int) -> OverseasActualStage | None:
+def _stage_row(db: Session, basis_year: int, basis_month: int) -> CloseAccountStage | None:
+    """그 연월 해외연구소의 결산 단계 행. "1차 완료"는 mapping_done 하나가 진실이다 —
+    예전에는 overseas_actual_stages.close_first_done이 같은 사실을 따로 들고 있었다(PLAN.md P2-6)."""
     return db.scalar(
-        select(OverseasActualStage).where(
-            OverseasActualStage.basis_year == basis_year, OverseasActualStage.basis_month == basis_month
+        select(CloseAccountStage).where(
+            CloseAccountStage.account_key == ACCOUNT_KEY,
+            CloseAccountStage.basis_year == basis_year,
+            CloseAccountStage.basis_month == basis_month,
         )
     )
 
@@ -1167,7 +1171,7 @@ def _stage_out(db: Session, basis_year: int, basis_month: int) -> ActualStageOut
             OverseasActualFirstRow.lab_code.in_(lab_codes or {""}),
         )
     ) or 0
-    close_done = bool(row and row.close_first_done)
+    close_done = bool(row and row.mapping_done)
     locked = bool(row and row.first_locked)
     note = (
         "실적결산 1차가 아직 끝나지 않아 1차 분석을 열 수 없다(가져올 ERP 약식 값이 없다)."
@@ -1203,12 +1207,17 @@ def update_actual_stage(body: ActualStageIn, db: Session = Depends(get_db)) -> A
     남아 있으므로 버전은 작성중 그대로여야 한다)."""
     row = _stage_row(db, body.basis_year, body.basis_month)
     if row is None:
-        row = OverseasActualStage(basis_year=body.basis_year, basis_month=body.basis_month)
+        row = CloseAccountStage(
+            account_key=ACCOUNT_KEY, basis_year=body.basis_year, basis_month=body.basis_month
+        )
         db.add(row)
     if body.close_first_done is not None:
-        row.close_first_done = body.close_first_done
+        # API 이름(close_first_done)은 그대로 두고 저장만 mapping_done으로 간다 — 프런트·챗봇
+        # 계약을 바꾸지 않으려는 것이다(PLAN Phase 3·4는 API 모양 유지가 원칙).
+        row.mapping_done = body.close_first_done
+        row.first_done_at = datetime.now(timezone.utc) if body.close_first_done else None
     if body.first_locked is not None:
-        if body.first_locked and not (row.close_first_done or body.close_first_done):
+        if body.first_locked and not (row.mapping_done or body.close_first_done):
             raise HTTPException(400, "실적결산 1차가 끝나지 않아 고정할 1차 값이 없다.")
         row.first_locked = body.first_locked
         row.first_locked_at = datetime.now(timezone.utc) if body.first_locked else None

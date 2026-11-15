@@ -18,7 +18,7 @@ from fastapi import HTTPException
 
 from app.api.v1.endpoints import overseas_variance as ov
 from app.api.v1.endpoints.overseas import LabView, _basis_month
-from app.models import OverseasActualStage
+from app.models import CloseAccountStage
 from app.schemas.overseas import (
     ActualFirstIn,
     ActualStageIn,
@@ -258,7 +258,7 @@ def test_stage_is_rejected_on_forecast(db):
 
 def test_first_and_second_reasons_stored_separately(db):
     """1차 사유와 2차 사유는 따로 저장된다 — 1차는 보고까지 끝난 값이라 2차가 덮어쓰면 안 된다."""
-    db.add(OverseasActualStage(basis_year=2026, basis_month=8, close_first_done=True))
+    db.add(CloseAccountStage(account_key="overseas", basis_year=2026, basis_month=8, mapping_done=True))
     db.flush()
     first = ov.upsert_variance_reason(
         VarianceReasonIn(

@@ -28,7 +28,6 @@ from app.models.generic import (  # noqa: F401
 )
 from app.models.overseas import (  # noqa: F401
     OverseasActualFirstRow,
-    OverseasActualStage,
     OverseasCpRow,
     OverseasLab,
     OverseasLabRevision,

@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api.v1.endpoints import overseas_close as cl
-from app.models import CloseMatchRule, CloseVoucher, CloseVoucherMap, OverseasActualStage
+from app.models import CloseAccountStage, CloseMatchRule, CloseVoucher, CloseVoucherMap
 from app.schemas.close import (
     DeptRule,
     MapEdit,
@@ -308,12 +308,16 @@ def test_first_done_sets_variance_first_tab_but_not_account_done(seeded):
     assert got.mapping_done is True and got.first_done_at
     assert got.display_status == "1차 완료"
     assert got.account_done is False
+    # Phase 4로 1차 완료는 close_account_stages.mapping_done 하나가 진실이다 — 예전에는
+    # overseas_actual_stages.close_first_done이 같은 사실을 따로 들고 있었다.
     stage = seeded.scalar(
-        select(OverseasActualStage).where(
-            OverseasActualStage.basis_year == YEAR, OverseasActualStage.basis_month == MONTH
+        select(CloseAccountStage).where(
+            CloseAccountStage.account_key == "overseas",
+            CloseAccountStage.basis_year == YEAR,
+            CloseAccountStage.basis_month == MONTH,
         )
     )
-    assert stage.close_first_done is True
+    assert stage.mapping_done is True
 
 
 def test_undo_first_done_is_blocked_while_first_is_locked(seeded):
@@ -322,8 +326,10 @@ def test_undo_first_done_is_blocked_while_first_is_locked(seeded):
     _ingest(seeded, [_line("9000091")])
     cl.put_stage(StageIn(basis_year=YEAR, basis_month=MONTH, mapping_done=True), db=seeded)
     stage = seeded.scalar(
-        select(OverseasActualStage).where(
-            OverseasActualStage.basis_year == YEAR, OverseasActualStage.basis_month == MONTH
+        select(CloseAccountStage).where(
+            CloseAccountStage.account_key == "overseas",
+            CloseAccountStage.basis_year == YEAR,
+            CloseAccountStage.basis_month == MONTH,
         )
     )
     stage.first_locked = True
