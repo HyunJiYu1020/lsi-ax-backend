@@ -11,29 +11,38 @@ from app.core.enums import AccountStatus, CodeGroup, OverseasSheetType, VersionS
 from app.db.session import SessionLocal
 from app.models import Account, AccountProgress, AccountStep, CommonCode, CommonCodeGroup, OverseasLab, OverseasLabSheet
 
-# 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order) — 프론트 OV_LABS와 동일.
+# 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order, currency)
+# — 프론트 OV_LABS와 동일.
 # sort_order는 lab_code 단위 표시 순서(같은 lab_code의 파트들은 같은 값) — 탭·집계표가 이 순서로 나온다.
-OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int]] = [
-    ("SARC:CPU", "SARC", "CPU", "SARC+ACL · CPU", "미국", 10),
-    ("SARC:GPU", "SARC", "GPU", "SARC+ACL · GPU (ACL)", "미국", 10),
+#
+# currency(현지통화)를 여기 적어 두는 이유: 예전에는 시드가 통화를 아예 안 넣어서 컬럼 기본값 USD로
+# 깔리고, 통화는 마이그레이션(b3f4c91a7d2e)이 국가별 매핑으로 한 번 백필하는 것에만 의존했다.
+# 그러면 "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 USD가 되어 현지통화 연구소의
+# 환차 분해(현지→$ 단계)가 통째로 사라진다. 통화는 환산의 입력이라 시드가 직접 책임져야 한다.
+#
+# 대만(TDC)만 국가 기본값(TWD)이 아니라 USD다 — TDC는 $로 결산하는 연구소라 목업에서도 국가별
+# 기본값을 덮어쓴다(core.js ovLabsSeed의 `r.c==="TDC"?"USD":...`). 국가로 유추하지 말 것.
+OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int, str]] = [
+    ("SARC:CPU", "SARC", "CPU", "SARC+ACL · CPU", "미국", 10, "USD"),
+    ("SARC:GPU", "SARC", "GPU", "SARC+ACL · GPU (ACL)", "미국", 10, "USD"),
     # CPU+GPU 합산과 별개로 연구소에서 받는 공식 총계 원본값. part_code="TOTAL"은 프론트
     # ovLabsFromApi가 L.parts 그룹핑에서 제외하므로 OV_ALLPK(전체 집계)에는 안 섞인다 —
     # "총계" 탭 전용 조회(ovCostView의 totPk)로만 쓰인다.
-    ("SARC:TOTAL", "SARC", "TOTAL", "SARC+ACL · 총계", "미국", 10),
-    ("DSRA", "DSRA", None, "DSRA", "미국", 20),
-    ("SIRC", "SIRC", None, "SIRC", "이스라엘", 30),
-    ("SSIR", "SSIR", None, "SSIR", "인도", 40),
-    ("SCSC", "SCSC", None, "SCSC", "영국", 50),
-    ("SSCR", "SSCR", None, "SSCR", "중국", 60),
-    ("TDC", "TDC", None, "TDC", "대만", 70),
-    ("DSRJ", "DSRJ", None, "DSRJ", "일본", 80),
-    ("SRPOL", "SRPOL", None, "SRPOL", "폴란드", 90),
-    ("SRR", "SRR", None, "SRR", "러시아", 100),
-    ("CP", "CP", None, "CP", "이스라엘", 110),
-    ("SRCX", "SRCX", None, "SRCX", "중국", 120),
+    ("SARC:TOTAL", "SARC", "TOTAL", "SARC+ACL · 총계", "미국", 10, "USD"),
+    ("DSRA", "DSRA", None, "DSRA", "미국", 20, "USD"),
+    ("SIRC", "SIRC", None, "SIRC", "이스라엘", 30, "ILS"),
+    ("SSIR", "SSIR", None, "SSIR", "인도", 40, "INR"),
+    ("SCSC", "SCSC", None, "SCSC", "영국", 50, "GBP"),
+    ("SSCR", "SSCR", None, "SSCR", "중국", 60, "CNY"),
+    ("TDC", "TDC", None, "TDC", "대만", 70, "USD"),  # 대만이지만 $ 결산 — 위 주석 참고
+    ("DSRJ", "DSRJ", None, "DSRJ", "일본", 80, "JPY"),
+    ("SRPOL", "SRPOL", None, "SRPOL", "폴란드", 90, "PLN"),
+    ("SRR", "SRR", None, "SRR", "러시아", 100, "RUB"),
+    ("CP", "CP", None, "CP", "이스라엘", 110, "ILS"),
+    ("SRCX", "SRCX", None, "SRCX", "중국", 120, "CNY"),
     # 실제 연구소가 아니라 "원화 기타"처럼 특정 연구소에 속하지 않는 계정 전체 단위 값을
     # 담기 위한 가상 행. cost_entries 등 공용 테이블의 scope_code를 그대로 재사용하기 위함.
-    ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999),
+    ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999, "USD"),
 ]
 
 # 연구소(lab_code)별 워크북 시트 구성. SARC+ACL만 비용 시트 하나고, 나머지는 비용·증감분석·
@@ -220,12 +229,13 @@ def seed(db: Session) -> None:
             db.add(AccountProgress(account_id=acct.id, current_step_order=1))
 
     existing_labs = {lab.pk for lab in db.query(OverseasLab).all()}
-    for pk, lab_code, part_code, name, country, sort_order in OVERSEAS_LABS:
+    for pk, lab_code, part_code, name, country, sort_order, currency in OVERSEAS_LABS:
         if pk in existing_labs:
             continue
         db.add(
             OverseasLab(
-                pk=pk, lab_code=lab_code, part_code=part_code, name=name, country=country, sort_order=sort_order
+                pk=pk, lab_code=lab_code, part_code=part_code, name=name, country=country,
+                sort_order=sort_order, currency=currency,
             )
         )
 

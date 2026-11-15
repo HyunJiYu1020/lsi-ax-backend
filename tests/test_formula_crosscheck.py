@@ -333,10 +333,6 @@ def test_local_currency_rate_formula_matches_core_js(db):
 # ---------- ④ 수식이 쓰는 기준정보 ----------
 
 
-# TDC(대만)만 세 곳이 갈려 있다 — 아래 test_tdc_currency_is_an_open_question가 따로 기록한다.
-_OPEN_QUESTION_LABS = {"TDC"}
-
-
 def test_lab_currency_tables_agree(db):
     """연구소 → 현지통화 표가 DB · core.js · calc.js에서 같은지.
 
@@ -353,7 +349,7 @@ def test_lab_currency_tables_agree(db):
     diff = {
         code: (front_core.get(code), front_calc.get(code))
         for code in set(front_core) | set(front_calc)
-        if front_core.get(code) != front_calc.get(code) and code not in _OPEN_QUESTION_LABS
+        if front_core.get(code) != front_calc.get(code)
     }
     assert not diff, f"core.js와 calc.js의 연구소 통화 표가 다르다 (core, calc): {diff}"
 
@@ -361,35 +357,13 @@ def test_lab_currency_tables_agree(db):
     mismatch = {
         code: (front_calc[code], db_cur[code])
         for code in front_calc
-        if code in db_cur and front_calc[code] != db_cur[code] and code not in _OPEN_QUESTION_LABS
+        if code in db_cur and front_calc[code] != db_cur[code]
     }
     assert not mismatch, f"프런트 초기값과 DB의 연구소 통화가 다르다 (프런트, DB): {mismatch}"
 
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="TDC의 현지통화가 core.js(USD)와 DB·calc.js(TWD)에서 다르다 — 어느 쪽이 맞는지 "
-    "확인이 필요한 미해결 항목. 정해서 한쪽으로 맞추면 이 테스트를 지울 것.",
-)
-def test_tdc_currency_is_an_open_question(db):
-    """TDC(대만)를 USD 연구소로 볼지 TWD 연구소로 볼지가 세 곳에서 갈려 있다.
-
-    - core.js: TDC만 콕 집어 USD로 바꾼다 (ovLabsSeed는 `r.c==="TDC"?"USD":...`로 국가별 기본값을
-      덮고, ovEnsure의 `tdcUsd` 플래그는 저장된 상태의 TDC까지 USD로 되돌린다 — 두 군데에서
-      일부러 그렇게 해 놨다)
-    - DB: TWD (마이그레이션 b3f4c91a7d2e가 국가→통화 일괄 매핑으로 "대만"→TWD를 넣었다)
-    - calc.js: TWD (국가별 기본값 그대로)
-
-    즉 한쪽은 "TDC는 예외적으로 $로 결산한다"는 구체적 결정처럼 보이고, 다른 쪽은 국가 기본값을
-    자동으로 받은 것처럼 보인다. 어느 쪽이 실제 업무인지는 코드로 알 수 없다.
-
-    실제 영향: TDC를 TWD로 보면 증감분석에서 TDC의 환차가 "현지→$"와 "$→원" 두 단계로 쪼개지고,
-    USD로 보면 "$→원" 한 단계만 생긴다. 금액 총합은 같지만 환차/환차外 배분과 인건비의 인원·단가
-    분해가 달라진다.
-    """
-    js = run_js("lab_currencies")
-    db_cur = {lab.lab_code: (lab.currency or "USD").upper() for lab in _lab_views(db)}
-    assert js["core"]["TDC"] == js["calc"]["TDC"] == db_cur.get("TDC", "USD")
+    # TDC는 국가 기본값(대만→TWD)의 예외다 — $로 결산하는 연구소라 세 곳 모두 USD여야 한다.
+    # 국가로 유추해 TWD로 되돌리는 회귀가 가장 생기기 쉬운 자리라 따로 못 박는다.
+    assert front_core["TDC"] == front_calc["TDC"] == db_cur["TDC"] == "USD"
 
 
 def test_blank_cell_handling_differs_by_design():
