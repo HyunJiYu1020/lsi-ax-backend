@@ -259,7 +259,27 @@ close_account_stages (변경 후)
 - 같이 고친 것 ③: **`seed.py`가 연구소 통화를 아예 안 넣고 있었다.** 통화는 마이그레이션의 1회성 백필에만 의존해서, "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 컬럼 기본값 USD로 깔렸다 — 현지통화 연구소의 환차 분해(현지→$ 단계)가 통째로 사라지는 상태다. 통화는 환산의 입력이라 시드가 직접 책임지도록 `OVERSEAS_LABS`에 넣었다
 - 롤백: 테스트 추가 + 조회 정렬 2곳 (DB 무변경, `git revert`로 끝)
 
-**Phase 1 — 코드 배치 리팩토링 (DB 무변경)** — 🔄 진행 중 (3/6: periods · fxcalc · labs 완료)
+**Phase 1 — 코드 배치 리팩토링 (DB 무변경)** — 🔄 거의 완료 (2026-11-16)
+
+끝난 것:
+- `core/periods.py`(기간) · `core/values.py`(n·source_hash) — 순수 유틸
+- `services/fx_rates.py`(적용 환율 계산, 전 계정) · `services/overseas/fxcalc.py`(rate_arrays)
+- `services/overseas/labs.py`(all_labs·lab_views·LabView·ACCOUNT_KEY)
+- `services/overseas/entries.py`(읽기/쓰기 + **분기·연간 재계산 통합 → P1-3 해결**, current_basis_month)
+- `services/overseas/aggregate.py`(group_tree·krw_months·cp_quarter_amounts·extra_row_months·TOT/LABOR_TREE)
+- `overseas_variance.py`는 `overseas.py`를 **전혀 import하지 않는다**
+- `_month` 중복 정의 통합(P3)
+
+남은 것 — 라우트 핸들러 직접 호출 2건(P1-1의 가장 나쁜 부분):
+- `overseas_aggregate.py` → `get_overseas_state` (상태 조립을 `services/overseas/state.py`로 내려야 함)
+- `overseas_aggregate.py` → `check_variance_reasons`
+- `overseas_close.py` → `overseas_variance._active_labs` · `_load_cost_version`
+- `overseas_aggregate.py` → `overseas.list_extra_rows` (조회 핸들러 — 추가 행 읽기를 services로)
+
+**이름 짓기 교훈**: 공용으로 올리는 이름은 흔한 지역 변수명과 겹치지 않게 고른다. `_yyyymm`→`yyyymm`,
+`_labs`→`labs`, `_basis_month`→`basis_month`로 바꿨을 때 각각 `UnboundLocalError`로 2건·41건·12건이
+깨졌다(지역 변수가 함수를 가린다). `all_labs`·`current_basis_month`처럼 접두사를 붙여 피했고,
+공개 이름 25개에 대한 AST 그림자 검사를 돌린다.
 - `services/overseas/` 신설, 공유 헬퍼 이동 + 공개 이름 전환 (D1-A). endpoints의 교차 import를 services 참조로 교체, `overseas_aggregate`의 라우트 핸들러 직접 호출 제거
 - `_check_kind` 등 소소한 중복 통합, `core/periods.py` 추출
 - 이때 **분기·연간 재계산을 `services/overseas/entries.py`의 bulk upsert에 통합** (P1-3 해결 — 쓰기 경로가 하나로 모이는 시점이 유일한 해결 기회)
