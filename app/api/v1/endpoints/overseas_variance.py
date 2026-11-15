@@ -49,9 +49,9 @@ from app.models import (
     ManagementPlanVersion,
     OverseasActualFirstRow,
     OverseasActualStage,
-    OverseasReasonTranslation,
-    OverseasVarianceDriver,
-    OverseasVarianceReason,
+    TextTranslation,
+    VarianceDriver,
+    VarianceReason,
     Version,
 )
 from app.schemas.overseas import (
@@ -638,8 +638,11 @@ def get_variance(
 
 
 # ---------- 증감사유 ----------
-def _reason_filters(key, model=OverseasVarianceReason):
+def _reason_filters(key, model=VarianceReason):
+    # variance_reasons·variance_drivers는 전 계정 공용 테이블이 됐다(PLAN.md Phase 3) —
+    # 계정을 안 걸면 다른 계정의 증감사유가 섞인다. 이 함수가 모든 조회의 단일 관문이다.
     return (
+        model.account_key == ACCOUNT_KEY,
         model.basis_year == key.basis_year,
         model.basis_month == key.basis_month,
         model.kind == key.kind,
@@ -650,7 +653,7 @@ def _reason_filters(key, model=OverseasVarianceReason):
     )
 
 
-def _reason_out(row: OverseasVarianceReason, current_diff: float | None = None) -> VarianceReasonOut:
+def _reason_out(row: VarianceReason, current_diff: float | None = None) -> VarianceReasonOut:
     return VarianceReasonOut(
         basis_year=row.basis_year,
         basis_month=row.basis_month,
@@ -717,7 +720,7 @@ def list_variance_reasons(
         base_version=base_version, period=period, lab_scope=lab_scope, category_key="",
     )
     _check_period(period)
-    rows = list(db.scalars(select(OverseasVarianceReason).where(*_reason_filters(key))))
+    rows = list(db.scalars(select(VarianceReason).where(*_reason_filters(key))))
     diffs = _diff_by_category(db, key, plan_no)
     out: list[VarianceReasonOut] = []
     for row in rows:
@@ -726,7 +729,7 @@ def list_variance_reasons(
     return out
 
 
-def _apply_recheck(row: OverseasVarianceReason, current_diff: float | None) -> None:
+def _apply_recheck(row: VarianceReason, current_diff: float | None) -> None:
     """저장된 사유는 그대로 두고 재확인 플래그만 갱신한다.
 
     왜 사유를 지우지 않는가: 담당자가 쓴 문장은 서버가 버릴 값이 아니다. 금액이 바뀌었다고 사유를
@@ -753,12 +756,13 @@ def upsert_variance_reason(body: VarianceReasonIn, db: Session = Depends(get_db)
         _require_first_unlocked(db, body.basis_year, body.basis_month, "1차 사유")
 
     row = db.scalar(
-        select(OverseasVarianceReason).where(
-            *_reason_filters(body), OverseasVarianceReason.category_key == body.category_key
+        select(VarianceReason).where(
+            *_reason_filters(body), VarianceReason.category_key == body.category_key
         )
     )
     if row is None:
-        row = OverseasVarianceReason(
+        row = VarianceReason(
+            account_key=ACCOUNT_KEY,
             basis_year=body.basis_year, basis_month=body.basis_month, kind=body.kind, stage=stage,
             base_version=body.base_version, period=body.period, lab_scope=body.lab_scope,
             category_key=body.category_key,
@@ -812,7 +816,7 @@ async def make_variance_reason_draft(
     engine = engine_label(provider)
 
     cached = db.scalar(
-        select(OverseasReasonTranslation).where(OverseasReasonTranslation.source_hash == _source_hash(source))
+        select(TextTranslation).where(TextTranslation.source_hash == _source_hash(source))
     )
     source_ko = cached.ko_text if cached and cached.ko_text else ""
     error = ""
@@ -851,12 +855,12 @@ def _cache_translation(db: Session, source: str, ko: str, engine: str) -> None:
     """번역 1건을 /overseas/reason-translate와 같은 자리에 캐시한다 — 두 경로가 따로 캐시하면 같은
     원문이 두 번역을 갖게 되어 "원문 1건 = 번역 1개"가 깨진다. ko_text가 String(600)이라 길면 자른다."""
     text = ko[:600]
-    stmt = pg_insert(OverseasReasonTranslation).values(
+    stmt = pg_insert(TextTranslation).values(
         source_hash=_source_hash(source), source_text=source, ko_text=text, engine=engine
     )
     db.execute(
         stmt.on_conflict_do_update(
-            index_elements=[OverseasReasonTranslation.source_hash],
+            index_elements=[TextTranslation.source_hash],
             set_={"ko_text": text, "engine": engine, "updated_at": func.now()},
         )
     )
@@ -893,7 +897,7 @@ def check_variance_reasons(
     result = _compute_variance(db, basis_year, month, kind, base_version, period, lab_scope, plan_no, stage)
     saved = {
         r.category_key: r
-        for r in db.scalars(select(OverseasVarianceReason).where(*_reason_filters(key)))
+        for r in db.scalars(select(VarianceReason).where(*_reason_filters(key)))
     }
 
     missing: list[VarianceReasonGap] = []
@@ -984,7 +988,7 @@ def _driver_rows(cells: dict[str, dict[str, float]], factors: list[dict]) -> lis
     return rows
 
 
-def _driver_out(row: OverseasVarianceDriver, basis_year: int, basis_month: int, kind: str) -> VarianceDriverOut:
+def _driver_out(row: VarianceDriver, basis_year: int, basis_month: int, kind: str) -> VarianceDriverOut:
     created_here = (row.basis_year, row.basis_month, row.kind) == (basis_year, basis_month, kind)
     return VarianceDriverOut(
         basis_year=row.basis_year,
@@ -1005,7 +1009,7 @@ def _driver_out(row: OverseasVarianceDriver, basis_year: int, basis_month: int, 
 
 def _visible_drivers(
     db: Session, basis_year: int, basis_month: int, kind: str, lab_scope: str
-) -> list[OverseasVarianceDriver]:
+) -> list[VarianceDriver]:
     """이 버전에서 보이는 동인 표 = 이 버전에 붙인 것 + 이전 버전에서 carry_over로 켜 둔 것.
 
     같은 driver_key가 양쪽에 다 있으면 이 버전에 붙인 것을 쓴다 — 담당자가 이번에 고쳐 둔 표가
@@ -1013,12 +1017,12 @@ def _visible_drivers(
     cur_ym = basis_year * 100 + basis_month
     rows = list(
         db.scalars(
-            select(OverseasVarianceDriver)
-            .where(OverseasVarianceDriver.lab_scope == lab_scope)
-            .order_by(OverseasVarianceDriver.basis_year, OverseasVarianceDriver.basis_month)
+            select(VarianceDriver)
+            .where(VarianceDriver.account_key == ACCOUNT_KEY, VarianceDriver.lab_scope == lab_scope)
+            .order_by(VarianceDriver.basis_year, VarianceDriver.basis_month)
         )
     )
-    by_key: dict[str, OverseasVarianceDriver] = {}
+    by_key: dict[str, VarianceDriver] = {}
     for r in rows:
         r_ym = r.basis_year * 100 + r.basis_month
         here = (r.basis_year, r.basis_month, r.kind) == (basis_year, basis_month, kind)
@@ -1075,16 +1079,18 @@ def upsert_variance_driver(body: VarianceDriverIn, db: Session = Depends(get_db)
         raise HTTPException(400, "driver_key와 title은 비울 수 없다.")
 
     row = db.scalar(
-        select(OverseasVarianceDriver).where(
-            OverseasVarianceDriver.basis_year == body.basis_year,
-            OverseasVarianceDriver.basis_month == body.basis_month,
-            OverseasVarianceDriver.kind == body.kind,
-            OverseasVarianceDriver.lab_scope == body.lab_scope,
-            OverseasVarianceDriver.driver_key == body.driver_key,
+        select(VarianceDriver).where(
+            VarianceDriver.account_key == ACCOUNT_KEY,
+            VarianceDriver.basis_year == body.basis_year,
+            VarianceDriver.basis_month == body.basis_month,
+            VarianceDriver.kind == body.kind,
+            VarianceDriver.lab_scope == body.lab_scope,
+            VarianceDriver.driver_key == body.driver_key,
         )
     )
     if row is None:
-        row = OverseasVarianceDriver(
+        row = VarianceDriver(
+            account_key=ACCOUNT_KEY,
             basis_year=body.basis_year, basis_month=body.basis_month, kind=body.kind,
             lab_scope=body.lab_scope, driver_key=body.driver_key,
         )
@@ -1113,12 +1119,13 @@ def delete_variance_driver(
     _check_kind(kind)
     month = basis_month or _basis_month(db) or 1
     row = db.scalar(
-        select(OverseasVarianceDriver).where(
-            OverseasVarianceDriver.basis_year == basis_year,
-            OverseasVarianceDriver.basis_month == month,
-            OverseasVarianceDriver.kind == kind,
-            OverseasVarianceDriver.lab_scope == lab_scope,
-            OverseasVarianceDriver.driver_key == driver_key,
+        select(VarianceDriver).where(
+            VarianceDriver.account_key == ACCOUNT_KEY,
+            VarianceDriver.basis_year == basis_year,
+            VarianceDriver.basis_month == month,
+            VarianceDriver.kind == kind,
+            VarianceDriver.lab_scope == lab_scope,
+            VarianceDriver.driver_key == driver_key,
         )
     )
     if row is None:

@@ -28,16 +28,16 @@ from app.models import (
     Memo,
     MemoCol,
     Note,
-    OverseasAnomalyRule,
-    OverseasAnomalyRuleLog,
-    OverseasCarryDef,
+    AnomalyRule,
+    AnomalyRuleLog,
+    CarryDef,
     OverseasCpRow,
     OverseasLab,
     OverseasLabRevision,
     OverseasLabSheet,
     OverseasReasonRow,
-    OverseasReasonTranslation,
-    OverseasRowAlias,
+    TextTranslation,
+    RowAlias,
     OverseasVendorRow,
     OverseasVendorRowDetail,
     OverseasFxRuleOverride,
@@ -1696,12 +1696,12 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
     rows = {
         r.source_hash: r
         for r in db.scalars(
-            select(OverseasReasonTranslation).where(
-                OverseasReasonTranslation.source_hash.in_([_source_hash(t) for t in sources])
+            select(TextTranslation).where(
+                TextTranslation.source_hash.in_([_source_hash(t) for t in sources])
             )
         )
     }
-    hit: dict[str, OverseasReasonTranslation] = {}
+    hit: dict[str, TextTranslation] = {}
     todo: list[str] = []
     for text in sources:
         row = rows.get(_source_hash(text))
@@ -1729,10 +1729,10 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
             fresh[text] = ko
             # 같은 원문이 이미 있으면(refresh) 덮어쓴다 — source_hash가 unique라 insert는 못 한다.
             db.execute(
-                pg_insert(OverseasReasonTranslation)
+                pg_insert(TextTranslation)
                 .values(source_hash=_source_hash(text), source_text=text, ko_text=ko, engine=label)
                 .on_conflict_do_update(
-                    index_elements=[OverseasReasonTranslation.source_hash],
+                    index_elements=[TextTranslation.source_hash],
                     set_={"ko_text": ko, "engine": label, "updated_at": func.now()},
                 )
             )
@@ -1764,10 +1764,10 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
 def list_reason_translations(q: str | None = None, limit: int = 200, db: Session = Depends(get_db)) -> list[ReasonTranslateItem]:
     """저장된 원문 · 번역 쌍 목록(최근 순). 오역을 찾거나 모델을 바꾼 뒤 어떤 번역이 옛 모델로
     만들어졌는지 훑어볼 때 쓴다 — q를 주면 원문 · 번역 양쪽을 부분 일치로 찾는다."""
-    stmt = select(OverseasReasonTranslation).order_by(OverseasReasonTranslation.updated_at.desc()).limit(max(1, min(limit, 1000)))
+    stmt = select(TextTranslation).order_by(TextTranslation.updated_at.desc()).limit(max(1, min(limit, 1000)))
     if q:
         like = f"%{q.strip()}%"
-        stmt = stmt.where(OverseasReasonTranslation.source_text.ilike(like) | OverseasReasonTranslation.ko_text.ilike(like))
+        stmt = stmt.where(TextTranslation.source_text.ilike(like) | TextTranslation.ko_text.ilike(like))
     return [
         ReasonTranslateItem(source=r.source_text, ko=r.ko_text, engine=r.engine, cached=True) for r in db.scalars(stmt)
     ]
@@ -1778,8 +1778,10 @@ def list_reason_translations(q: str | None = None, limit: int = 200, db: Session
 # 비교 대상(전실행)을 DB에서 꺼내 오는 일을 한다. 반영을 막지 않는다 — 알리기만 한다.
 
 
-def _rule_rows(db: Session) -> list[OverseasAnomalyRule]:
-    return list(db.scalars(select(OverseasAnomalyRule)))
+def _rule_rows(db: Session) -> list[AnomalyRule]:
+    # anomaly_rules는 전 계정 공용 테이블이라 계정으로 걸러야 한다 — 안 걸면 다른 계정의
+    # 급변 기준이 섞여 들어온다(PLAN.md Phase 3로 account_key가 생겼다).
+    return list(db.scalars(select(AnomalyRule).where(AnomalyRule.account_key == ACCOUNT_KEY)))
 
 
 def _rule_out(key: str, r: dict) -> AnomalyRuleOut:
@@ -1825,11 +1827,13 @@ def upsert_anomaly_rule(body: AnomalyRuleIn, db: Session = Depends(get_db)) -> l
     if body.ratio is not None and body.ratio <= 1:
         raise HTTPException(status_code=400, detail="배수(ratio)는 1보다 커야 합니다.")
 
-    row = db.scalar(select(OverseasAnomalyRule).where(OverseasAnomalyRule.rule_key == key))
+    row = db.scalar(
+        select(AnomalyRule).where(AnomalyRule.account_key == ACCOUNT_KEY, AnomalyRule.rule_key == key)
+    )
     before = anomaly.merged_rules(_rule_rows(db))[key]
     before_snap = {k: before[k] for k in ("enabled", "pct", "amount", "ratio")}
     if not row:
-        row = OverseasAnomalyRule(rule_key=key)
+        row = AnomalyRule(account_key=ACCOUNT_KEY, rule_key=key)
         db.add(row)
     if body.reset:
         d = anomaly.DEFAULTS[key]
@@ -1849,8 +1853,8 @@ def upsert_anomaly_rule(body: AnomalyRuleIn, db: Session = Depends(get_db)) -> l
     after_snap = {k: after[k] for k in ("enabled", "pct", "amount", "ratio")}
     if before_snap != after_snap:
         db.add(
-            OverseasAnomalyRuleLog(
-                rule_key=key, before=before_snap, after=after_snap,
+            AnomalyRuleLog(
+                account_key=ACCOUNT_KEY, rule_key=key, before=before_snap, after=after_snap,
                 source="reset" if body.reset else (body.source or "screen")[:10], note=body.note.strip()[:200],
             )
         )
@@ -1864,8 +1868,9 @@ def list_anomaly_rule_history(limit: int = 50, db: Session = Depends(get_db)) ->
     rows = db.scalars(
         # id까지 내림차순으로 정렬한다 — 한 트랜잭션에서 두 번 바꾸면 now()가 같은 값이라
         # changed_at만으로는 어느 게 최신인지 가려지지 않는다.
-        select(OverseasAnomalyRuleLog)
-        .order_by(OverseasAnomalyRuleLog.changed_at.desc(), OverseasAnomalyRuleLog.id.desc())
+        select(AnomalyRuleLog)
+        .where(AnomalyRuleLog.account_key == ACCOUNT_KEY)
+        .order_by(AnomalyRuleLog.changed_at.desc(), AnomalyRuleLog.id.desc())
         .limit(max(1, min(limit, 500)))
     )
     return [
@@ -1933,7 +1938,9 @@ def scan_anomalies(body: AnomalyScanIn, db: Session = Depends(get_db)) -> Anomal
 @router.get("/overseas/carry-defs", response_model=list[CarryDefOut])
 def list_carry_defs(db: Session = Depends(get_db)) -> list[CarryDefOut]:
     """다음 버전에도 유지하기로 승인한 파생 행·열 목록."""
-    rows = db.scalars(select(OverseasCarryDef).order_by(OverseasCarryDef.kind, OverseasCarryDef.label))
+    rows = db.scalars(
+        select(CarryDef).where(CarryDef.account_key == ACCOUNT_KEY).order_by(CarryDef.kind, CarryDef.label)
+    )
     return [CarryDefOut(kind=r.kind, def_key=r.def_key, label=r.label) for r in rows]
 
 
@@ -1948,16 +1955,20 @@ def upsert_carry_def(body: CarryDefIn, db: Session = Depends(get_db)) -> list[Ca
         raise HTTPException(status_code=400, detail="def_key가 비어 있습니다.")
     if body.carry:
         db.execute(
-            pg_insert(OverseasCarryDef)
-            .values(kind=body.kind, def_key=key, label=body.label.strip() or key)
+            pg_insert(CarryDef)
+            .values(account_key=ACCOUNT_KEY, kind=body.kind, def_key=key, label=body.label.strip() or key)
             .on_conflict_do_update(
-                index_elements=[OverseasCarryDef.kind, OverseasCarryDef.def_key],
+                # uq가 (account_key, kind, def_key)로 바뀌었으므로 충돌 판정 컬럼도 같이 맞춘다 —
+                # 안 맞추면 Postgres가 "그런 제약이 없다"며 거부한다.
+                index_elements=[CarryDef.account_key, CarryDef.kind, CarryDef.def_key],
                 set_={"label": body.label.strip() or key},
             )
         )
     else:
         db.execute(
-            delete(OverseasCarryDef).where(OverseasCarryDef.kind == body.kind, OverseasCarryDef.def_key == key)
+            delete(CarryDef).where(
+                CarryDef.account_key == ACCOUNT_KEY, CarryDef.kind == body.kind, CarryDef.def_key == key
+            )
         )
     db.commit()
     return list_carry_defs(db)
@@ -1973,7 +1984,7 @@ def carry_forward_defs(body: CarryForwardIn, db: Session = Depends(get_db)) -> C
     _check_version(body.to_version)
     if (body.from_yyyymm, body.from_version) == (body.to_yyyymm, body.to_version):
         raise HTTPException(status_code=400, detail="같은 버전으로는 복제할 수 없습니다.")
-    defs = list(db.scalars(select(OverseasCarryDef)))
+    defs = list(db.scalars(select(CarryDef).where(CarryDef.account_key == ACCOUNT_KEY)))
     row_keys = {d.def_key for d in defs if d.kind == "row"}
     col_labels = {d.def_key for d in defs if d.kind == "col"}
     rows = cols = 0
@@ -2051,10 +2062,15 @@ def carry_forward_defs(body: CarryForwardIn, db: Session = Depends(get_db)) -> C
 # 사람에게 묻는다. 한 번 답한 이름은 다음 업로드부터 resolved로 바로 내려가서 다시 묻지 않는다.
 
 
-def _alias_rows(db: Session, norms: list[str]) -> dict[str, OverseasRowAlias]:
+def _alias_rows(db: Session, norms: list[str]) -> dict[str, RowAlias]:
     if not norms:
         return {}
-    return {a.alias_norm: a for a in db.scalars(select(OverseasRowAlias).where(OverseasRowAlias.alias_norm.in_(norms)))}
+    return {
+        a.alias_norm: a
+        for a in db.scalars(
+            select(RowAlias).where(RowAlias.account_key == ACCOUNT_KEY, RowAlias.alias_norm.in_(norms))
+        )
+    }
 
 
 def _match_candidates(db: Session, yyyymm: str, version: str | None) -> list[dict]:
@@ -2136,7 +2152,9 @@ def match_row_labels(body: RowMatchIn, db: Session = Depends(get_db)) -> RowMatc
 @router.get("/overseas/row-aliases", response_model=list[RowAliasOut])
 def list_row_aliases(db: Session = Depends(get_db)) -> list[RowAliasOut]:
     """사람이 답해 둔 행 이름 매핑 전체(최근 답한 것 먼저). 잘못 합친 걸 찾을 때 본다."""
-    rows = db.scalars(select(OverseasRowAlias).order_by(OverseasRowAlias.updated_at.desc()))
+    rows = db.scalars(
+        select(RowAlias).where(RowAlias.account_key == ACCOUNT_KEY).order_by(RowAlias.updated_at.desc())
+    )
     return [
         RowAliasOut(
             alias_norm=a.alias_norm,
@@ -2172,8 +2190,9 @@ def upsert_row_alias(body: RowAliasIn, db: Session = Depends(get_db)) -> RowAlia
     if body.target_kind == "extra_row" and key == norm:
         raise HTTPException(status_code=400, detail="같은 이름을 자기 자신에게 연결할 수 없습니다.")
     db.execute(
-        pg_insert(OverseasRowAlias)
+        pg_insert(RowAlias)
         .values(
+            account_key=ACCOUNT_KEY,
             alias_norm=norm,
             alias_label=body.alias_label.strip(),
             target_kind=body.target_kind,
@@ -2181,7 +2200,7 @@ def upsert_row_alias(body: RowAliasIn, db: Session = Depends(get_db)) -> RowAlia
             target_label=label,
         )
         .on_conflict_do_update(
-            index_elements=[OverseasRowAlias.alias_norm],
+            index_elements=[RowAlias.account_key, RowAlias.alias_norm],
             set_={
                 "alias_label": body.alias_label.strip(),
                 "target_kind": body.target_kind,
@@ -2201,7 +2220,9 @@ def upsert_row_alias(body: RowAliasIn, db: Session = Depends(get_db)) -> RowAlia
 def delete_row_alias(alias_label: str, db: Session = Depends(get_db)) -> dict:
     """답을 지운다 — 다음 업로드에서 그 이름을 다시 물어본다(잘못 답한 걸 되돌릴 때)."""
     norm = row_match.normalize(alias_label)
-    deleted = db.execute(delete(OverseasRowAlias).where(OverseasRowAlias.alias_norm == norm)).rowcount
+    deleted = db.execute(
+        delete(RowAlias).where(RowAlias.account_key == ACCOUNT_KEY, RowAlias.alias_norm == norm)
+    ).rowcount
     db.commit()
     if not deleted:
         raise HTTPException(status_code=404, detail=f"저장된 답이 없습니다: {alias_label!r}")

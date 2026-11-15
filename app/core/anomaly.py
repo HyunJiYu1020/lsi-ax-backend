@@ -78,12 +78,17 @@ def merged_rules(rows: list[Any], overrides: dict[str, dict] | None = None) -> d
     for r in rows or []:
         if r.rule_key not in out:
             continue
-        out[r.rule_key].update(
-            enabled=r.enabled,
-            pct=None if r.pct is None else float(r.pct),
-            amount=None if r.amount is None else float(r.amount),
-            ratio=None if r.ratio is None else float(r.ratio),
-        )
+        # NULL 컬럼은 "그 값은 안 건드렸다"는 뜻이라 기본값을 그대로 둔다 — 덮어쓰면 비율만 바꾼
+        # 사용자가 금액 하한을 잃는다("50% 넘는것만 알려줘"가 변동액 조건까지 지워버린다).
+        # 저장은 보낸 필드만 쓰는 부분 갱신이므로(upsert_anomaly_rule), 안 보낸 필드는 NULL로
+        # 남는다. 그래서 NULL을 "미설정"으로 읽어야 저장 규칙과 읽기 규칙이 맞는다.
+        # (기본값을 되돌리는 건 reset=true가 맡는다.)
+        patch = {"enabled": r.enabled}
+        for field in ("pct", "amount", "ratio"):
+            v = getattr(r, field)
+            if v is not None:
+                patch[field] = float(v)
+        out[r.rule_key].update(patch)
     for key, patch in (overrides or {}).items():
         if key in out and isinstance(patch, dict):
             out[key].update({k: v for k, v in patch.items() if k in ("enabled", "pct", "amount", "ratio")})

@@ -17,21 +17,23 @@ from app.models.common import (  # noqa: F401
     Upload,
 )
 from app.models.fx import FxAppliedRate, FxRate, OverseasFxRuleOverride  # noqa: F401
+from app.models.generic import (  # noqa: F401
+    AnomalyRule,
+    AnomalyRuleLog,
+    CarryDef,
+    RowAlias,
+    TextTranslation,
+    VarianceDriver,
+    VarianceReason,
+)
 from app.models.overseas import (  # noqa: F401
     OverseasActualFirstRow,
     OverseasActualStage,
-    OverseasAnomalyRule,
-    OverseasAnomalyRuleLog,
-    OverseasCarryDef,
     OverseasCpRow,
     OverseasLab,
     OverseasLabRevision,
     OverseasLabSheet,
     OverseasReasonRow,
-    OverseasReasonTranslation,
-    OverseasRowAlias,
-    OverseasVarianceDriver,
-    OverseasVarianceReason,
     OverseasVendorRow,
     OverseasVendorRowDetail,
 )
