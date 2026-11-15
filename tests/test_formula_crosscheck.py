@@ -22,11 +22,11 @@ from app.api.v1.endpoints.overseas import (
     _basis_month,
     _group_tree,
     _krw_months,
-    _lab_views,
     yyyymm,
     get_labor_split,
     get_overseas_state,
 )
+from app.services.overseas.labs import lab_views
 from app.core.cost_groups import GROUP_CALC, resolve_leaves
 from app.services.overseas.fxcalc import rate_arrays
 
@@ -258,7 +258,7 @@ def test_labor_split_matches_backend(db, lab_scope):
     snap = state.actualV.get("cur")
     assert snap is not None  # get_labor_split이 성공했으면 반드시 있다
     basis_month = state.basis_month or 1
-    labs = {lab.pk: lab for lab in _lab_views(db, yyyymm(BASIS_YEAR, basis_month))}
+    labs = {lab.pk: lab for lab in lab_views(db, yyyymm(BASIS_YEAR, basis_month))}
 
     pks = [row.lab_pk for row in result.labs]
     if not pks:
@@ -308,7 +308,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
     아니라 설계가 갈린 지점이라 Phase 6(수식 백엔드 단일화)에서 맞춰야 한다 — 여기 기록만 남긴다.
     """
     basis_month = _basis_month(db) or 1
-    labs = _lab_views(db, yyyymm(BASIS_YEAR, basis_month))
+    labs = lab_views(db, yyyymm(BASIS_YEAR, basis_month))
     local = {lab.currency for lab in labs if lab.currency and lab.currency != "USD"}
     if not local:
         pytest.skip("현지통화 연구소가 없다")
@@ -344,7 +344,7 @@ def test_lab_currency_tables_agree(db):
     (core.js ovLabsFromApi), 초기값이 DB와 다르면 로딩 전 첫 화면이 다른 숫자를 그린다."""
     js = run_js("lab_currencies")
     front_core, front_calc = js["core"], js["calc"]
-    db_cur = {lab.lab_code: (lab.currency or "USD").upper() for lab in _lab_views(db)}
+    db_cur = {lab.lab_code: (lab.currency or "USD").upper() for lab in lab_views(db)}
 
     diff = {
         code: (front_core.get(code), front_calc.get(code))

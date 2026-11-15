@@ -20,13 +20,12 @@ from sqlalchemy.orm import Session
 
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
 from app.services.overseas.fxcalc import rate_arrays
+from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.api.v1.endpoints.overseas import (
-    ACCOUNT_KEY,
     _basis_month,
     _cp_quarter_amounts,
     _extra_row_months,
     _krw_months,
-    _lab_views,
     _n,
     _LABOR_TREE,
     _TOT_TREE,
@@ -151,7 +150,7 @@ def check_overseas_confirm(
     # ② 미업로드 연구소 — 합계는 올라온 것만 더하므로 금액은 그대로지만, 그 사실을 단서로 남긴다.
     labs = [
         lab
-        for lab in _lab_views(db, f"{basis_year:04d}-{month:02d}")
+        for lab in lab_views(db, f"{basis_year:04d}-{month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
     uploaded_pks = _uploaded_lab_pks(db, ym, version)
@@ -251,7 +250,7 @@ def get_labor_ratio(
         rate_year, rate_month, rate_kind = basis_year, basis_month, "forecast"
     labs = [
         lab
-        for lab in _lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
+        for lab in lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]

@@ -47,6 +47,7 @@ from app.models import (
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, category_label, resolve_leaves
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, ym_month, ym_year, yyyymm
 from app.services.overseas.fxcalc import rate_arrays
+from app.services.overseas.labs import ACCOUNT_KEY, LAB_EPOCH, LabView, all_labs, lab_views, overseas_account
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.core.enums import CodeGroup
@@ -110,90 +111,11 @@ from app.schemas.overseas import (
 
 router = APIRouter()
 
-# cost_entries 등 공용 테이블은 account_code로 계정을 구분한다. 이 라우터는 해외연구소 전용이라 고정.
-ACCOUNT_KEY = "overseas"
 
 # 경영계획(plan) 역할태그는 cost_entries에 저장하지 않고 management_plan_entries가 담당한다
 # (plan_no별로 영구 보관·비교해야 해서 cost_entries의 forecast/actual과는 다른 테이블).
 # 해외연구소 화면엔 plan_no 선택 UI가 아직 없어 "P00" 고정 버전 하나만 쓴다.
 PLAN_NO = "P00"
-
-
-def _overseas_account(db: Session) -> Account:
-    acct = db.scalar(select(Account).where(Account.key == ACCOUNT_KEY))
-    if not acct:
-        raise HTTPException(status_code=500, detail="overseas 계정이 시드되지 않았습니다 (app.db.seed 먼저 실행하세요).")
-    return acct
-
-
-def _labs(db: Session) -> list[OverseasLab]:
-    """지금 값(overseas_labs) 그대로. 쓰기(수정·삭제)와 "pk가 실재하나" 검증에만 쓴다 —
-    버전별 숫자를 계산할 때는 _lab_views(as_of=...)로 그 시점 값을 읽어야 한다."""
-    return list(db.scalars(select(OverseasLab)))
-
-
-# ---------- 연구소 기준정보를 "그 버전 시점"으로 읽기 ----------
-# 공통 RULE: 기준정보 변경은 변경한 버전부터 적용하고 지난 버전은 영향받지 않는다.
-# overseas_labs에는 "지금 값" 한 줄뿐이라 그대로 읽으면 과거 버전까지 새 값으로 다시 계산된다
-# (통화를 USD→ILS로 바꾸는 순간 이미 마감한 달의 환차 분해가 달라진다). 그래서 변경 이력
-# (overseas_lab_revisions)을 남기고, 버전이 보는 시점의 값으로 되돌려 읽는다.
-# fx가 기본 환산 기준을 바꿀 때 과거 달에 예외를 심어 고정하는 것과 같은 방식이다.
-
-LAB_EPOCH = "0000-01"  # "처음부터" — 기준정보가 처음 바뀌기 전 구간을 가리키는 effective_from
-
-
-@dataclass(frozen=True)
-class LabView:
-    """as_of 시점으로 읽은 연구소 기준정보. 필드 이름을 OverseasLab과 맞춰 놔서 읽기만 하는
-    호출부는 둘 중 아무거나 받아도 된다(쓰기는 ORM 객체인 _labs 쪽을 써야 한다)."""
-
-    pk: str
-    lab_code: str
-    part_code: str | None
-    name: str
-    country: str
-    sort_order: int
-    currency: str
-    is_active: bool
-
-
-def _lab_views(db: Session, as_of: str | None = None) -> list[LabView]:
-    """as_of("YYYY-MM") 시점의 기준정보. as_of가 없으면 지금 값 그대로 본다.
-
-    그 시점 값 = effective_from이 as_of 이하인 이력 중 가장 최근 행. 한 번도 안 바뀐 연구소는
-    이력이 없어서 overseas_labs를 그대로 쓴다(바뀐 적이 없으니 시점과 무관하게 같은 값이다)."""
-    labs = _labs(db)
-    part_count: dict[str, int] = {}
-    for lab in labs:
-        part_count[lab.lab_code] = part_count.get(lab.lab_code, 0) + 1
-
-    at: dict[str, OverseasLabRevision] = {}
-    if as_of is not None:
-        for rev in db.scalars(
-            select(OverseasLabRevision)
-            .where(OverseasLabRevision.effective_from <= as_of)
-            .order_by(OverseasLabRevision.lab_code, OverseasLabRevision.effective_from)
-        ):
-            at[rev.lab_code] = rev  # 정렬돼 있으므로 마지막으로 덮어쓴 것이 가장 최근 이력
-
-    out: list[LabView] = []
-    for lab in labs:
-        rev = at.get(lab.lab_code)
-        out.append(
-            LabView(
-                pk=lab.pk,
-                lab_code=lab.lab_code,
-                part_code=lab.part_code,
-                # SARC처럼 파트가 여러 개면 이름이 파트마다 달라서 이력의 단일 이름으로 덮어쓰지
-                # 않는다 — save_labs/upsert_lab이 저장할 때 쓰는 규칙과 같다.
-                name=rev.name if rev and part_count[lab.lab_code] == 1 else lab.name,
-                country=lab.country,
-                sort_order=rev.sort_order if rev else lab.sort_order,
-                currency=rev.currency if rev else lab.currency,
-                is_active=rev.is_active if rev else lab.is_active,
-            )
-        )
-    return out
 
 
 def _current_basis_ym(db: Session) -> str:
@@ -529,8 +451,8 @@ def _bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[
 
 @router.get("/overseas/state", response_model=OverseasState)
 def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> OverseasState:
-    acct = _overseas_account(db)
-    labs = _labs(db)
+    acct = overseas_account(db)
+    labs = all_labs(db)
     lab_pks = {lab.pk for lab in labs}
     lab_codes = {lab.lab_code for lab in labs}
 
@@ -769,8 +691,8 @@ def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> Overse
 
 @router.put("/overseas/state")
 def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> dict[str, str]:
-    acct = _overseas_account(db)
-    labs = _labs(db)
+    acct = overseas_account(db)
+    labs = all_labs(db)
     lab_pks = {lab.pk for lab in labs}
     lab_codes = {lab.lab_code for lab in labs}
 
@@ -957,7 +879,7 @@ def get_labor_split(
     # 기준정보는 "당월 속보 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한 환차 분해가
     # 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).
     labs = {
-        lab.pk: lab for lab in _lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
+        lab.pk: lab for lab in lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     }
     scope = (lab_scope or "ALL").strip()
@@ -1155,7 +1077,7 @@ def get_overseas_summary(
     # 기준정보(통화·사용여부·이름)도 환율과 같은 시점으로 본다 — 지금 값으로 과거 버전을 다시
     # 계산하면 이미 마감해서 보고한 숫자가 바뀐다(공통 RULE: 변경한 버전부터 적용, 지난 버전 무영향).
     labs = [
-        lab for lab in _lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
+        lab for lab in lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
@@ -1352,14 +1274,14 @@ def get_vendor_by_project(
 
 @router.get("/overseas/step")
 def get_overseas_step(db: Session = Depends(get_db)) -> StepUpdate:
-    acct = _overseas_account(db)
+    acct = overseas_account(db)
     progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
     return StepUpdate(step=progress.current_step_order if progress else 1)
 
 
 @router.put("/overseas/step")
 def update_overseas_step(body: StepUpdate, db: Session = Depends(get_db)) -> StepUpdate:
-    acct = _overseas_account(db)
+    acct = overseas_account(db)
     progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
     if progress is None:
         progress = AccountProgress(account_id=acct.id, current_step_order=body.step)
@@ -1401,7 +1323,7 @@ def list_labs(as_of: str | None = None, db: Session = Depends(get_db)) -> list[L
             currency=lab.currency,
             is_active=lab.is_active,
         )
-        for lab in sorted(_lab_views(db, as_of), key=lambda lab: (lab.sort_order, lab.pk))
+        for lab in sorted(lab_views(db, as_of), key=lambda lab: (lab.sort_order, lab.pk))
         if lab.pk != "_ETC"
     ]
 
@@ -1412,7 +1334,7 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
     upsert하고, 목록에서 빠진 lab_code는 삭제한다(단 _ETC 가상 행은 화면에 없으니 건드리지 않음).
     cost_entries 등에 남은 데이터는 FK가 없어 지워지지 않고, 집계에서만 조용히 빠진다."""
     by_code: dict[str, list[OverseasLab]] = {}
-    for lab in _labs(db):
+    for lab in all_labs(db):
         by_code.setdefault(lab.lab_code, []).append(lab)
 
     submitted_codes = {row.lab_code for row in body}
@@ -1472,7 +1394,7 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
             currency=lab.currency,
             is_active=lab.is_active,
         )
-        for lab in sorted(_labs(db), key=lambda lab: (lab.sort_order, lab.pk))
+        for lab in sorted(all_labs(db), key=lambda lab: (lab.sort_order, lab.pk))
         if lab.pk != "_ETC"
     ]
 

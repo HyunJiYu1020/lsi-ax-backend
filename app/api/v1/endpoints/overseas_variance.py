@@ -24,18 +24,16 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.api.v1.endpoints.overseas import (
-    ACCOUNT_KEY,
     _basis_month,
-    _lab_views,
     _n,
     _plan_entry_months_bulk,
     _entry_months_bulk,
     _source_hash,
-    LabView,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
 from app.core.periods import PERIOD_IX, month_value, yyyymm
 from app.services.overseas.fxcalc import rate_arrays
+from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.core.reason_translate import (
     MAX_LEN,
     draft_reason,
@@ -410,7 +408,7 @@ def _active_labs(db: Session, basis_year: int, basis_month: int) -> dict[str, La
     SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다."""
     return {
         lab.pk: lab
-        for lab in _lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
+        for lab in lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     }
 

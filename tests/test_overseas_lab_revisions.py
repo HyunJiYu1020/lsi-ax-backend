@@ -6,14 +6,16 @@
 
 import pytest
 
-from app.api.v1.endpoints.overseas import _lab_views, upsert_lab
+from app.services.overseas.labs import lab_views
+
+from app.api.v1.endpoints.overseas import upsert_lab
 from app.schemas.overseas import LabIn
 
 CODE = "ZZTEST"  # 실제 연구소와 안 겹치는 테스트 전용 코드
 
 
 def _view(db, as_of=None):
-    got = {lab.lab_code: lab for lab in _lab_views(db, as_of)}
+    got = {lab.lab_code: lab for lab in lab_views(db, as_of)}
     return got.get(CODE)
 
 
