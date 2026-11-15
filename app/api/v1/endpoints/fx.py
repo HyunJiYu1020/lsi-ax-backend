@@ -6,6 +6,20 @@ from sqlalchemy import delete, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.services.fx_rates import (
+    FX_INV,
+    FxRateCache,
+    OVERSEAS_FX_RULE_DEFAULT_CODE,
+    OVERSEAS_FX_RULE_FALLBACK,
+    OVERSEAS_FX_RULE_GROUP,
+    avg_krw,
+    compute_applied_rows,
+    eom_krw,
+    forecast_krw,
+    fx_dir,
+    overseas_fx_default,
+    overseas_fx_default_row,
+)
 from app.db.session import get_db
 from app.models import CommonCode, FxAppliedRate, FxRate, OverseasFxRuleOverride
 from app.schemas.fx import (
@@ -23,18 +37,6 @@ from app.schemas.fx import (
 )
 
 router = APIRouter()
-
-# "적용 환율" 계산 규칙(프론트 fxSeries/fxAvgKRW/fxForecastKRW와 동일) — USD만 원/통화 그 자체고,
-# 나머지 통화는 그 달 USD 값과 결합해서 원/통화로 바꾼다. EUR·GBP·AUD·NZD는 "$/통화"(역방향)라
-# USD와 곱하고, 나머지는 "통화/$"라 USD를 나눈다.
-FX_INV = {"EUR", "GBP", "AUD", "NZD"}
-
-
-def _fx_dir(c: str) -> str:
-    if c == "USD":
-        return "krw"
-    return "inv" if c in FX_INV else "per"
-
 
 def _upsert_fx_input(
     db: Session, year_month: str, currency: str, kind: str, rate: float, source_file: str, uploaded_at: datetime
@@ -120,83 +122,6 @@ def save_fx_state(state: FxState, db: Session = Depends(get_db)) -> dict[str, st
     return {"status": "ok"}
 
 
-class _FxRateCache:
-    """fx_rates를 한 번에 읽어서 메모리에서 조회한다. 적용 환율 계산은 통화×12개월(+기준 조합 수)만큼
-    반복되는데, 반복마다 DB를 따로 조회하면 호출 하나에 수백~수천 번 왕복이 생긴다.
-
-    basis_year로 연도 범위를 좁혀서 읽는다 — actual_avg/actual_eom은 basis_year 안에서만
-    조회되고(아래 _compute_applied_rows가 그 해 1~12월만 ym으로 만듦), forecast는 "그 달 속보가
-    없으면 이전 속보를 쓴다"는 규칙 때문에 전년도까지만 보면 된다(매달 연속으로 올라오는 데이터라
-    그 이상 과거까지 봐야 하는 경우는 없다고 가정). kind='plan'은 이 계산에 아예 안 쓰여 제외한다."""
-
-    def __init__(self, db: Session, basis_year: int) -> None:
-        self._by_key: dict[tuple[str, str, str], float] = {}
-        for r in db.scalars(
-            select(FxRate).where(
-                FxRate.kind.in_(("actual_avg", "actual_eom", "forecast")),
-                FxRate.year_month >= f"{basis_year - 1}-01",
-                FxRate.year_month <= f"{basis_year}-12",
-            )
-        ):
-            self._by_key[(r.year_month, r.currency_code, r.kind)] = float(r.rate) if r.rate else 0.0
-        self.currencies = sorted({c for _, c, _ in self._by_key})
-        self._forecast_yms = sorted({ym for ym, _, kind in self._by_key if kind == "forecast"})
-
-    def rate_of(self, ym: str, c: str, kind: str) -> float:
-        return self._by_key.get((ym, c, kind), 0.0)
-
-    def forecast_of(self, ym: str) -> str | None:
-        """ym 이하 중 가장 최근 속보 연월(그 달 속보가 없으면 이전 속보를 그대로 쓴다)."""
-        idx = bisect_right(self._forecast_yms, ym)
-        return self._forecast_yms[idx - 1] if idx else None
-
-
-def _avg_krw(cache: _FxRateCache, ym: str, c: str) -> float:
-    x = cache.rate_of(ym, c, "actual_avg")
-    if not x:
-        return 0.0
-    if c == "USD":
-        return round(x, 2)
-    u = cache.rate_of(ym, "USD", "actual_avg")
-    return round(u * x, 2) if _fx_dir(c) == "inv" else (round(u / x, 2) if x else 0.0)
-
-
-def _eom_krw(cache: _FxRateCache, ym: str, c: str) -> float:
-    return cache.rate_of(ym, c, "actual_eom")
-
-
-def _forecast_krw(cache: _FxRateCache, forecast_ym: str | None, c: str) -> float:
-    if not forecast_ym:
-        return 0.0
-    x = cache.rate_of(forecast_ym, c, "forecast")
-    if not x:
-        return 0.0
-    if c == "USD":
-        return round(x, 2)
-    u = cache.rate_of(forecast_ym, "USD", "forecast")
-    return round(u * x, 2) if _fx_dir(c) == "inv" else (round(u / x, 2) if x else 0.0)
-
-
-def _compute_applied_rows(cache: _FxRateCache, basis_year: int, basis_month: int, basis_kind: str, rule: str) -> list[FxAppliedRow]:
-    """실적·속보(fx_rates)를 기준(연도·월·속보실적)과 룰(평균/말일)에 맞춰 12개월치로 조합한다."""
-    th = basis_month + 1 if basis_kind == "actual" else basis_month
-    out: list[FxAppliedRow] = []
-    for c in cache.currencies:
-        for mo in range(1, 13):
-            ym = f"{basis_year}-{mo:02d}"
-            if mo < th:
-                v = _eom_krw(cache, ym, c) if rule == "last" else 0.0
-                source = "actual"
-                if not v:
-                    v = _avg_krw(cache, ym, c)
-            else:
-                forecast_ym = cache.forecast_of(ym)
-                v = _forecast_krw(cache, forecast_ym, c)
-                source = "forecast"
-            out.append(FxAppliedRow(target_month=mo, currency_code=c, rate=v, source=source))
-    return out
-
-
 def _write_applied_rows(
     db: Session, basis_year: int, basis_month: int, basis_kind: str, rule: str, rows: list[FxAppliedRow]
 ) -> None:
@@ -231,10 +156,10 @@ def _refresh_all_applied_rates(db: Session) -> None:
             FxAppliedRate.basis_year, FxAppliedRate.basis_month, FxAppliedRate.basis_kind, FxAppliedRate.rule
         ).distinct()
     ).all()
-    cache_by_year: dict[int, _FxRateCache] = {}  # 같은 basis_year끼리는 캐시를 재사용(연도별로 1번만 로드)
+    cache_by_year: dict[int, FxRateCache] = {}  # 같은 basis_year끼리는 캐시를 재사용(연도별로 1번만 로드)
     for basis_year, basis_month, basis_kind, rule in bases:
-        cache = cache_by_year.setdefault(basis_year, _FxRateCache(db, basis_year))
-        rows = _compute_applied_rows(cache, basis_year, basis_month, basis_kind, rule)
+        cache = cache_by_year.setdefault(basis_year, FxRateCache(db, basis_year))
+        rows = compute_applied_rows(cache, basis_year, basis_month, basis_kind, rule)
         _write_applied_rows(db, basis_year, basis_month, basis_kind, rule, rows)
 
 
@@ -245,8 +170,8 @@ def recompute_applied_rates(body: FxAppliedRecomputeRequest, db: Session = Depen
     기준들은 /fx/state 저장 시 _refresh_all_applied_rates로 자동 갱신된다.
     dry_run=True면 계산 결과만 돌려주고 fx_applied_rates는 안 건드린다 — 실제 저장 전에 "이 기준으로
     바꾸면 숫자가 어떻게 되는지" 미리 보여줄 때 쓴다."""
-    cache = _FxRateCache(db, body.basis_year)
-    rows = _compute_applied_rows(cache, body.basis_year, body.basis_month, body.basis_kind, body.rule)
+    cache = FxRateCache(db, body.basis_year)
+    rows = compute_applied_rows(cache, body.basis_year, body.basis_month, body.basis_kind, body.rule)
     if body.dry_run:
         return rows
     _write_applied_rows(db, body.basis_year, body.basis_month, body.basis_kind, body.rule, rows)
@@ -274,32 +199,13 @@ def get_applied_rates(
     ]
 
 
-OVERSEAS_FX_RULE_GROUP = "OVERSEAS_FX_RULE"
-OVERSEAS_FX_RULE_DEFAULT_CODE = "default"
-OVERSEAS_FX_RULE_FALLBACK = "last"  # 공통코드 행조차 없는 환경에서의 최종 기본값(기존 동작)
-
-
-def _overseas_fx_default_row(db: Session) -> CommonCode | None:
-    return db.scalar(
-        select(CommonCode).where(
-            CommonCode.group_code == OVERSEAS_FX_RULE_GROUP,
-            CommonCode.code == OVERSEAS_FX_RULE_DEFAULT_CODE,
-        )
-    )
-
-
-def _overseas_fx_default(db: Session) -> str:
-    row = _overseas_fx_default_row(db)
-    return row.name if row and row.name in ("avg", "last") else OVERSEAS_FX_RULE_FALLBACK
-
-
 @router.get("/fx/overseas-rule", response_model=OverseasFxRuleState)
 def get_overseas_fx_rule(db: Session = Depends(get_db)) -> OverseasFxRuleState:
     """해외연구소 환산 환율 기준의 현재 상태 — 기본값(예외 없는 달이 쓰는 값)과 월 단위 예외 전체.
     화면은 이걸 한 번만 받아서 월마다 "예외 있으면 그 rule, 없으면 default"로 판정한다."""
     overrides = db.scalars(select(OverseasFxRuleOverride).order_by(OverseasFxRuleOverride.year_month))
     return OverseasFxRuleState(
-        default=_overseas_fx_default(db),
+        default=overseas_fx_default(db),
         overrides=[
             OverseasFxRuleOverrideRow(year_month=o.year_month, rule=o.rule, created_at=o.created_at)
             for o in overrides
@@ -330,7 +236,7 @@ def set_overseas_fx_rule_default(body: OverseasFxRuleDefaultIn, db: Session = De
     예외를 심어서 고정한다 — 그래야 이미 마감해서 보고된 과거 달 숫자가 소급해서 바뀌지 않는다.
     고정 대상은 실제로 환율 데이터가 있는 달(fx_rates의 연월)로 한정하고, 이미 예외가 있는 달은
     사용자가 명시적으로 정한 값이라 건드리지 않는다."""
-    old_default = _overseas_fx_default(db)
+    old_default = overseas_fx_default(db)
 
     if body.rule != old_default:
         existing = set(db.scalars(select(OverseasFxRuleOverride.year_month)))
@@ -343,7 +249,7 @@ def set_overseas_fx_rule_default(body: OverseasFxRuleDefaultIn, db: Session = De
         ]
         db.add_all(frozen)
 
-    row = _overseas_fx_default_row(db)
+    row = overseas_fx_default_row(db)
     if row is None:
         db.add(
             CommonCode(

@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
+from app.services.overseas.fxcalc import rate_arrays
 from app.api.v1.endpoints.overseas import (
     ACCOUNT_KEY,
     _basis_month,
@@ -27,7 +28,6 @@ from app.api.v1.endpoints.overseas import (
     _krw_months,
     _lab_views,
     _n,
-    _rate_arrays,
     _LABOR_TREE,
     _TOT_TREE,
     get_overseas_state,
@@ -140,7 +140,7 @@ def check_overseas_confirm(
 
     # ① 환율 — 적용 환율(원/$)이 없는 달이 있으면 그 달은 원화 환산이 안 된다. ix를 비워 넘기면
     # _rate_arrays가 "없는 달"로 실패하지 않고 12개월 값을 그대로 돌려준다(여기서 직접 판정한다).
-    rates = _rate_arrays(db, basis_year, month, version, set(), ())["USD"]
+    rates = rate_arrays(db, basis_year, month, version, set(), ())["USD"]
     fx_missing = [m for m, v in enumerate(rates, start=1) if not v]
     if fx_missing:
         blocking.append(
@@ -254,7 +254,7 @@ def get_labor_ratio(
         for lab in _lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
-    rate = _rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
+    rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
     api_version = "actual" if version in ("prev", "prior") else "forecast"
     extras = _extra_row_months(db, yyyymm(basis_year, basis_month), api_version)
     cp_total_q, cp_labor_q = _cp_quarter_amounts(db, basis_year)

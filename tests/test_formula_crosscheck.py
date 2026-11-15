@@ -23,12 +23,12 @@ from app.api.v1.endpoints.overseas import (
     _group_tree,
     _krw_months,
     _lab_views,
-    _rate_arrays,
     yyyymm,
     get_labor_split,
     get_overseas_state,
 )
 from app.core.cost_groups import GROUP_CALC, resolve_leaves
+from app.services.overseas.fxcalc import rate_arrays
 
 BASIS_YEAR = 2026
 HARNESS = Path(__file__).parent / "js_formula_harness.mjs"
@@ -265,8 +265,8 @@ def test_labor_split_matches_backend(db, lab_scope):
         pytest.skip(f"{lab_scope}: 올라온 데이터가 없다")
 
     local = {labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"}
-    rate_cur = _rate_arrays(db, BASIS_YEAR, basis_month, "forecast", local, tuple(MONTHS))
-    rate_base = _rate_arrays(db, BASIS_YEAR, snap.thru_month, "actual", local, tuple(MONTHS))
+    rate_cur = rate_arrays(db, BASIS_YEAR, basis_month, "forecast", local, tuple(MONTHS))
+    rate_base = rate_arrays(db, BASIS_YEAR, snap.thru_month, "actual", local, tuple(MONTHS))
 
     def rates(arr: dict[str, list[float]]) -> dict[str, list[float]]:
         # calc.js는 현지환율을 소문자 통화 키("ils")로 찾는다(ovLcOf). CP도 같은 원/$ 배열을 쓴다.
@@ -315,7 +315,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
 
     ix = tuple(MONTHS)
     try:
-        arr = _rate_arrays(db, BASIS_YEAR, basis_month, "forecast", local, ix)
+        arr = rate_arrays(db, BASIS_YEAR, basis_month, "forecast", local, ix)
     except Exception as e:
         pytest.skip(f"환율 데이터가 없다 — {e}")
 

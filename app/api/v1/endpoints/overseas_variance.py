@@ -30,12 +30,12 @@ from app.api.v1.endpoints.overseas import (
     _n,
     _plan_entry_months_bulk,
     _entry_months_bulk,
-    _rate_arrays,
     _source_hash,
     LabView,
 )
 from app.core.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
 from app.core.periods import PERIOD_IX, month_value, yyyymm
+from app.services.overseas.fxcalc import rate_arrays
 from app.core.reason_translate import (
     MAX_LEN,
     draft_reason,
@@ -461,8 +461,8 @@ def _variance_cells(
     local_curs = {
         labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"
     } if split_fx else set()
-    rate_cur = _rate_arrays(db, *cur_fx, local_curs, ix)
-    rate_base = _rate_arrays(db, *base_fx, local_curs, ix) if split_fx else rate_cur
+    rate_cur = rate_arrays(db, *cur_fx, local_curs, ix)
+    rate_base = rate_arrays(db, *base_fx, local_curs, ix) if split_fx else rate_cur
 
     leaves = {key: resolve_leaves(key) for key, _, _ in VARIANCE_ROWS if key != "pct"}
     out = {key: {"cur": 0.0, "base": 0.0, "fx_local": 0.0, "fx_usd": 0.0, "fx_outside": 0.0} for key in leaves}
@@ -1264,8 +1264,8 @@ def get_actual_first(
     cur_fx = (basis_year, month, "actual")
     base_is_fx = basis.kind in ("forecast", "actual")
     base_fx = (basis.year, basis.month, basis.kind) if base_is_fx else cur_fx
-    rate_cur = _rate_arrays(db, *cur_fx, local_curs, ix)
-    rate_base = _rate_arrays(db, *base_fx, local_curs, ix) if base_is_fx else rate_cur
+    rate_cur = rate_arrays(db, *cur_fx, local_curs, ix)
+    rate_base = rate_arrays(db, *base_fx, local_curs, ix) if base_is_fx else rate_cur
 
     base_d = _load_basis(db, (basis.year, basis.month, basis.kind, basis.plan_no), set(labs))
     tot_leaves = resolve_leaves("tot")
@@ -1409,7 +1409,7 @@ def get_actual_stage_shift(
     j = basis_month - 1
     ix = (j,)
     local_curs = {lab.currency for lab in by_code.values() if lab.currency and lab.currency != "USD"}
-    rate = _rate_arrays(db, basis_year, basis_month, "actual", local_curs, ix)
+    rate = rate_arrays(db, basis_year, basis_month, "actual", local_curs, ix)
     second_d = _load_cost_version(db, "actual", yyyymm(basis_year, basis_month), set(labs))
     tot_leaves = resolve_leaves("tot")
 

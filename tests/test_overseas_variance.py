@@ -92,10 +92,10 @@ def _lab(pk: str, currency: str) -> LabView:
 
 
 def _cells_with_rates(monkeypatch, labs, cur_d, base_d, rate_cur, rate_base, ix=(0,)):
-    """_rate_arrays를 고정 환율로 바꿔치고 _variance_cells만 돌린다 — 시드 환율은 속보·실적이
+    """rate_arrays를 고정 환율로 바꿔치고 _variance_cells만 돌린다 — 시드 환율은 속보·실적이
     같아서 DB로는 "환율이 움직인 상황"을 만들 수 없다."""
     calls = iter([rate_cur, rate_base])
-    monkeypatch.setattr(ov, "_rate_arrays", lambda *a, **k: next(calls))
+    monkeypatch.setattr(ov, "rate_arrays", lambda *a, **k: next(calls))
     return ov._variance_cells(
         None, labs, list(labs), cur_d, base_d, ix, (2026, 9, "forecast"), (2026, 8, "actual"), True
     )
