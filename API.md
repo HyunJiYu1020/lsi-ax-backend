@@ -30,13 +30,16 @@ Base URL: `http://localhost:8000/api/v1`
 | GET | `/overseas/anomaly-rules/history` | 기준 변경 이력(before/after) | 챗봇만 |
 | POST | `/overseas/anomaly-scan` | 업로드 값(또는 저장된 값)을 기준에 걸어 검사 — 반영을 막지 않고 목록만 돌려준다 | 화면+챗봇 |
 | POST | `/overseas/row-match` | 업로드 파일의 행 이름이 이미 있는 행과 같은 행인지 후보 찾기 (`Travel Expense` → 출장비). 합치지는 않는다 | 화면+챗봇 |
-| GET/PUT/DELETE | `/overseas/row-aliases` | 사람이 답한 "같은 행 / 별개 행" 저장·조회·삭제 (`overseas_row_aliases`) | 화면+챗봇 |
+| GET/PUT/DELETE | `/overseas/row-aliases` | 사람이 답한 "같은 행 / 별개 행" 저장·조회·삭제 (`row_aliases`(account_key='overseas')) | 화면+챗봇 |
 | GET/PUT/DELETE | `/overseas/extra-rows` | 사용자 추가 행 조회/저장/삭제 (값은 `cost_entries`에 저장) | 화면+챗봇 |
 | GET/DELETE | `/overseas/extra-cols` | 추가 열(라벨) 목록 조회/삭제 | 화면+챗봇 |
 | GET/PUT | `/overseas/cost-extras` | 추가 열의 칸 값 조회/저장 | 화면+챗봇 |
 | GET/PUT/DELETE | `/overseas/memo-cols` | 메모 전용 열 조회/저장/삭제 | 챗봇만 |
 | GET/PUT | `/overseas/memos` | 메모 셀 조회/저장 | 챗봇만 |
-| GET | `/overseas/vendor-rows` | 외주용역 상세 조회 (`overseas_vendor_rows`, 저장은 `/overseas/state`) | 챗봇만 |
+| GET | `/overseas/vendor-rows` | 외주용역 상세 조회 (`overseas_vendor_rows`) | 챗봇만 |
+| PUT | `/overseas/vendor-rows` | 외주용역 상세 저장 — 연구소×버전 단위 전체 교체 | 화면 |
+| PUT | `/overseas/cp-rows` | CP 계약 저장 — 연도 단위 전체 교체 | 화면 |
+| PUT | `/overseas/reason-rows` | 증감사유 업로드 시트 저장 — 키별 upsert(누적) | 화면 |
 | GET | `/overseas/vendor-by-project` | 외주용역을 과제(Project)별로 묶어 집계 (증감분석 · 챗봇) | 챗봇만 |
 | GET | `/overseas/variance-basis` | 비교 기준 세 칸이 실제로 무엇과 비교하는지 해석 (전실행=직전 버전 · 전년=전년 12월 실적 · 경영계획=선택 차수) + 경영계획 차수 목록 | 화면+챗봇 |
 | GET | `/overseas/variance` | 계정별 증감분석 표 (기준·당월·증감·환차 현지→$/$→원·환차外). 챗봇이 "왜 늘었어?"에 답할 때 쓰는 근거 데이터 | 화면+챗봇 |
@@ -182,6 +185,37 @@ Base URL: `http://localhost:8000/api/v1`
 
 ---
 
+## 도메인별 전용 저장 API — 왜 `/overseas/state`에서 떼어냈나
+
+`PUT /overseas/state`는 화면이 가진 상태 전부를 한 번에 받는다. 그래서 외주용역 한 시트를 올려도,
+메모 하나를 고쳐도 비용·증감사유·외주용역·CP가 매번 같이 올라갔다. 도메인별로 떼어낸 세 개는
+저장 단위가 이미 분명한 것들이다:
+
+| API | 저장 단위 | 왜 그 단위인가 |
+|---|---|---|
+| `PUT /overseas/vendor-rows` | 연구소×버전 **전체 교체** | 업로드마다 행 수가 달라서 upsert만 하면 연구소가 뺀 항목이 남는다 |
+| `PUT /overseas/cp-rows` | 연도 **전체 교체** | 연 1회 올리는 파일이라 사라진 POC·직급은 지워야 한다 |
+| `PUT /overseas/reason-rows` | 키별 **upsert 누적** | 회신을 항목별로 쌓아 가는 자료라, 한 시트를 올렸을 때 다른 항목 사유가 사라지면 안 된다 |
+
+**`PUT /overseas/state`와 이 세 개는 같은 서비스 함수를 부른다**(`services/overseas/{vendor,cp,reason_rows}.py`).
+쓰기 규칙이 두 벌이 되면 "같은 데이터, 두 가지 쓰기 규칙"이 되어 반드시 어긋나기 때문이다. 덕분에
+프런트가 어느 경로로 저장해도 결과가 같고, 프런트의 `OV_SPLIT_SAVE` 플래그를 끄면 옛 동작(전부
+일괄)으로 즉시 되돌아간다.
+
+세 API 모두 `state_token`을 선택적으로 받는다 — 아래 동시 편집 보호와 같은 지문이다.
+
+## 동시 편집 보호 — `state_token`
+
+`GET /overseas/state`가 "지금 상태의 지문"(`state_token`)을 같이 내려준다. 저장할 때 그걸 그대로
+돌려보내면, 그 사이 다른 세션(같은 사람의 탭 2개 포함)이 저장했는지 서버가 안다 — 다르면 **409**로
+막고 아무것도 쓰지 않는다. 막지 않으면 나중 저장이 전체를 덮고(last-write-wins) 덮인 쪽은 자기
+수정이 사라진 걸 알 방법이 없다.
+
+- 지문은 이 화면이 저장하는 테이블들의 `max(타임스탬프)`와 `count(*)`를 묶어 만든다. 스키마 변경은 없다
+- 저장 성공 시 **새 지문을 응답에 담아 준다** — 안 주면 화면이 들고 있는 지문이 낡아서 다음 저장이
+  자기 자신과 충돌한 것처럼 409가 된다
+- `state_token`이 빈 문자열이면 검사하지 않는다(토큰을 모르는 클라이언트 호환 + 서버 쪽 롤백 수단)
+
 ## GET/PUT /fx/state
 
 전사 공통 환율 3종(실적·속보·경영, 전부 `fx_rates` 테이블에 `kind` 컬럼으로 구분해 저장)을 한 번에
@@ -281,7 +315,7 @@ POST /overseas/row-match
 - **후보는 두 종류**다: 고정 비용항목(`kind:"category"` — 집계로 계산되는 그룹 행은 제외한다. 거기엔
   업로드 값을 꽂을 수 없다)과 그 달에 이미 쓰이는 추가 행(`kind:"extra_row"`, 그 행을 쓰는 연구소를
   `labs`에 같이 준다 — "SARC·DSRA가 쓰는 행"이라는 걸 알면 판단하기 쉽다).
-- **답은 저장해서 다시 묻지 않는다**: `PUT /overseas/row-aliases`가 `overseas_row_aliases`에 남기고,
+- **답은 저장해서 다시 묻지 않는다**: `PUT /overseas/row-aliases`가 `row_aliases`(account_key='overseas')에 남기고,
   다음 호출부터 그 이름은 `resolved`로 내려간다. "별개 행"이라는 답도 `target_kind:"distinct"`로
   저장한다 — 안 남기면 매달 12개 연구소에 같은 질문을 다시 하게 된다. 잘못 답했으면 다시 PUT해서
   덮어쓰거나 DELETE로 지운다(이미 그 답으로 들어간 과거 데이터는 바뀌지 않는다 — 다시 업로드해야 한다).
@@ -399,7 +433,7 @@ PUT /versions/2026/9/forecast/accounts/overseas
 
 ## 증감분석 화면 (`/overseas/variance*` · `/overseas/actual-*`)
 
-이 엔드포인트들은 `app/api/v1/endpoints/overseas_variance.py`에 따로 모여 있다 — `overseas.py`가
+이 엔드포인트들은 `app/accounts/overseas/endpoints/variance.py`에 따로 모여 있다 — `overseas.py`가
 다루는 건 "취합·집계"(업로드·기준정보·행/열)이고 여기 있는 건 전부 "증감분석 한 화면"의 일이라서다.
 경로 공간은 같은 `/overseas/...`를 쓰되 파일만 갈랐다.
 
@@ -443,7 +477,7 @@ AI가 그때 계산한 숫자를 박아 두면 원본이 업로드로 바뀐 뒤
 (1000으로 나누지 않으면 1차 금액만 1000배로 보인다). ERP가 $ 환산액을 같이 준 경우엔 그 값을
 이기고, 그때는 현지→$ 단계를 ERP가 이미 밟았으므로 그 환차를 0으로 둔다.
 
-`overseas_actual_stages`의 두 값은 서로 다른 일을 한다: `close_first_done`은 실적결산 1차가
+`close_account_stages`(account_key='overseas')의 두 값은 서로 다른 일을 한다: `mapping_done`은 실적결산 1차가
 끝났는지(끝나지 않았으면 가져올 ERP 값이 없어 화면 1차 탭을 비활성으로 둔다), `first_locked`는
 [1차 고정](보고한 값·사유 수정 금지, 해제해야 쓰기 가능 — 거부는 409)이다. **1차 고정은
 `versions.status`를 건드리지 않는다** — 버전 확정과 1차 고정은 다른 층의 결정이고, 1차를 고정해도
@@ -497,7 +531,7 @@ NRE) 연구소 몫, 없으면 해외연구소 실적이 아니다(국내가 부�
 그대로다 — 엑셀 다운로드도 원래 금액을 내려야 ERP와 맞춰볼 수 있다.
 
 **해외연구소의 완료는 '1차 완료'까지다.** `PUT /close/stages`로 매핑 완료를 켜면 해외연구소는
-`display_status`가 "1차 완료"가 되고 `overseas_actual_stages.close_first_done`이 같이 켜져서
+`display_status`가 "1차 완료"가 되고 `close_account_stages.mapping_done`이 켜져서
 증감분석 화면의 [1차 분석] 탭이 열린다. **계정 완료(`account_done`)는 건드리지 않는다** — 전표
 매핑은 ERP 약식 1차일 뿐이고, 계정 완료는 PL이 나온 뒤 실적 시뮬레이션 화면의 [확정]
 (`version_account_status`)으로만 된다. 1차 없이도 2차를 진행할 수 있다. [1차 고정] 상태에서 1차

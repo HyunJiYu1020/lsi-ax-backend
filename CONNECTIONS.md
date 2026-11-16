@@ -120,7 +120,7 @@ const BASE = (import.meta.env.VITE_API_BASE || window.OV_API_BASE || "http://loc
 `logic/calc.js`의 클라이언트 계산 + `localStorage`로 돈다. 그래서 **서버가 안 떠 있어도 표는 그대로
 그려진다** — 증감분석 화면도 라벨과 사유 저장만 못 하고 숫자는 계속 보인다(`ApiError.status === 0`을
 각 패널이 안내 문구로 처리한다). 화면 계산과 서버 계산이 어긋나면 안 되므로, `logic/calc.js`의
-환차 분해 식을 고칠 때는 `app/api/v1/endpoints/overseas_variance.py`의 `_variance_cells`도 같이 고친다.
+환차 분해 식을 고칠 때는 `app/accounts/overseas/services/variance.py`의 `variance_cells`도 같이 고친다.
 
 **[계정 확정] 버튼은 해외연구소 편성 화면에 두지 않는다.** 계정 확정은 계정 담당자가 전체 현황에서
 하는 결정이라, 편성 화면에 같은 버튼을 또 두면 어느 쪽이 진짜인지 알 수 없다 — 이 화면은 상태
@@ -230,7 +230,7 @@ import해서 `mcp.list_tools()` / `mcp.call_tool()`을 직접 호출한다(4-1�
 | **[1차 완료] / 취소** | **서버 저장** | `PUT /close/stages` ✅ |
 
 **[1차 완료]만 먼저 서버에 붙인 이유**: 그 값은 혼자 쓰는 값이 아니다 — 증감분석 화면의 [1차 분석]
-탭을 열지 말지가 `overseas_actual_stages.close_first_done`에 달려 있어서, 브라우저에만 두면 결산
+탭을 열지 말지가 `close_account_stages.mapping_done`에 달려 있어서, 브라우저에만 두면 결산
 담당자와 증감분석 담당자가 서로 다른 상태를 본다. 나머지(전표·매핑)는 아직 예시 전표로 도는 화면이라
 서버에 쌓을 실제 자료가 없다. 실패는 조용히 삼키고 로그에만 남긴다(`log()`) — 화면은 서버 없이도
 돌아가야 한다.
