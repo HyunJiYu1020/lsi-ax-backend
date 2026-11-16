@@ -77,7 +77,7 @@ from app.services.overseas.extra_rows import (
     months_by_category,
     read_extra_rows,
 )
-from app.services.overseas.state import build_state, latest_uploads_stmt
+from app.services.overseas.state import build_state, latest_uploads_stmt, state_token
 from app.services.overseas.labs import ACCOUNT_KEY, ALL_SCOPE, LAB_EPOCH, LabView, all_labs, lab_views, overseas_account
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
@@ -269,6 +269,22 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     lab_pks = {lab.pk for lab in labs}
     lab_codes = {lab.lab_code for lab in labs}
 
+    # 동시 편집 보호(PLAN.md P1-2) — 쓰기를 시작하기 전에 막는다. 검증이 쓰기보다 뒤에 있으면
+    # 409를 받았는데 DB에는 절반만 들어간 상태가 된다.
+    # 토큰이 비어 있으면 검사하지 않는다: 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
+    # 문제가 생기면 서버에서 이 블록만 끄면 롤백된다(PLAN Phase 2의 롤백 조건).
+    if state.state_token:
+        now_token = state_token(db)
+        if state.state_token != now_token:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                    "화면을 다시 불러온 뒤 수정 내용을 다시 넣어 주세요(지금 저장하면 그 사람의 "
+                    "수정이 사라집니다)."
+                ),
+            )
+
     unknown_pks: set[str] = set()
     for version, vd in state.V.items():
         for pk in vd.d:
@@ -411,7 +427,9 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
         db.rollback()
         raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
 
-    return {"status": "ok"}
+    # 저장 뒤 새 토큰을 같이 돌려준다 — 안 주면 화면이 들고 있는 토큰이 낡아서, 같은 화면에서
+    # 두 번째로 저장할 때 자기 자신과 충돌한 것처럼 409가 난다(테스트가 그걸 잡았다).
+    return {"status": "ok", "state_token": state_token(db)}
 
 
 # ---------- 인건비 증감의 원인: 인원 효과 vs 단가 효과 ----------

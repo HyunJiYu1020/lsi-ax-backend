@@ -26,7 +26,11 @@ def state(db):
 
 
 def dump(s):
-    return s.model_dump()
+    """비교용 상태. state_token은 뺀다 — 저장을 하면 타임스탬프가 바뀌어 토큰도 당연히 바뀐다
+    (그게 동시 편집 보호의 작동 원리다). 토큰 자체의 동작은 test_state_token_* 가 따로 본다."""
+    d = s.model_dump()
+    d.pop("state_token", None)
+    return d
 
 
 # ---------- 왕복 동일성 ----------
@@ -40,7 +44,7 @@ def test_get_put_get_is_identical(db, state):
     실제로 생겼는지 보는 자리다."""
     before = dump(state)
 
-    assert save_overseas_state(state=state, db=db) == {"status": "ok"}
+    assert save_overseas_state(state=state, db=db)["status"] == "ok"
     after = dump(get_overseas_state(basis_year=BASIS_YEAR, db=db))
 
     assert after == before, "같은 상태를 저장했는데 다시 읽은 값이 달라졌다"
@@ -339,3 +343,69 @@ def test_rejected_put_saves_nothing(db, state):
 
     after = dump(get_overseas_state(basis_year=BASIS_YEAR, db=db))
     assert after == before, "거부된 저장이 일부 반영됐다"
+
+
+# ---------- 동시 편집 보호 (PLAN.md P1-2 · Phase 2) ----------
+
+
+def test_state_token_is_issued_and_stable(db, state):
+    """GET이 토큰을 내려주고, 아무것도 바뀌지 않았으면 같은 토큰이 나온다."""
+    assert state.state_token, "GET이 state_token을 안 내려준다"
+    again = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+    assert again.state_token == state.state_token
+
+
+def test_state_token_changes_after_a_save(db, state):
+    """저장하면 토큰이 바뀐다 — 그래야 그 사이 저장이 있었는지 알 수 있다.
+    그리고 PUT이 새 토큰을 돌려줘야 화면이 이어서 저장할 수 있다."""
+    before = state.state_token
+    res = save_overseas_state(state=state, db=db)
+
+    assert res["state_token"] and res["state_token"] != before, "PUT이 새 토큰을 안 준다"
+    assert get_overseas_state(basis_year=BASIS_YEAR, db=db).state_token == res["state_token"]
+
+
+def test_stale_token_is_rejected_with_409(db, state):
+    """다른 세션이 먼저 저장한 뒤에 옛 토큰으로 저장하면 막는다 — 조용히 덮어쓰면 먼저 저장한
+    사람의 수정이 사라지고, 그 사실을 아무도 모른다(PLAN P1-2의 핵심 사고)."""
+    stale = state.state_token
+
+    # 다른 세션이 먼저 저장했다고 가정
+    other = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+    save_overseas_state(state=other, db=db)
+
+    state.state_token = stale
+    with pytest.raises(HTTPException) as e:
+        save_overseas_state(state=state, db=db)
+    assert e.value.status_code == 409
+    assert "다시 불러온" in str(e.value.detail)
+
+
+def test_conflict_saves_nothing(db, state):
+    """409로 막힌 저장은 아무것도 남기지 않는다 — 검증이 쓰기보다 앞에 있어야 한다."""
+    stale = state.state_token
+    other = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+    save_overseas_state(state=other, db=db)
+    after_other = dump(get_overseas_state(basis_year=BASIS_YEAR, db=db))
+
+    # 값을 고쳐서 옛 토큰으로 보낸다
+    pk, cat = next(((p, c) for p, cats in state.V["cur"].d.items() for c in cats), (None, None))
+    if pk is None:
+        pytest.skip("당월 속보에 저장된 값이 없다")
+    state.V["cur"].d[pk][cat][0] = (state.V["cur"].d[pk][cat][0] or 0.0) + 777.0
+    state.state_token = stale
+
+    with pytest.raises(HTTPException):
+        save_overseas_state(state=state, db=db)
+
+    assert dump(get_overseas_state(basis_year=BASIS_YEAR, db=db)) == after_other, "충돌인데 일부가 저장됐다"
+
+
+def test_empty_token_skips_the_check(db, state):
+    """토큰을 안 보내면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
+    서버에서 이 동작만 끄면 기능을 롤백할 수 있다(PLAN Phase 2의 롤백 조건)."""
+    other = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+    save_overseas_state(state=other, db=db)  # 토큰이 낡게 만든다
+
+    state.state_token = ""  # 옛 클라이언트처럼
+    assert save_overseas_state(state=state, db=db)["status"] == "ok"

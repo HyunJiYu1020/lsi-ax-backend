@@ -10,7 +10,9 @@ HTTP 입출력만 맡고, 조립은 이 모듈이 한다 — 집계는 서비스
 점진 분해할 때 다룬다. 지금은 "어디에 사는가"만 바로잡는다.
 """
 
-from sqlalchemy import select
+import hashlib
+
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.periods import ym_month, yyyymm
@@ -297,4 +299,59 @@ def build_state(db: Session, basis_year: int) -> OverseasState:
     return OverseasState(
         step=step, basis_year=basis_year, basis_month=basis_month, V=V, actualV=actualV, files=files, note=note,
         reason=reason, vendor=vendor, cp=cp,
+        # 이 응답을 만든 시점의 지문. PUT이 이걸 돌려보내면 그 사이 다른 저장이 있었는지 알 수 있다.
+        state_token=state_token(db),
     )
+
+
+# ---------- 동시 편집 보호 (낙관적 잠금) ----------
+# PLAN.md P1-2: 같은 화면을 띄운 두 세션(같은 사람의 탭 2개 포함)이 저장하면 나중 것이 전체를
+# 덮었다(last-write-wins). 덮인 쪽은 자기 수정이 사라진 걸 알 방법이 없었다.
+#
+# 해결: GET이 "지금 상태의 지문"(state_token)을 같이 내려주고, PUT이 그걸 그대로 돌려보낸다.
+# 그 사이 누가 저장했으면 지문이 달라져 있으므로 409로 막고 "다시 불러오세요"라고 한다.
+# 스키마 변경이 없다(PLAN 5.2(e)) — 기존 테이블의 타임스탬프만 읽는다.
+#
+# max(타임스탬프)만 쓰지 않고 count(*)도 섞는 이유: 외주용역·CP는 "단위 교체"(delete+insert)라
+# 행을 지우기만 하면 max는 그대로일 수 있다. 개수가 같이 들어가면 그 경우도 지문이 바뀐다.
+_TOKEN_PARTS: tuple[tuple[str, str], str] = (
+    ("cost_entries", "updated_at", "account_code = :acct"),
+    ("management_plan_entries", "updated_at", "account_code = :acct"),
+    ("notes", "updated_at", "account_key = :acct"),
+    ("uploads", "uploaded_at", "account_key = :acct"),
+    ("overseas_reason_rows", "uploaded_at", ""),
+    ("overseas_vendor_rows", "uploaded_at", ""),
+    ("overseas_cp_rows", "uploaded_at", ""),
+)
+
+
+def state_token(db: Session) -> str:
+    """이 화면이 저장하는 행들의 "지금 모습"을 요약한 짧은 지문.
+
+    값(월별 금액)은 cost_entry_details·management_plan_entry_details에 들어 있어서 헤더 테이블만
+    보면 금액 수정을 놓친다 — 그래서 디테일도 같이 센다(해당 계정 헤더에 달린 것만).
+    """
+    parts: list[str] = []
+    for table, ts, cond in _TOKEN_PARTS:
+        where = f" WHERE {cond}" if cond else ""
+        row = db.execute(
+            text(f"SELECT coalesce(max({ts})::text, '-'), count(*) FROM {table}{where}"),
+            {"acct": ACCOUNT_KEY} if cond else {},
+        ).one()
+        parts.append(f"{table}:{row[0]}:{row[1]}")
+
+    # 디테일(월 값)은 해당 계정 헤더에 달린 것만 본다.
+    for detail, header, fk, acct_col in (
+        ("cost_entry_details", "cost_entries", "cost_entry_id", "account_code"),
+        ("management_plan_entry_details", "management_plan_entries", "plan_entry_id", "account_code"),
+    ):
+        row = db.execute(
+            text(
+                f"SELECT coalesce(max(d.updated_at)::text, '-'), count(*) FROM {detail} d "
+                f"JOIN {header} h ON h.id = d.{fk} WHERE h.{acct_col} = :acct"
+            ),
+            {"acct": ACCOUNT_KEY},
+        ).one()
+        parts.append(f"{detail}:{row[0]}:{row[1]}")
+
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]

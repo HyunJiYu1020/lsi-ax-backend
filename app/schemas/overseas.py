@@ -95,6 +95,11 @@ class OverseasState(BaseModel):
     reason: list[ReasonRow] = []  # 증감사유 업로드 (연구소×버전×항목×구간 키로 upsert, cost처럼 누적)
     vendor: list[VendorRow] = []  # 외주용역 상세 (연구소×버전 단위로 전체 교체 — 업로드마다 행 수가 달라짐)
     cp: list[CpRow] = []  # CP 계약 업로드 (연도 단위로 전체 교체 — 연 1회 올리는 파일)
+    # 동시 편집 보호(PLAN.md P1-2). GET이 "지금 상태의 지문"을 담아 내려주고, PUT은 그걸 그대로
+    # 돌려보낸다. 그 사이 다른 세션이 저장했으면 지문이 달라져 있어 409로 막는다.
+    # 빈 문자열이면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
+    # 서버 쪽에서 검증만 끄면 롤백도 된다(PLAN Phase 2의 롤백 조건).
+    state_token: str = ""
 
 
 class StepUpdate(BaseModel):
