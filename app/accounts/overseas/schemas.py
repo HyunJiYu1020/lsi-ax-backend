@@ -485,6 +485,33 @@ class ReasonTranslateResult(BaseModel):
     error: str = ""
 
 
+class ReasonSummaryItem(BaseModel):
+    """요약에 넣을 회신 한 줄. label은 그 사유가 달린 계정 이름(인건비 등)이다 — 원문만 모아 보내면
+    모델이 "무엇이 늘었는지"를 본문에서 추측하게 되고, 계정 이름이 원문에 없으면 지어낸다."""
+
+    label: str
+    text: str
+
+
+class ReasonSummaryIn(BaseModel):
+    """지금 화면에 보이는 회신 묶음을 요약해 달라는 요청. 무엇을 보내느냐는 화면이 정한다 —
+    연구소·기간·비교 기준으로 이미 걸러 놓은 그 목록이 담당자가 읽으려던 범위다."""
+
+    items: list[ReasonSummaryItem]
+    scope_label: str = ""  # "SARC · 전실행 대비 · 연간" — 요약문이 무엇을 본 것인지 모델에게 알려준다
+    provider: str | None = None
+
+
+class ReasonSummaryResult(BaseModel):
+    """요약 결과. 번역과 같은 약속으로 실패해도 200에 error를 담는다 — 요약이 안 된다고 표가
+    사라지면 안 되고, 원문·번역은 표에 그대로 남아 있다."""
+
+    lines: list[str] = []
+    count: int = 0  # 요약에 들어간 회신 건수(화면이 "15건을 요약했습니다"로 밝힌다)
+    engine: str = ""
+    error: str = ""
+
+
 class RowMatchSuggestion(BaseModel):
     """"이 행과 같은 행인가요?"로 보여줄 후보 하나. score는 후보를 고르는 기준이 아니라 정렬용이다 —
     합칠지 말지는 항상 사람이 답한다(자동 병합은 Travel Exp / Test Exp처럼 다른 행을 합칠 수 있다)."""
@@ -628,6 +655,7 @@ class VarianceRow(BaseModel):
     label_en: str = ""
     level: int = 0  # 손익계산서형 들여쓰기 단계
     unit: str = "krw"  # krw(금액) | hc(명) | pct(%)
+    memo: bool = False  # 참고 행(IT 관련 비용·외주용역비) — 개발비 합계에 들어가지 않는다
     base: float = 0  # 비교 기준 금액
     cur: float = 0  # 지금 보고 있는 버전 금액
     diff: float = 0  # cur - base
@@ -652,6 +680,50 @@ class VarianceResult(BaseModel):
     lab_scope: str
     plan_no: str = ""
     rows: list[VarianceRow]
+    fallback_note: str = ""
+    note: str = ""
+
+
+class LaborSplitTotals(BaseModel):
+    """인건비 분해의 합계만. 증감분석 표에 실어 보내는 모양이다.
+
+    왜 연구소별 상세(LaborSplitResult.labs)를 빼는가: 화면은 합계 줄만 그리는데, 17기간 × 연구소
+    20여 곳이면 한 응답에 안 쓰는 줄 340개가 실린다(260KB → 60KB). 엑셀 다운로드는 연구소마다
+    따로 받으니 그 차이가 수 MB가 된다. 연구소별 상세가 필요하면 `/overseas/labor-split`을 쓴다.
+    """
+
+    hc_base: float = 0
+    hc_cur: float = 0
+    per_head_base: float = 0  # 원/명
+    per_head_cur: float = 0
+    hc_effect: float = 0  # 인원이 늘어서 생긴 몫
+    rate_effect: float = 0  # 1인당 인건비가 올라서 생긴 몫
+    unsplit: float = 0  # 인력을 안 낸 연구소 몫(나눌 수 없어 따로 뺀다)
+    fx_outside: float = 0  # = hc_effect + rate_effect + unsplit
+
+
+class VarianceTable(BaseModel):
+    """증감분석 화면 표 한 장 전체 — 17기간 × 계정. periods의 키는 조회 파라미터와 같은 기간 코드
+    (y · q1~q4 · m1~m12)이고, 값은 그 기간의 계정 행 목록이다.
+
+    기간별 행을 따로 주는 이유: 월 금액을 더해 분기를 만들 수 없는 행이 있다 — 인력은 평균이고
+    비율은 분자·분모를 각각 더한 뒤 나눠야 한다. 화면이 월 값을 접어 분기를 만들면 그 두 행이
+    틀어진다(집계표에서 실제로 그랬다, to_17 참조).
+    """
+
+    basis_year: int
+    basis_month: int
+    kind: str
+    stage: str = ""
+    base_version: str
+    base_label: str
+    lab_scope: str
+    plan_no: str = ""
+    periods: dict[str, list[VarianceRow]]
+    # 기간별 인건비 분해(인원 효과 · 단가 효과). 화면이 인건비 행의 ▸를 누르면 보여주는 줄들이다.
+    # 같은 응답에 담는 이유: 기간마다 따로 부르면 17번, 연구소까지 더하면 수십 번이 된다.
+    # 경영계획 대비는 환율 기준이 없어 분해할 수 없으므로 빈 dict가 온다(화면도 같은 제약).
+    labor_split: dict[str, LaborSplitTotals] = {}
     fallback_note: str = ""
     note: str = ""
 

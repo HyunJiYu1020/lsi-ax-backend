@@ -18,6 +18,7 @@ from app.shared.core.reason_translate import (
     engine_label,
     normalize,
     resolve_provider,
+    summarize_reasons,
     translate_batch,
 )
 from app.shared.core.storage import upload_bytes
@@ -68,6 +69,10 @@ from app.accounts.overseas.services.extra_rows import (
     months_by_category,
     read_extra_rows,
 )
+from app.accounts.overseas.services.labor_split import (
+    prepare as labor_split_prepare,
+    split_for as labor_split_for,
+)
 from app.accounts.overseas.services.state import build_state, latest_uploads_stmt, state_token
 from app.accounts.overseas.services.cp import replace_cp_rows
 from app.accounts.overseas.services.reason_rows import upsert_reason_rows
@@ -117,6 +122,8 @@ from app.accounts.overseas.schemas import (
     OverseasSummary,
     OverseasSummaryLab,
     ReasonRow,
+    ReasonSummaryIn,
+    ReasonSummaryResult,
     ReasonTranslateIn,
     ReasonTranslateItem,
     AnomalyFinding,
@@ -489,122 +496,16 @@ def get_labor_split(
     lab_scope: str = "ALL",
     db: Session = Depends(get_db),
 ) -> LaborSplitResult:
-    if base_version not in ("prev", "prior", "plan"):
-        raise HTTPException(400, "base_version은 prev(전실행) | prior(전년 실적) | plan(경영계획)만 쓸 수 있다.")
+    """인건비 증감을 인원 효과 · 단가 효과로 나눈다(한 기간).
+
+    계산은 services/labor_split.py에 있다 — 증감분석 표(17기간)와 **같은 함수**를 쓴다.
+    식이 두 벌이 되면 화면과 챗봇이 다른 답을 하고, 그건 PLAN P1-3에서 이미 겪은 사고다.
+    """
     ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
+    return labor_split_for(db, labor_split_prepare(db, basis_year, base_version, lab_scope), period, ix)
 
-    state = build_state(db, basis_year)
-    cur_d, base_d = state.V["cur"].d, state.V[base_version].d
-    if not cur_d:
-        raise HTTPException(404, f"{basis_year}년 당월 속보 데이터가 없다.")
-    if not base_d:
-        label = {"prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[base_version]
-        raise HTTPException(404, f"{label} 데이터가 저장돼 있지 않아 인건비 증감을 나눌 수 없다.")
-
-    basis_month = state.basis_month or 1
-    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 — 넣으면
-    # SARC가 CPU+GPU+TOTAL로 두 번 세어져 인원과 금액이 정확히 두 배가 된다(실제로 그렇게 나왔다).
-    # 화면도 같은 규칙이다(core.js의 ovPks는 파트 목록에 TOTAL을 두지 않는다).
-    # 기준정보는 "당월 속보 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한 환차 분해가
-    # 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).
-    labs = {
-        lab.pk: lab for lab in lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
-        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
-    }
-    scope = (lab_scope or "ALL").strip()
-    if scope.upper() == "ALL":
-        pks = [pk for pk in labs if pk in cur_d or pk in base_d]
-    else:
-        # "SARC"처럼 파트 없는 코드를 주면 그 연구소의 파트를 모두 더한다.
-        pks = [pk for pk, lab in labs.items() if pk == scope or lab.lab_code == scope]
-        if not pks:
-            raise HTTPException(404, f"그런 연구소가 없다: {scope!r}")
-
-    cur_spec = (basis_year, basis_month, "forecast")
-    if base_version == "prev":
-        snap = state.actualV.get("cur")
-        if not snap:
-            raise HTTPException(404, "전실행(직전 실적) 스냅샷이 없어 비교할 수 없다.")
-        base_spec = (basis_year, snap.thru_month, "actual")
-    elif base_version == "prior":
-        base_spec = (basis_year - 1, 12, "actual")
-    else:
-        # 경영계획은 속보/실적 환율 기준이 없어 환차·환차外를 나눌 수 없다(화면도 같은 제약).
-        raise HTTPException(
-            400, "경영계획 대비는 환율 기준(속보/실적)이 없어 인원·단가로 나눌 수 없다. 화면 표를 보라."
-        )
-
-    # 현지통화 → $ 환차를 따로 나누는 통화. core.js의 ovLcOf와 똑같이 "통화가 USD가 아니면 현지통화"로
-    # 본다 — CP도 통화가 ILS라 여기 포함된다.
-    local_curs = {
-        lab.currency for pk, lab in labs.items()
-        if pk in pks and lab.currency and lab.currency != "USD"
-    }
-    rate_cur = rate_arrays(db, *cur_spec, local_curs, ix)
-    rate_base = rate_arrays(db, *base_spec, local_curs, ix)
-
-    rows: list[LaborSplitLab] = []
-    tot = {"hc_cur": 0.0, "hc_base": 0.0, "amt_cur": 0.0, "amt_base": 0.0, "unsplit": 0.0}
-    for pk in sorted(pks):
-        lab = labs[pk]
-        cats_cur, cats_base = cur_d.get(pk, {}), base_d.get(pk, {})
-        lc = lab.currency if lab.currency and lab.currency != "USD" else None
-        amt_cur = amt_base = hc_cur = hc_base = 0.0
-        for j in ix:
-            k_cur = sum(n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
-            k_base = sum(n(cats_base.get(leaf, [None] * 12)[j]) for leaf in _LABOR_LEAVES)
-            rb = rate_base["USD"][j]
-            lrc = rate_cur.get(lc, [0.0] * 12)[j] if lc else 0.0
-            lrb = rate_base.get(lc, [0.0] * 12)[j] if lc else 0.0
-            # 비교 버전 환율로 환산해야 환율이 움직인 몫이 빠진다(= 환차外 기준).
-            if lc and lrc > 0 and lrb > 0:
-                amt_cur += k_cur * lrc / lrb * rb * 1000
-            else:
-                amt_cur += k_cur * rb * 1000
-            amt_base += k_base * rb * 1000
-            hc_cur += n(cats_cur.get("hc", [None] * 12)[j]) / len(ix)
-            hc_base += n(cats_base.get("hc", [None] * 12)[j]) / len(ix)
-        splittable = hc_cur > 0 and hc_base > 0
-        p_base = amt_base / hc_base if splittable else 0.0
-        p_cur = amt_cur / hc_cur if splittable else 0.0
-        hc_eff = (hc_cur - hc_base) * p_base if splittable else 0.0
-        rate_eff = hc_cur * (p_cur - p_base) if splittable else 0.0
-        unsplit = 0.0 if splittable else amt_cur - amt_base
-        rows.append(LaborSplitLab(
-            lab_pk=pk, lab_name=lab.name, currency=lab.currency or "USD",
-            hc_base=hc_base, hc_cur=hc_cur, per_head_base=p_base, per_head_cur=p_cur,
-            hc_effect=hc_eff, rate_effect=rate_eff, unsplit=unsplit,
-            fx_outside=hc_eff + rate_eff + unsplit,
-        ))
-        if splittable:
-            tot["hc_cur"] += hc_cur
-            tot["hc_base"] += hc_base
-            tot["amt_cur"] += amt_cur
-            tot["amt_base"] += amt_base
-        else:
-            tot["unsplit"] += unsplit
-
-    # 합계는 연구소별 효과를 더하는 게 아니라 전체 인원·전체 금액으로 다시 계산한다 — 단가는 비율이라
-    # 연구소별로 따로 낸 걸 더하면 뜻이 없다(집계 파생 행이 전체 합산만 쓰는 것과 같은 이유).
-    pB = tot["amt_base"] / tot["hc_base"] if tot["hc_base"] else 0.0
-    pC = tot["amt_cur"] / tot["hc_cur"] if tot["hc_cur"] else 0.0
-    hc_effect = (tot["hc_cur"] - tot["hc_base"]) * pB
-    rate_effect = tot["hc_cur"] * (pC - pB)
-    return LaborSplitResult(
-        basis_year=basis_year, period=period, base_version=base_version, lab_scope=scope,
-        hc_base=tot["hc_base"], hc_cur=tot["hc_cur"], per_head_base=pB, per_head_cur=pC,
-        hc_effect=hc_effect, rate_effect=rate_effect, unsplit=tot["unsplit"],
-        fx_outside=hc_effect + rate_effect + tot["unsplit"],
-        labor_cur=tot["amt_cur"] + tot["unsplit"], labor_base=tot["amt_base"],
-        labs=rows,
-        note=(
-            "환율이 움직여서 변한 몫(환차)은 빼고 환차外만 인원 효과와 단가 효과로 나눈 값이다. "
-            "두 효과의 합(+ 인력 없는 연구소 몫)이 fx_outside이고, 이 값은 화면 계정별 상세의 "
-            "인건비 행 환차外 칸과 같아야 한다."
-        ),
-    )
 
 
 # ---------- 히어로 카드(화면 맨 위 편성 현황) ----------
@@ -1330,6 +1231,49 @@ async def translate_reasons(body: ReasonTranslateIn, db: Session = Depends(get_d
         failed=failed,
         error=error,
     )
+
+
+@router.post("/overseas/reason-summary", response_model=ReasonSummaryResult)
+async def summarize_reason_rows(body: ReasonSummaryIn) -> ReasonSummaryResult:
+    """지금 보고 있는 회신 묶음 → 담당자가 먼저 읽을 요약 3~5줄.
+
+    번역(/overseas/reason-translate)은 한 문장을 한국어로 옮기고, 이건 여러 계정에 흩어진 회신을
+    가로질러 읽는다 — 연구소 하나가 보낸 사유가 계정 20여 개로 쪼개져 있어서 담당자가 표를 훑으며
+    머릿속에서 모으던 일이다.
+
+    DB를 쓰지 않는다(Session 의존성이 없는 이유): 요약은 저장하지도 캐시하지도 않는다 — 원문·번역은
+    이미 표와 캐시에 있고, 요약은 화면이 무엇을 걸러 놨느냐에 따라 매번 달라지는 읽을거리다.
+
+    실패해도 200으로 돌려주고 error에 이유를 담는다 — 요약이 안 된다고 사유 표가 사라지면 안 된다
+    (번역 엔드포인트와 같은 약속)."""
+    items: list[tuple[str, str]] = []
+    too_long = 0
+    for it in body.items:
+        text = normalize(it.text)
+        if not text:
+            continue
+        if len(text) > MAX_LEN:
+            too_long += 1
+            continue
+        items.append((normalize(it.label), text))
+    if not items:
+        raise HTTPException(400, "요약할 회신 원문이 없다.")
+    if len(items) > MAX_TEXTS:
+        raise HTTPException(
+            400,
+            f"한 번에 요약할 수 있는 회신은 {MAX_TEXTS}건까지입니다 (요청 {len(items)}건). 기간이나 연구소를 좁혀주세요.",
+        )
+
+    provider = resolve_provider(body.provider)
+    lines: list[str] = []
+    error = ""
+    try:
+        lines = await summarize_reasons(items, body.scope_label, provider)
+    except HTTPException as e:
+        error = str(e.detail)
+    if too_long:
+        error = (error + " " if error else "") + f"{too_long}건은 원문이 {MAX_LEN}자를 넘어 요약에서 뺐습니다."
+    return ReasonSummaryResult(lines=lines, count=len(items), engine=engine_label(provider), error=error)
 
 
 @router.get("/overseas/reason-translations", response_model=list[ReasonTranslateItem])

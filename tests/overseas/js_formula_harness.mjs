@@ -86,7 +86,10 @@ function loadCore(labs) {
      ovCpEnsure = () => ({ pocs: cpPocs });
      fxEnsure = () => {};
    },
-   tables: () => ovTables() })`;
+   tables: () => ovTables(),
+   // 증감분석은 버전이 둘이라 ovCache(ver)가 버전마다 다른 캐시를 줘야 한다.
+   setVersionCaches: (cc, cb) => { S.ov.base = "prev"; ovCache = (v) => (v === "cur" ? cc : cb); },
+   analysis: (per) => ovAnalysis(per, "ALL") })`;
   return vm.runInContext(src + epilogue, vm.createContext(browserStub()), { filename: CORE_JS });
 }
 
@@ -145,6 +148,21 @@ const CASES = {
   // 집계 그룹 정의 자체(어느 행이 어느 하위를 더하는가). 백엔드 cost_groups.GROUP_CALC와 짝이다.
   group_defs(_input, core) {
     return { core: Object.fromEntries(core.OV_EL.filter((e) => e.calc).map((e) => [e.k, e.calc])) };
+  },
+
+  // 증감분석 화면 표(17기간 × 계정). 백엔드 compute_variance_table과 짝이다.
+  // 두 버전(당월 · 비교)의 캐시를 각각 꽂아야 한다 — 환차는 "두 기준의 환율 차이"에서 나오므로
+  // 한 캐시만 주면 환차가 통째로 0이 되어 대조가 통과해 버린다.
+  // ratesCur · ratesBase는 **완성된 환율 맵**이다({std, cp, ils, ...}) — 현지통화 연구소가 있으면
+  // 소문자 통화 키(core.js ovLcOf)가 있어야 하고, 없으면 ovAnaEl이 그 자리에서 터진다.
+  variance({ dCur, dBase, ratesCur, ratesBase, periods }, core) {
+    const Cc = buildCache(core, dCur, ratesCur), Cb = buildCache(core, dBase, ratesBase);
+    core.setVersionCaches(Cc, Cb);
+    return {
+      core: Object.fromEntries(
+        periods.map((per) => [per, core.analysis(per)]),
+      ),
+    };
   },
 
   // 집계 ②③④ 탭(연구소별 표). 백엔드 lab_tables와 짝이다. ①(pl_rows)과 달리 행이 연구소별이고

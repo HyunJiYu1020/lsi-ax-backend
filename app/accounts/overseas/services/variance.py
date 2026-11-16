@@ -21,15 +21,27 @@ check_variance_reasons를 함수로 직접 호출하고, 결산 엔드포인트�
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from dataclasses import dataclass
+
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.accounts.overseas.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
+from app.accounts.overseas.cost_groups import (
+    AGGREGATE_ROWS,
+    CATEGORY_LABELS,
+    CATEGORY_LABELS_EN,
+    VARIANCE_ROWS,
+    resolve_leaves,
+)
 from app.shared.core.periods import PERIOD_IX, month_value, yyyymm
 from app.shared.core.values import n, source_hash
 from app.accounts.overseas.services.entries import current_basis_month, entry_months_bulk, plan_entry_months_bulk
 from app.accounts.overseas.services.fxcalc import rate_arrays
+from app.accounts.overseas.services.labor_split import (
+    prepare as labor_split_prepare,
+    split_for as labor_split_for,
+)
 from app.accounts.overseas.services.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.shared.core.reason_translate import (
     MAX_LEN,
@@ -68,6 +80,8 @@ from app.accounts.overseas.schemas import (
     VarianceReasonIn,
     VarianceReasonOut,
     VarianceResult,
+    LaborSplitTotals,
+    VarianceTable,
     VarianceRow,
 )
 
@@ -432,7 +446,10 @@ def variance_cells(
     rate_cur = rate_arrays(db, *cur_fx, local_curs, ix)
     rate_base = rate_arrays(db, *base_fx, local_curs, ix) if split_fx else rate_cur
 
-    leaves = {key: resolve_leaves(key) for key, _, _ in VARIANCE_ROWS if key != "pct"}
+    # 화면이 그리는 행 전부를 계산한다 — 참고 행(IT 관련 비용 · 외주용역비 7개)까지.
+    # VARIANCE_ROWS(38행)만 돌면 그 7개가 빠지고, 증감분석 화면은 집계표와 같은 45행을 그리므로
+    # 화면이 서버 값을 쓸 때 그 줄이 빈칸으로 남는다. 두 표가 같은 행 목록을 쓰는 게 맞다.
+    leaves = {key: resolve_leaves(key) for key, _, _, _ in AGGREGATE_ROWS if key != "pct"}
     out = {key: {"cur": 0.0, "base": 0.0, "fx_local": 0.0, "fx_usd": 0.0, "fx_outside": 0.0} for key in leaves}
 
     for pk in pks:
@@ -482,18 +499,27 @@ def pct_of(cur: float, base: float) -> float | None:
 
 
 def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
+    """계정 행 목록. 집계표와 같은 45행을 쓴다(AGGREGATE_ROWS) — 두 화면이 같은 계정 트리를
+    그리므로 행 목록이 갈리면 한쪽에만 있는 줄이 생긴다. memo(참고 행)는 개발비 합계에 들어가지
+    않는다는 표시이고, 증감분석에서도 같은 뜻이다."""
     rows: list[VarianceRow] = []
-    for key, level, unit in VARIANCE_ROWS:
+    for key, level, unit, memo in AGGREGATE_ROWS:
         if unit == "pct":
-            # (%) 행은 금액이 아니라 MARK UP 비율(B ÷ A)이다. 두 버전의 비율을 각각 내고 그 차이를
-            # %p로 보여주므로, 환차를 가를 대상이 아니다.
-            a, b = cells["A"], cells["B"]
-            cur = (b["cur"] / a["cur"] * 100) if a["cur"] else 0.0
-            base = (b["base"] / a["base"] * 100) if a["base"] else 0.0
+            # (%) 행은 금액이 아니라 MARK UP 비율이다. 두 버전의 비율을 각각 내고 그 차이를 %p로
+            # 보여주므로 환차를 가를 대상이 아니다.
+            #
+            # 분모는 **개발비(매출)=tot**이다(개발비 A가 아니다). 근거는 화면이 사용자에게 적어
+            # 주는 문장이다 — "합계 화면은 MARK UP ÷ 개발비(매출) 계산값"(core.js 집계표 안내).
+            # 집계표(aggregate.pl_rows)도 tot을 쓴다. 2026-11-16까지 여기만 A를 써서, MARK UP이
+            # 0이 아닌 데이터에서는 챗봇이 화면과 다른 %를 말하게 되어 있었다(개발 데이터는 B가
+            # 0이라 두 값이 같아서 드러나지 않았다).
+            d, b = cells["tot"], cells["B"]
+            cur = (b["cur"] / d["cur"] * 100) if d["cur"] else 0.0
+            base = (b["base"] / d["base"] * 100) if d["base"] else 0.0
             rows.append(
                 VarianceRow(
                     category_key=key, label=CATEGORY_LABELS[key], label_en=CATEGORY_LABELS_EN[key], level=level, unit="pct",
-                    base=base, cur=cur, diff=cur - base,
+                    memo=memo, base=base, cur=cur, diff=cur - base,
                 )
             )
             continue
@@ -504,6 +530,7 @@ def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
                 category_key=key,
                 label=CATEGORY_LABELS.get(key, key),
                 label_en=CATEGORY_LABELS_EN.get(key, ""),
+                memo=memo,
                 level=level,
                 unit=unit,
                 base=c["base"],
@@ -519,20 +546,29 @@ def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
     return rows
 
 
-def compute_variance(
-    db: Session,
-    basis_year: int,
-    basis_month: int,
-    kind: str,
-    base_version: str,
-    period: str,
-    lab_scope: str,
-    plan_no: str | None,
-    stage: str = "",
-) -> VarianceResult:
+@dataclass(frozen=True)
+class _VarianceSetup:
+    """기간과 무관한 준비물. 17기간 표(compute_variance_table)는 이걸 한 번만 만들고 기간만
+    바꿔 가며 계산한다 — 기간마다 다시 만들면 같은 DB 읽기를 17번 한다."""
+
+    labs: dict
+    pks: list[str]
+    cur_d: dict
+    base_d: dict
+    cur_fx: tuple
+    base_fx: tuple
+    split_fx: bool
+    basis: object
+    plan_no: str
+    note: str
+
+
+def _variance_setup(
+    db: Session, basis_year: int, basis_month: int, kind: str, base_version: str,
+    lab_scope: str, plan_no: str | None,
+) -> _VarianceSetup:
     if base_version not in BASE_LABELS:
         raise HTTPException(400, "base_version은 prev(전실행) | prior(전년) | plan(경영계획)만 쓸 수 있다.")
-    ix = check_period(period)
     resolved = resolve_bases(db, basis_year, basis_month, kind, plan_no)
     basis = next(b for b in resolved.bases if b.key == base_version)
     if not basis.has_data:
@@ -557,7 +593,6 @@ def compute_variance(
     # 두고 증감 전부를 환차外로 본다. 0을 "환차가 없었다"로 읽지 않도록 note에 적어 내려보낸다.
     split_fx = "plan" not in (cur_spec[2], base_spec[2])
     cur_fx, base_fx = fx_specs(cur_spec, base_spec)
-    cells = variance_cells(db, labs, pks, cur_d, base_d, ix, cur_fx, base_fx, split_fx)
     note = (
         "환차 = 환율이 움직여서 변한 몫, 환차外 = 금액 자체의 증감이다. USD가 아닌 통화를 쓰는 "
         "연구소는 환차를 현지→$(fx_local)와 $→원(fx_usd)으로 가른다 — USD 연구소는 fx_local이 0이다. "
@@ -565,20 +600,42 @@ def compute_variance(
     )
     if not split_fx:
         note += " 경영계획은 속보/실적 환율 기준이 없어 환차를 가를 수 없다 — 환차 칸은 0이고 증감 전부가 환차外로 들어가 있다."
+    return _VarianceSetup(
+        labs, pks, cur_d, base_d, cur_fx, base_fx, split_fx, basis, basis.plan_no, note
+    )
+
+
+def compute_variance(
+    db: Session,
+    basis_year: int,
+    basis_month: int,
+    kind: str,
+    base_version: str,
+    period: str,
+    lab_scope: str,
+    plan_no: str | None,
+    stage: str = "",
+) -> VarianceResult:
+    ix = check_period(period)
+    st = _variance_setup(db, basis_year, basis_month, kind, base_version, lab_scope, plan_no)
+    cells = variance_cells(
+        db, st.labs, st.pks, st.cur_d, st.base_d, ix, st.cur_fx, st.base_fx, st.split_fx
+    )
     return VarianceResult(
         basis_year=basis_year,
         basis_month=basis_month,
         kind=kind,
         stage=stage,
         base_version=base_version,
-        base_label=basis.resolved_label,
+        base_label=st.basis.resolved_label,
         period=period,
         lab_scope=(lab_scope or "ALL"),
-        plan_no=basis.plan_no,
+        plan_no=st.plan_no,
         rows=variance_rows(cells),
-        fallback_note=basis.fallback_note,
-        note=note,
+        fallback_note=st.basis.fallback_note,
+        note=st.note,
     )
+
 
 
 # ---------- 증감사유 ----------
@@ -907,3 +964,67 @@ def compute_reason_check(
         else f"증감률 {threshold_pct:g}% 이상인 항목은 모두 사유가 적혀 있다."
     )
     return VarianceReasonCheck(threshold_pct=threshold_pct, missing=missing, stale=stale, note=note)
+
+
+def compute_variance_table(
+    db: Session,
+    basis_year: int,
+    basis_month: int,
+    kind: str,
+    base_version: str,
+    lab_scope: str,
+    plan_no: str | None,
+    stage: str = "",
+) -> VarianceTable:
+    """증감분석 화면이 그리는 표 전체 — 17기간(월 12 + 분기 4 + 연간) × 계정 전부.
+
+    기간을 하나씩 받는 `compute_variance`와 같은 계산이지만, 준비물(기준 해석 · 연구소 목록 ·
+    두 버전 데이터 로드)을 **한 번만** 만들고 기간만 바꿔 돈다 — 화면이 17번 부르면 같은 DB
+    읽기를 17번 하고, 그게 이 화면이 브라우저에서 계산되고 있던 이유다.
+
+    왜 기간별 응답을 합치지 않고 따로 주는가: 월 금액을 더해 분기를 만들 수 없는 행이 있다
+    (인력은 평균, 비율은 분자·분모를 각각 더한 뒤 나눠야 한다). 서버가 기간마다 제대로 계산해서
+    주고 화면은 고르기만 한다.
+    """
+    st = _variance_setup(db, basis_year, basis_month, kind, base_version, lab_scope, plan_no)
+    periods = {
+        period: variance_rows(
+            variance_cells(
+                db, st.labs, st.pks, st.cur_d, st.base_d, ix, st.cur_fx, st.base_fx, st.split_fx
+            )
+        )
+        for period, ix in PERIOD_IX.items()
+    }
+
+    # 인건비 분해도 같이 담는다 — 화면이 인건비 행을 펼칠 때 쓰는 줄들이고, 따로 부르면 기간마다
+    # 한 번씩(17번) 왕복한다. 계산은 엔드포인트와 **같은 함수**를 쓴다(services/labor_split.py).
+    # 경영계획 대비는 환율 기준이 없어 분해할 수 없다 — 그때는 빈 dict로 두고 화면이 그 줄을
+    # 안 그리게 한다(없는 걸 0으로 주면 "분해했는데 0"으로 읽힌다).
+    split: dict[str, LaborSplitTotals] = {}
+    try:
+        inp = labor_split_prepare(db, basis_year, base_version, lab_scope)
+        split = {
+            period: LaborSplitTotals(
+                **{
+                    f: getattr(labor_split_for(db, inp, period, ix), f)
+                    for f in LaborSplitTotals.model_fields
+                }
+            )
+            for period, ix in PERIOD_IX.items()
+        }
+    except HTTPException:
+        split = {}
+    return VarianceTable(
+        basis_year=basis_year,
+        basis_month=basis_month,
+        kind=kind,
+        stage=stage,
+        base_version=base_version,
+        base_label=st.basis.resolved_label,
+        lab_scope=(lab_scope or "ALL"),
+        plan_no=st.plan_no,
+        periods=periods,
+        labor_split=split,
+        fallback_note=st.basis.fallback_note,
+        note=st.note,
+    )
