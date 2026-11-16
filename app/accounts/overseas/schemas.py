@@ -98,6 +98,17 @@ class CpRow(BaseModel):
     source_file: str = ""
 
 
+class CpRowsIn(BaseModel):
+    """CP 계약 전용 저장 요청(PUT /overseas/cp-rows). PLAN.md Phase 5.
+
+    rows에 들어온 연도만 통째로 바뀐다 — 연 1회 올리는 파일이라 사라진 POC·직급은 지워야 한다.
+    보내지 않은 연도는 건드리지 않는다.
+    """
+
+    rows: list[CpRow]
+    state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
+
+
 class OverseasState(BaseModel):
     step: int
     basis_year: int  # 편성 기준연도(프론트 S.basis 연도). cur/prev/plan은 이 연도, prior는 이 연도-1

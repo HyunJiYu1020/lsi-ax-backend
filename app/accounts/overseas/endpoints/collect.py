@@ -69,6 +69,7 @@ from app.accounts.overseas.services.extra_rows import (
     read_extra_rows,
 )
 from app.accounts.overseas.services.state import build_state, latest_uploads_stmt, state_token
+from app.accounts.overseas.services.cp import replace_cp_rows
 from app.accounts.overseas.services.vendor import replace_vendor_rows
 from app.accounts.overseas.services.labs import (
     ACCOUNT_KEY,
@@ -83,6 +84,7 @@ from app.accounts.overseas.services.labs import (
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.shared.core.enums import CodeGroup
 from app.accounts.overseas.schemas import (
+    CpRowsIn,
     VendorRowsIn,
     ActualSnapshot,
     LaborSplitLab,
@@ -366,23 +368,8 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     # 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서 겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다.
     replace_vendor_rows(db, state.basis_year, state.vendor, lab_codes)
 
-    # 4-3) CP 계약 (연도 단위 전체 교체 — 연 1회 올리는 파일이라 사라진 POC·직급은 지운다)
-    cp_years = {r.year for r in state.cp}
-    if cp_years:
-        db.execute(delete(OverseasCpRow).where(OverseasCpRow.year.in_(cp_years)))
-    if state.cp:
-        db.execute(
-            insert(OverseasCpRow),
-            [
-                {
-                    "year": r.year, "poc_type": r.poc_type, "poc_proj": r.poc_proj, "poc_desc": r.poc_desc, "title": r.title,
-                    "dedicated": r.dedicated, "common": r.common, "man_month": r.man_month, "cost_year": r.cost_year,
-                    "poc_cost_sum": r.poc_cost_sum, "poc_mm_sum": r.poc_mm_sum, "poc_direct": r.poc_direct,
-                    "poc_ovh": r.poc_ovh, "poc_total": r.poc_total, "source_file": r.source_file,
-                }
-                for r in state.cp
-            ],
-        )
+    # 4-3) CP 계약 — 전용 저장 API(PUT /overseas/cp-rows)와 **같은 함수**를 부른다.
+    replace_cp_rows(db, state.cp)
 
     # 5) 진행 단계
     progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
@@ -432,6 +419,31 @@ def save_vendor_rows(body: VendorRowsIn, db: Session = Depends(get_db)) -> dict[
         raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
     # 저장 뒤 새 지문을 같이 준다 — 안 주면 화면이 들고 있는 토큰이 낡아서 다음 저장이 409가 된다.
     return {"status": "ok", "replaced": replaced, "state_token": state_token(db)}
+
+
+@router.put("/overseas/cp-rows")
+def save_cp_rows(body: CpRowsIn, db: Session = Depends(get_db)) -> dict[str, object]:
+    """CP 계약만 저장한다 — 연도 단위 전체 교체.
+
+    `PUT /overseas/state`와 같은 서비스 함수를 부른다(PLAN.md Phase 5). 구 경로와 신 경로를
+    병행해 둬도 결과가 갈리지 않는다.
+    """
+    if body.state_token and body.state_token != state_token(db):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                "화면을 다시 불러온 뒤 다시 올려 주세요."
+            ),
+        )
+    replaced = replace_cp_rows(db, body.rows)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
+    return {"status": "ok", "replaced": replaced, "state_token": state_token(db)}
+
 
 
 
