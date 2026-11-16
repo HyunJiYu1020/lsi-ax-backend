@@ -22,7 +22,7 @@ from app.shared.models.system import CommonCode, CommonCodeGroup
 # 그러면 "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 USD가 되어 현지통화 연구소의
 # 환차 분해(현지→$ 단계)가 통째로 사라진다. 통화는 환산의 입력이라 시드가 직접 책임져야 한다.
 #
-# 대만(TDC)만 국가 기본값(TWD)이 아니라 USD다 — TDC는 $로 결산하는 연구소라 목업에서도 국가별
+# 대만(TDC)만 국가 기본값(TWD)이 아니라 USD다 — TDC는 $로 결산하는 연구소라 프런트에서도 국가별
 # 기본값을 덮어쓴다(core.js ovLabsSeed의 `r.c==="TDC"?"USD":...`). 국가로 유추하지 말 것.
 OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int, str]] = [
     ("SARC:CPU", "SARC", "CPU", "SARC+ACL · CPU", "미국", 10, "USD"),

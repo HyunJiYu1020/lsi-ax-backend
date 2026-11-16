@@ -425,9 +425,9 @@ class OverseasSummaryLab(BaseModel):
 class OverseasSummary(BaseModel):
     """해외연구소 화면 맨 위 히어로 카드 한 장에 들어가는 값 전부.
 
-    화면(frontend/src/components/OverseasApp.jsx)이 ovAgg/ov17로 브라우저에서 계산하던 숫자를
+    화면(frontend-html/shared/core.js)이 ovAgg/ov17로 브라우저에서 계산하던 숫자를
     서버에서 같은 식으로 낸 것이다 — 챗봇·MCP가 말하는 총액과 사용자가 보는 카드가 어긋나면 안 되므로
-    식을 바꿀 때는 화면 쪽(OverseasApp.jsx, logic/calc.js)도 같이 고칠 것."""
+    식을 바꿀 때는 화면 쪽(core.js)도 같이 고칠 것."""
 
     basis_year: int
     basis_month: int
@@ -640,7 +640,7 @@ class VarianceRow(BaseModel):
 
 class VarianceResult(BaseModel):
     """증감분석 표 한 장 전체. 챗봇이 "SARC 인건비 왜 늘었어?"에 답할 때 근거로 쓰는 데이터이기도
-    해서, 화면이 보여주는 것과 같은 값을 같은 식으로 낸다(식을 바꿀 때는 logic/calc.js도 같이 고칠 것)."""
+    해서, 화면이 보여주는 것과 같은 값을 같은 식으로 낸다(식을 바꿀 때는 core.js도 같이 고칠 것)."""
 
     basis_year: int
     basis_month: int

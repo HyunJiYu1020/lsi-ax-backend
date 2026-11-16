@@ -4,7 +4,7 @@
 `_TOT_TREE` · `_LABOR_TREE` 상수였고, 집계 엔드포인트가 그 밑줄 이름을 직접 import해서 썼다
 (PLAN.md P1-1).
 
-여기 식은 프런트(core.js의 ovAgg · ovCPc · ovCustExtra, calc.js의 같은 이름)와 맞춰야 한다 —
+여기 식은 프런트(core.js의 ovAgg · ovCPc · ovCustExtra)와 맞춰야 한다 —
 챗봇이 말하는 금액과 사용자가 보는 표가 어긋나면 안 된다. 어긋남은
 tests/test_formula_crosscheck.py가 세 구현을 실제로 실행해서 잡는다(PLAN.md P1-4).
 """
@@ -94,7 +94,7 @@ def krw_months(
 
 
 # ---------- 17열(월 12 + 분기 4 + 연간 1) ----------
-# 프런트 ov17과 같은 규칙이다(core.js · calc.js). 집계표·증감분석이 모두 이 모양으로 숫자를 본다.
+# 프런트 ov17(core.js)과 같은 규칙이다. 집계표·증감분석이 모두 이 모양으로 숫자를 본다.
 # 어긋나면 화면 숫자 ≠ 챗봇 숫자가 되므로 tests/overseas/test_formula_crosscheck.py가 대조한다.
 
 QUARTER_IX: tuple[tuple[int, ...], ...] = ((0, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11))
@@ -205,8 +205,8 @@ def pl_rows(
     - 인력(hc)은 금액이 아니라 명수다 → 환율을 곱하지 않고, 분기·연간은 **합이 아니라 평균**이다
     - 비율(pct)은 MARK UP(B) ÷ **개발비(매출)(tot)** × 100 → 분모가 없으면 빈칸(0%가 아니다).
       분모가 tot인 근거는 화면이 사용자에게 적어 주는 문장이다 — "합계 화면은 MARK UP ÷
-      개발비(매출) 계산값"(core.js의 집계표 안내). React(calc.js)는 분모를 A로 쓰고 있어서
-      같은 표에서 다른 비율이 나온다 — 대조 테스트가 그 차이를 잡았다(React 쪽 버그다)
+      개발비(매출) 계산값"(core.js의 집계표 안내). 지금 쓰지 않는 React(calc.js)는 분모를 A로
+      쓰고 있다 — 되살릴 때 먼저 고쳐야 한다(PLAN.md 질문 2)
     - 그 외는 리프를 더해 17칸으로 접는다
     """
     if mode not in ("usd", "krw"):

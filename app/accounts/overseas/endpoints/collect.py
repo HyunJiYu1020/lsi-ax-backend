@@ -474,8 +474,8 @@ def save_reason_rows(body: ReasonRowsIn, db: Session = Depends(get_db)) -> dict[
 
 # ---------- 인건비 증감의 원인: 인원 효과 vs 단가 효과 ----------
 # 화면(분석 › 증감분석 › 계정별 증감분석 › 계정별 상세)의 인건비 행 아래 줄과 같은 계산이다.
-# frontend-html/shared/core.js의 ovLaborSplit / frontend/src/logic/calc.js의 ovLaborSplit와 같은 식을
-# 쓴다 — 챗봇이 말하는 금액과 사용자가 보는 표가 어긋나면 안 되므로 식을 바꿀 때 세 곳을 같이 고칠 것.
+# frontend-html/shared/core.js의 ovLaborSplit와 같은 식을 쓴다 — 챗봇이 말하는 금액과 사용자가
+# 보는 표가 어긋나면 안 되므로 식을 바꿀 때 두 곳을 같이 고칠 것.
 _LABOR_LEAVES = tuple(resolve_leaves("labor"))
 
 

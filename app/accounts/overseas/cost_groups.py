@@ -20,6 +20,8 @@ CATEGORY_LABELS: dict[str, str] = {
     "gen": "일반운영비", "mgr": "통제성경비", "itx": "IT 관련 비용", "eda": "EDA Tool",
     "emu": "Emulator", "swl": "SW/License구매", "svr": "SVR/Storage임대", "itoth": "IT 기타",
     "outs": "외주용역비", "A": "개발비", "tot": "개발비(매출)", "labor": "인건비", "B": "MARK UP",
+    # 계정이 아니라 "MARK UP ÷ 개발비(매출)" 비율 행이라 이름이 기호다(프런트 OV_EL과 같게).
+    "pct": "(%)",
 }
 
 # 업로드 파일은 영문 양식으로 온다 — 행 이름을 맞출 때(app/core/row_match.py) 한글명만으로는
@@ -39,7 +41,7 @@ CATEGORY_LABELS_EN: dict[str, str] = {
     "misc": "Misc.", "tax": "Taxes and Duties", "nonop": "Non-operational", "B": "Margin (B)",
     "itx": "IT Expenses", "eda": "EDA Tool", "emu": "Emulator", "swl": "SW/License Purchase",
     "svr": "Rent for SVR/Storage", "itoth": "Other IT Expenses",
-    "outs": "Outsourcing Expense(Only for R&D)",
+    "outs": "Outsourcing Expense(Only for R&D)", "pct": "(%)",
 }
 
 # 그리드의 "구분"에 보이는 집계 행(개발비(A) 등)은 그 자체로 저장된 값이 아니라 리프 여러 개를
@@ -132,7 +134,7 @@ VARIANCE_ROWS: tuple[tuple[str, int, str], ...] = (
 
 
 # 집계 화면 ① 전체 계정 표의 행 구성 — (key, 들여쓰기, 단위, 참고행인지).
-# 프런트 OV_EL과 1:1로 맞춰야 한다(core.js · calc.js). VARIANCE_ROWS(증감분석 표)와 달리
+# 프런트 OV_EL과 1:1로 맞춰야 한다(core.js). VARIANCE_ROWS(증감분석 표)와 달리
 # "참고 행"(memo)을 포함한다 — IT 관련 비용 분해와 외주용역비는 개발비 합계에 들어가지 않고
 # 따로 보여주는 값이다(그래서 resolve_leaves("tot")에도 없다).
 # 라벨은 CATEGORY_LABELS / CATEGORY_LABELS_EN에서 가져온다 — 이름을 두 번 적지 않기 위함이다.

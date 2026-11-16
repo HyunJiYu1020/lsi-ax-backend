@@ -416,7 +416,7 @@ def variance_cells(
     base_fx: tuple[int, int, str],
     split_fx: bool,
 ) -> dict[str, dict[str, float]]:
-    """계정 키 → {cur, base, fx_local, fx_usd, fx_outside} (원). 화면 logic/calc.js의 ovAnaEl과 같은 식.
+    """계정 키 → {cur, base, fx_local, fx_usd, fx_outside} (원). 화면 core.js의 ovAnaEl과 같은 식.
 
     환차 분해(현지통화 연구소):
       현지금액 L = K$ × (현지/$)
@@ -492,7 +492,7 @@ def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
             base = (b["base"] / a["base"] * 100) if a["base"] else 0.0
             rows.append(
                 VarianceRow(
-                    category_key=key, label="(%)", label_en="(%)", level=level, unit="pct",
+                    category_key=key, label=CATEGORY_LABELS[key], label_en=CATEGORY_LABELS_EN[key], level=level, unit="pct",
                     base=base, cur=cur, diff=cur - base,
                 )
             )
