@@ -28,7 +28,10 @@ class Account(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     key: Mapped[str] = mapped_column(
-        String(32), unique=True, index=True, comment="계정 코드 (overseas, dep, outsource 등). 프론트 라우팅에 쓰임"
+        # unique=True만 둔다 — Postgres는 유니크 제약에 인덱스를 딸려 만들므로 index=True는 중복이고,
+        # 둘을 같이 주면 SQLAlchemy가 제약 대신 유니크 "인덱스"를 선언해 DB(제약)와 어긋난다
+        # (alembic이 매번 제약을 지우고 인덱스를 만드는 diff를 냈다).
+        String(32), unique=True, comment="계정 코드 (overseas, dep, outsource 등). 프론트 라우팅에 쓰임"
     )
     name: Mapped[str] = mapped_column(String(100), comment="계정명 (한글)")
     data_type: Mapped[str] = mapped_column(

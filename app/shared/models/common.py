@@ -5,6 +5,7 @@ scope_key는 계정 안의 행 단위 식별자(해외연구소는 연구소 pk)
 from datetime import datetime
 
 from sqlalchemy import (
+    Index,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -66,6 +67,16 @@ class CostEntry(Base):
         UniqueConstraint("account_code", "scope_code", "category_code", "yyyymm", "version"),
         CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_cost_entries_yyyymm_format"),
         CheckConstraint("version IN ('forecast', 'actual')", name="ck_cost_entries_version"),
+        # 읽기 핫패스 인덱스(마이그레이션 f2b7c9d14e08). 위 UNIQUE는 (account_code, scope_code, ...)
+        # 순서라 selectivity가 거의 없는 account_code만 걸러지고 version·yyyymm은 못 쓴다 —
+        # /overseas/state와 list_cost_entries가 쓰는 조합으로 따로 둔다.
+        Index("ix_cost_entries_account_version_yyyymm", "account_code", "version", "yyyymm"),
+        # 사용자가 추가한 행(label IS NOT NULL)만 담는 부분 인덱스 — 전체의 1% 미만이라 아주 작다.
+        # 상태 조립의 custom_keys · 추가 행 조회 · 비용항목 검증이 모두 이 조건을 쓴다.
+        Index(
+            "ix_cost_entries_custom_rows", "account_code", "scope_code", "category_code",
+            postgresql_where=text("label IS NOT NULL"),
+        ),
         {"comment": "계정×행×비용항목×편성시점 헤더. 실제 월별 금액은 cost_entry_details 참조. 19개 계정이 공유."},
     )
 
@@ -153,7 +164,16 @@ class Upload(Base):
     """업로드 이력 (계정×행×버전별로 받은 파일명·시각)."""
 
     __tablename__ = "uploads"
-    __table_args__ = {"comment": "계정×행×버전별 업로드 이력. 19개 계정이 공유."}
+    __table_args__ = (
+        # 읽기 핫패스 인덱스(마이그레이션 f2b7c9d14e08). PK 말고 인덱스가 없었다 — 지울 일 없이
+        # 계속 쌓이는 이력 테이블이라, (version, scope_key)별 최신 1건을 뽑는 DISTINCT ON 쿼리가
+        # 쌓인 만큼 정렬 비용을 그대로 떠안았다.
+        Index(
+            "ix_uploads_account_version_scope_recent",
+            "account_key", "version", "scope_key", "uploaded_at",
+        ),
+        {"comment": "계정×행×버전별 업로드 이력. 19개 계정이 공유."},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
