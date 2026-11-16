@@ -313,7 +313,22 @@ services 1,895줄 + core 65줄로 빠져나왔다.
 - 4b: 한 사이클 검증 후 `overseas_actual_stages` 쓰기 중단·테이블 drop
 - 롤백: 4a는 읽기 스위치 원복, 4b 이전엔 데이터 양쪽에 존재
 
-**Phase 5 — PUT /state 점진 분해 (D2-B 2단계, 풀스택)**
+**Phase 5 — PUT /state 점진 분해 (D2-B 2단계, 풀스택)** — ✅ 2026-11-16 완료
+
+- 전용 저장 API 3개: `PUT /overseas/vendor-rows`(연구소×버전 교체) · `/cp-rows`(연도 교체) ·
+  `/reason-rows`(키별 upsert 누적). 각각 `services/overseas/{vendor,cp,reason_rows}.py`
+- **`PUT /state`와 전용 API가 같은 서비스 함수를 부른다** — 쓰기 규칙이 두 벌이 되면 P1-3의
+  "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다. 그래서 두 경로 병행이 안전하고, 도메인마다
+  `test_matches_the_bulk_state_path`로 결과가 같은지 확인한다
+- 프런트: `OV_SPLIT_SAVE` 플래그. true면 업로드 시점에 전용 API로 보내고 일괄 페이로드에서 뺀다.
+  false 한 줄로 옛 동작 복귀(롤백 조건 충족). 조립은 `ovReasonPayload`·`ovVendorPayload`·
+  `ovCpPayload`로 분리해 두 경로가 같은 조립을 쓴다
+- 부수 수확: 증감사유 upsert가 `uploaded_at`을 갱신하지 않아 `state_token`이 내용 변경을 놓치던
+  **Phase 2의 보호 구멍**을 테스트가 잡아 고쳤다
+
+`PUT /state`에 남은 쓰기: 비용 값 그리드 · 실적 스냅샷 · 업로드 이력 · 메모 · 진행 단계.
+PLAN의 최종 목표("값 그리드 저장만")에는 업로드 이력·메모·진행 단계를 더 떼어내면 도달하지만,
+그 셋은 "단위 교체"가 아니라 성격이 섞여 있어 분리 이득이 작다 — 필요해질 때 하면 된다.
 - 외주용역 → CP → 증감사유 순으로 전용 저장 API로 이관(각각 독립 배포), 프런트 저장 버튼이 바뀐 도메인만 호출하도록 수정
 - 최종: `/overseas/state`는 GET 전용(화면 초기 로드) + 값 그리드 저장만 담당
 - 롤백: 도메인별 플래그로 구(일괄)·신(개별) 경로 병행 유지 후 전환
