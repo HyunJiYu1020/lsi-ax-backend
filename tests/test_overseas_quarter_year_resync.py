@@ -13,9 +13,9 @@ Phase 1-4에서 쓰기 경로를 services/overseas/entries.py로 모으면서 �
 import pytest
 from sqlalchemy import select
 
-from app.models import CostEntry, CostEntryDetail
-from app.services.overseas.entries import bulk_upsert_cost_entries, resync_summaries
-from app.services.overseas.labs import ACCOUNT_KEY
+from app.shared.models.common import CostEntry, CostEntryDetail
+from app.accounts.overseas.services.entries import bulk_upsert_cost_entries, resync_summaries
+from app.accounts.overseas.services.labs import ACCOUNT_KEY
 
 # 실제 데이터와 겹치지 않는 미래 연월
 YYYYMM = "209912"
@@ -122,7 +122,7 @@ def test_resync_with_no_targets_is_noop(db):
 
 def test_state_save_path_also_resyncs(db):
     """PUT /overseas/state로 저장해도 분기·연간이 따라온다 — P1-3이 지적한 바로 그 경로다."""
-    from app.api.v1.endpoints.overseas import get_overseas_state, save_overseas_state
+    from app.accounts.overseas.endpoints.collect import get_overseas_state, save_overseas_state
 
     state = get_overseas_state(basis_year=2026, db=db)
     if not state.basis_month or not state.V["cur"].d:

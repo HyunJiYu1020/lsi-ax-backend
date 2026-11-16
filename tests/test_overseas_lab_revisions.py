@@ -6,10 +6,10 @@
 
 import pytest
 
-from app.services.overseas.labs import lab_views
+from app.accounts.overseas.services.labs import lab_views
 
-from app.api.v1.endpoints.overseas import upsert_lab
-from app.schemas.overseas import LabIn
+from app.accounts.overseas.endpoints.collect import upsert_lab
+from app.accounts.overseas.schemas import LabIn
 
 CODE = "ZZTEST"  # 실제 연구소와 안 겹치는 테스트 전용 코드
 

@@ -5,9 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.v1.router import api_router
-from app.core.config import settings
+from app.shared.core.config import settings
 from app.db.session import SessionLocal
-from app.models import ErrorLog
+from app.shared.models.system import ErrorLog
 
 app = FastAPI(title=settings.app_name)
 

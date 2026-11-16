@@ -16,12 +16,12 @@
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints import overseas_variance as ov
-from app.services.overseas import variance as varsvc
-from app.api.v1.endpoints.overseas import LabView
-from app.models import CloseAccountStage
-from app.services.overseas.entries import current_basis_month
-from app.schemas.overseas import (
+from app.accounts.overseas.endpoints import variance as ov
+from app.accounts.overseas.services import variance as varsvc
+from app.accounts.overseas.endpoints.collect import LabView
+from app.shared.models.close import CloseAccountStage
+from app.accounts.overseas.services.entries import current_basis_month
+from app.accounts.overseas.schemas import (
     ActualFirstIn,
     ActualStageIn,
     VarianceDriverFactor,
@@ -404,7 +404,7 @@ def test_first_lock_blocks_writes_until_released(db):
 def test_first_lock_does_not_touch_version_status(db):
     """1차 고정은 버전 확정과 다른 층의 결정이다 — 2차 작업이 남아 있으므로 버전 status는 그대로여야
     한다(사양: status 영향 없음)."""
-    from app.models import Version
+    from app.shared.models.version import Version
 
     before = [
         (v.year, v.month, v.kind, v.status)

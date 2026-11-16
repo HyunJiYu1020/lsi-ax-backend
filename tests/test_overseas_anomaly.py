@@ -8,10 +8,10 @@
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints import overseas as ov
-from app.core import anomaly
-from app.core.cost_groups import GROUP_CALC, category_label, resolve_leaves
-from app.schemas.overseas import AnomalyRuleIn, AnomalyScanIn
+from app.accounts.overseas.endpoints import collect as ov
+from app.shared.core import anomaly
+from app.accounts.overseas.cost_groups import GROUP_CALC, category_label, resolve_leaves
+from app.accounts.overseas.schemas import AnomalyRuleIn, AnomalyScanIn
 
 YM, BASE_YM, VER = "209901", "209812", "forecast"
 

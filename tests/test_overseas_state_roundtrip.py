@@ -13,8 +13,8 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.v1.endpoints.overseas import yyyymm, get_overseas_state, save_overseas_state
-from app.models.common import CostEntry, CostEntryDetail
+from app.accounts.overseas.endpoints.collect import yyyymm, get_overseas_state, save_overseas_state
+from app.shared.models.common import CostEntry, CostEntryDetail
 
 BASIS_YEAR = 2026
 VERSIONS = ("cur", "prev", "prior", "plan")
@@ -311,7 +311,7 @@ def test_put_rejects_unknown_lab_pk(db, state):
 def test_put_rejects_unknown_lab_code_in_reason(db, state):
     """증감사유·외주용역의 연구소 코드도 같이 검증한다(overseas.py:838-847). 이쪽은 파트 없는
     연구소 코드(lab_code)라 V의 pk와 검증 대상이 다르다."""
-    from app.schemas.overseas import ReasonRow
+    from app.accounts.overseas.schemas import ReasonRow
 
     state.reason.append(ReasonRow(lab_code="NOPE", version="cur", category_key="sal", block="y"))
 

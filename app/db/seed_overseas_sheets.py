@@ -20,16 +20,10 @@ from sqlalchemy import delete, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.core.cost_groups import GROUP_CALC
+from app.accounts.overseas.cost_groups import GROUP_CALC
 from app.db.session import SessionLocal
-from app.models import (
-    CostEntry,
-    CostEntryDetail,
-    OverseasLab,
-    OverseasReasonRow,
-    OverseasVendorRow,
-    OverseasVendorRowDetail,
-)
+from app.accounts.overseas.models import OverseasLab, OverseasReasonRow, OverseasVendorRow, OverseasVendorRowDetail
+from app.shared.models.common import CostEntry, CostEntryDetail
 
 ACCOUNT_KEY = "overseas"
 

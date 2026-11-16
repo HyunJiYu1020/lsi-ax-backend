@@ -8,7 +8,7 @@
 DB가 필요 없는 순수 로직이라 conftest의 db 픽스처를 쓰지 않는다.
 """
 
-from app.core.voucher_match import (
+from app.shared.core.voucher_match import (
     HIGH,
     LOW,
     MID,

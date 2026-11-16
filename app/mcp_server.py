@@ -11,12 +11,7 @@ from typing import Any
 import httpx
 from mcp.server.mcpserver import MCPServer
 
-from app.core.cost_groups import (  # noqa: F401  (CATEGORY_LABELS는 chat.py가 여기서 import해 쓴다)
-    CATEGORY_LABELS,
-    COST_GROUP_DEFS,
-    GROUP_CALC,
-    resolve_leaves,
-)
+from app.accounts.overseas.cost_groups import CATEGORY_LABELS, COST_GROUP_DEFS, GROUP_CALC, resolve_leaves
 
 API_BASE = os.environ.get("SLSI_API_BASE", "http://localhost:8000/api/v1")
 

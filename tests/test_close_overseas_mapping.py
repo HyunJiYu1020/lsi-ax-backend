@@ -10,17 +10,9 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.v1.endpoints import overseas_close as cl
-from app.models import CloseAccountStage, CloseMatchRule, CloseVoucher, CloseVoucherMap
-from app.schemas.close import (
-    DeptRule,
-    MapEdit,
-    MapEditIn,
-    MatchRuleIn,
-    StageIn,
-    VoucherIngestIn,
-    VoucherLine,
-)
+from app.accounts.overseas.endpoints import close as cl
+from app.shared.models.close import CloseAccountStage, CloseMatchRule, CloseVoucher, CloseVoucherMap
+from app.shared.schemas.close import DeptRule, MapEdit, MapEditIn, MatchRuleIn, StageIn, VoucherIngestIn, VoucherLine
 
 YEAR, MONTH = 2026, 9
 OV_CODE = "53840100"  # 해외연구소 비용계정 (테스트 안에서만 쓰는 기준정보)

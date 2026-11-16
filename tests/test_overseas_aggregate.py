@@ -1,7 +1,7 @@
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints.overseas_aggregate import check_overseas_confirm, get_cp_contract, get_labor_ratio
+from app.accounts.overseas.endpoints.aggregate import check_overseas_confirm, get_cp_contract, get_labor_ratio
 
 BASIS_YEAR = 2026
 

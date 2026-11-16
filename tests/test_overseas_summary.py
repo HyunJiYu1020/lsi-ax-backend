@@ -1,8 +1,8 @@
 import pytest
-from app.services.overseas.aggregate import cp_quarter_amounts
+from app.accounts.overseas.services.aggregate import cp_quarter_amounts
 from fastapi import HTTPException
 
-from app.api.v1.endpoints.overseas import get_overseas_summary
+from app.accounts.overseas.endpoints.collect import get_overseas_summary
 
 BASIS_YEAR = 2026
 

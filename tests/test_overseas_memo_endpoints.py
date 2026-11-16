@@ -1,15 +1,15 @@
 import pytest
 from sqlalchemy import delete
 
-from app.api.v1.endpoints.overseas import (
+from app.accounts.overseas.endpoints.collect import (
     delete_memo_col,
     list_memo_cols,
     list_memos,
     upsert_memo,
     upsert_memo_col,
 )
-from app.models import Memo, MemoCol
-from app.schemas.overseas import MemoColIn, MemoIn
+from app.shared.models.common import Memo, MemoCol
+from app.accounts.overseas.schemas import MemoColIn, MemoIn
 
 # 실제 데이터와 안 겹치는 가짜 열 키로 테스트한다.
 # 이 엔드포인트들은 (화면 라우트와 동일하게) 내부에서 db.commit()을 호출하므로 conftest의 db

@@ -1,8 +1,8 @@
 from sqlalchemy import select
 
-from app.api.v1.endpoints.fx import FxAppliedRow, _write_applied_rows
-from app.services.fx_rates import FxRateCache, compute_applied_rows
-from app.models import FxAppliedRate, FxRate
+from app.shared.endpoints.fx import FxAppliedRow, _write_applied_rows
+from app.shared.services.fx_rates import FxRateCache, compute_applied_rows
+from app.shared.models.fx import FxAppliedRate, FxRate
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연도를 써서 테스트한다.
 TEST_YEAR = 2099

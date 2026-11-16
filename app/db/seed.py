@@ -7,9 +7,11 @@
 
 from sqlalchemy.orm import Session
 
-from app.core.enums import AccountStatus, CodeGroup, OverseasSheetType, VersionStatus
+from app.shared.core.enums import AccountStatus, CodeGroup, OverseasSheetType, VersionStatus
 from app.db.session import SessionLocal
-from app.models import Account, AccountProgress, AccountStep, CommonCode, CommonCodeGroup, OverseasLab, OverseasLabSheet
+from app.accounts.overseas.models import OverseasLab, OverseasLabSheet
+from app.shared.models.account import Account, AccountProgress, AccountStep
+from app.shared.models.system import CommonCode, CommonCodeGroup
 
 # 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order, currency)
 # — 프론트 OV_LABS와 동일.

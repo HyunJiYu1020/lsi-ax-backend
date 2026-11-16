@@ -10,9 +10,9 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints import overseas as ov
-from app.core.reason_translate import MAX_TEXTS, _parse, normalize
-from app.schemas.overseas import ReasonTranslateIn
+from app.accounts.overseas.endpoints import collect as ov
+from app.shared.core.reason_translate import MAX_TEXTS, _parse, normalize
+from app.accounts.overseas.schemas import ReasonTranslateIn
 
 EN = "higher basic salary from new hires"
 

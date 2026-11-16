@@ -8,9 +8,9 @@
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints import overseas as ov
-from app.core import row_match
-from app.schemas.overseas import RowAliasIn, RowMatchIn
+from app.accounts.overseas.endpoints import collect as ov
+from app.shared.core import row_match
+from app.accounts.overseas.schemas import RowAliasIn, RowMatchIn
 
 YYYYMM = "202609"
 

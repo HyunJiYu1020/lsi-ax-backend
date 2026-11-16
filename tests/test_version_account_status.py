@@ -9,9 +9,9 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.v1.endpoints.version import list_version_accounts, update_version_account
-from app.models import Version
-from app.schemas.version import VersionAccountStatusUpdate as Upd
+from app.shared.endpoints.version import list_version_accounts, update_version_account
+from app.shared.models.version import Version
+from app.shared.schemas.version import VersionAccountStatusUpdate as Upd
 
 KIND = "forecast"
 

@@ -8,13 +8,8 @@ conftest의 db 픽스처가 끝나면 롤백하므로, 엔드포인트 함수에
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints.account import (
-    get_account,
-    list_accounts,
-    update_account,
-    update_account_step,
-)
-from app.schemas.account import AccountStepUpdate, AccountUpdate
+from app.shared.endpoints.account import get_account, list_accounts, update_account, update_account_step
+from app.shared.schemas.account import AccountStepUpdate, AccountUpdate
 
 
 def test_list_accounts_returns_all_seeded_accounts(db):

@@ -1,14 +1,11 @@
 from sqlalchemy import select
 
-from app.api.v1.endpoints.overseas import (
-    ACCOUNT_KEY,
-    PLAN_NO,
-    _bulk_upsert_notes,
-    _bulk_upsert_reason_rows,
-)
-from app.models import CostEntry, CostEntryDetail, ManagementPlanEntry, ManagementPlanEntryDetail, Note, OverseasReasonRow
-from app.services.overseas.entries import bulk_upsert_cost_entries, bulk_upsert_plan_entries
-from app.schemas.overseas import ReasonRow
+from app.accounts.overseas.endpoints.collect import ACCOUNT_KEY, PLAN_NO, _bulk_upsert_notes, _bulk_upsert_reason_rows
+from app.accounts.overseas.models import OverseasReasonRow
+from app.shared.models.common import CostEntry, CostEntryDetail, Note
+from app.shared.models.plan import ManagementPlanEntry, ManagementPlanEntryDetail
+from app.accounts.overseas.services.entries import bulk_upsert_cost_entries, bulk_upsert_plan_entries
+from app.accounts.overseas.schemas import ReasonRow
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연월/연도를 키로 써서 테스트한다.
 TEST_YM = "209901"

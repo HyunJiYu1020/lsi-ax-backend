@@ -8,8 +8,8 @@
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.endpoints import overseas as ov
-from app.schemas.overseas import CarryDefIn, CarryForwardIn, ExtraRowIn
+from app.accounts.overseas.endpoints import collect as ov
+from app.accounts.overseas.schemas import CarryDefIn, CarryForwardIn, ExtraRowIn
 
 FROM_YM, TO_YM, VER = "209901", "209902", "forecast"
 
