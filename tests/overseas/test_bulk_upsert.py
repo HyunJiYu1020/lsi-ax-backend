@@ -1,6 +1,7 @@
 from sqlalchemy import select
 
-from app.accounts.overseas.endpoints.collect import ACCOUNT_KEY, PLAN_NO, _bulk_upsert_notes, _bulk_upsert_reason_rows
+from app.accounts.overseas.endpoints.collect import ACCOUNT_KEY, PLAN_NO, _bulk_upsert_notes
+from app.accounts.overseas.services.reason_rows import upsert_reason_rows
 from app.accounts.overseas.models import OverseasReasonRow
 from app.shared.models.common import CostEntry, CostEntryDetail, Note
 from app.shared.models.plan import ManagementPlanEntry, ManagementPlanEntryDetail
@@ -184,7 +185,7 @@ def test_bulk_upsert_reason_rows(db):
             source_file="",
         )
     ]
-    _bulk_upsert_reason_rows(db, reasons)
+    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons})
     db.flush()
 
     row = db.scalar(

@@ -98,6 +98,17 @@ class CpRow(BaseModel):
     source_file: str = ""
 
 
+class ReasonRowsIn(BaseModel):
+    """증감사유 전용 저장 요청(PUT /overseas/reason-rows). PLAN.md Phase 5.
+
+    외주용역·CP와 달리 **전체 교체가 아니라 보낸 것만 누적 반영**이다 — 연구소 회신을 항목별로
+    쌓아 가는 자료라, 한 시트를 올렸을 때 다른 항목의 사유가 사라지면 안 된다.
+    """
+
+    rows: list[ReasonRow]
+    state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
+
+
 class CpRowsIn(BaseModel):
     """CP 계약 전용 저장 요청(PUT /overseas/cp-rows). PLAN.md Phase 5.
 

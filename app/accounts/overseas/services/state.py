@@ -307,6 +307,14 @@ def build_state(db: Session, basis_year: int) -> OverseasState:
 #
 # max(타임스탬프)만 쓰지 않고 count(*)도 섞는 이유: 외주용역·CP는 "단위 교체"(delete+insert)라
 # 행을 지우기만 하면 max는 그대로일 수 있다. 개수가 같이 들어가면 그 경우도 지문이 바뀐다.
+#
+# 타임스탬프가 내용 변경을 따라와야 한다: 증감사유는 upsert라 같은 키를 고쳐도 행 수가 안 변하는데,
+# uploaded_at까지 그대로면 지문이 변화를 놓쳐 나중 저장이 조용히 덮어쓴다. 그래서 그 upsert는
+# uploaded_at을 같이 갱신한다(services/reason_rows.py) — 테스트가 실제로 이 구멍을 잡았다.
+#
+# 한계: Postgres의 now()는 트랜잭션 시작 시각이라 **한 트랜잭션 안에서 두 번 저장하면** 지문이
+# 같다. HTTP 요청마다 트랜잭션이 하나씩이라 운영에서는 문제가 없지만(요청별 now()는 마이크로초
+# 단위로 다르다), 한 요청 안에서 두 번 쓰고 그 사이 지문을 비교하는 코드를 쓰면 안 된다.
 _TOKEN_PARTS: tuple[tuple[str, str], str] = (
     ("cost_entries", "updated_at", "account_code = :acct"),
     ("management_plan_entries", "updated_at", "account_code = :acct"),

@@ -70,6 +70,7 @@ from app.accounts.overseas.services.extra_rows import (
 )
 from app.accounts.overseas.services.state import build_state, latest_uploads_stmt, state_token
 from app.accounts.overseas.services.cp import replace_cp_rows
+from app.accounts.overseas.services.reason_rows import upsert_reason_rows
 from app.accounts.overseas.services.vendor import replace_vendor_rows
 from app.accounts.overseas.services.labs import (
     ACCOUNT_KEY,
@@ -85,6 +86,7 @@ from app.accounts.overseas.services.labs import (
 from app.shared.core.enums import CodeGroup
 from app.accounts.overseas.schemas import (
     CpRowsIn,
+    ReasonRowsIn,
     VendorRowsIn,
     ActualSnapshot,
     LaborSplitLab,
@@ -358,11 +360,9 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
             note_rows.append((base_version, period, scope, category_key, text))
     _bulk_upsert_notes(db, note_rows)
 
-    # 4-1) 증감사유 (연구소코드×버전×항목×구간 키로 upsert — cost처럼 보낸 것만 누적 반영)
-    unknown_reason_codes = {r.lab_code for r in state.reason if r.lab_code not in lab_codes}
-    if unknown_reason_codes:
-        raise HTTPException(status_code=400, detail=f"알 수 없는 연구소 코드(증감사유): {sorted(unknown_reason_codes)}")
-    _bulk_upsert_reason_rows(db, state.reason)
+    # 4-1) 증감사유 — 전용 저장 API(PUT /overseas/reason-rows)와 **같은 함수**를 부른다.
+    # 외주용역·CP와 달리 전체 교체가 아니라 보낸 것만 누적 반영이다(연구소 회신을 쌓아 가는 자료).
+    upsert_reason_rows(db, state.reason, lab_codes)
 
     # 4-2) 외주용역 상세 — 전용 저장 API(PUT /overseas/vendor-rows)와 **같은 함수**를 부른다.
     # 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서 겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다.
@@ -443,6 +443,31 @@ def save_cp_rows(body: CpRowsIn, db: Session = Depends(get_db)) -> dict[str, obj
         db.rollback()
         raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
     return {"status": "ok", "replaced": replaced, "state_token": state_token(db)}
+
+
+@router.put("/overseas/reason-rows")
+def save_reason_rows(body: ReasonRowsIn, db: Session = Depends(get_db)) -> dict[str, object]:
+    """증감사유 업로드 시트만 저장한다 — 보낸 것만 누적 반영(전체 교체가 아니다).
+
+    `PUT /overseas/state`와 같은 서비스 함수를 부른다(PLAN.md Phase 5).
+    """
+    if body.state_token and body.state_token != state_token(db):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                "화면을 다시 불러온 뒤 다시 올려 주세요."
+            ),
+        )
+    lab_codes = {lab.lab_code for lab in all_labs(db)}
+    saved = upsert_reason_rows(db, body.rows, lab_codes)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
+    return {"status": "ok", "saved": saved, "state_token": state_token(db)}
+
 
 
 
@@ -2365,32 +2390,6 @@ def _bulk_upsert_notes(db: Session, rows: list[tuple[str, str, str, str, str]]) 
     db.execute(stmt)
 
 
-def _bulk_upsert_reason_rows(db: Session, reason_rows: list[ReasonRow]) -> None:
-    dedup: dict[tuple[str, str, str, str], ReasonRow] = {
-        (r.lab_code, r.version, r.category_key, r.block): r for r in reason_rows
-    }
-    if not dedup:
-        return
-    set_cols = (
-        "mon_label", "plan_value", "prev_value", "cur_value", "diff_plan", "diff_prev",
-        "remark_plan", "remark_prev", "prev_label", "cur_label", "source_file",
-    )
-    stmt = pg_insert(OverseasReasonRow).values(
-        [
-            {
-                "lab_code": r.lab_code, "version": r.version, "category_key": r.category_key, "block": r.block,
-                "mon_label": r.mon_label, "plan_value": r.plan_value, "prev_value": r.prev_value, "cur_value": r.cur_value,
-                "diff_plan": r.diff_plan, "diff_prev": r.diff_prev, "remark_plan": r.remark_plan, "remark_prev": r.remark_prev,
-                "prev_label": r.prev_label, "cur_label": r.cur_label, "source_file": r.source_file,
-            }
-            for r in dedup.values()
-        ]
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["lab_code", "version", "category_key", "block"],
-        set_={k: getattr(stmt.excluded, k) for k in set_cols},
-    )
-    db.execute(stmt)
 
 
 @router.get("/overseas/extra-rows", response_model=list[ExtraRowOut])
