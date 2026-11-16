@@ -21,7 +21,7 @@ import pytest
 from app.accounts.overseas.endpoints.collect import yyyymm, get_labor_split, get_overseas_state
 from app.accounts.overseas.services.labs import lab_views
 from app.accounts.overseas.services.entries import current_basis_month
-from app.accounts.overseas.services.aggregate import group_tree, krw_months
+from app.accounts.overseas.services.aggregate import group_tree, krw_months, to_17
 from app.accounts.overseas.cost_groups import GROUP_CALC, resolve_leaves
 from app.accounts.overseas.services.fxcalc import rate_arrays
 
@@ -377,3 +377,62 @@ def test_blank_cell_handling_differs_by_design():
     assert js["core"]["labor"] == [0] * 12, "core.js는 0으로 채운다"
     # 값이 있는 쪽은 둘이 같다.
     assert js["calc"]["misc"] == js["core"]["misc"] == [5] * 12
+
+
+# ---------- ⑤ 17열 집계 (월 12 + 분기 4 + 연간) ----------
+
+_MONTHS_CASES = {
+    "값이 다 있는 경우": [float(m) for m in range(1, 13)],
+    "미등록이 섞인 경우": [1.0, None, 3.0, None, None, None, 7.0, 8.0, None, None, None, None],
+    "0이 섞인 경우": [0.0, 2.0, 0.0, 4.0] + [0.0] * 8,
+    "전부 미등록": [None] * 12,
+}
+
+
+@pytest.mark.parametrize("how", ["sum", "avg", "avgnz"])
+@pytest.mark.parametrize("case", list(_MONTHS_CASES))
+def test_17_column_aggregation_matches_calc_js(how, case):
+    """to_17(백엔드) = ov17(calc.js) — 미등록(None) 여부까지 똑같아야 한다.
+
+    집계표와 증감분석이 모두 이 모양으로 숫자를 본다. 분기·연간을 한 곳만 다르게 집계하면
+    "월 합과 분기 합이 안 맞는" 표가 나오고, 그건 사용자가 바로 알아차린다.
+
+    모드가 셋인 이유가 핵심이다: sum은 있는 값만 더하고, avg는 있는 달로만 평균 내고(미등록을
+    0으로 세면 인원 평균이 실제보다 낮아진다), avgnz는 0까지 빼고 평균 낸다(환율은 0일 수가
+    없으니 0은 "아직 안 넣은 달"이다).
+
+    core.js는 따로 본다 — 미등록을 0으로 채우는 설계 차이가 있다(아래 테스트).
+    """
+    months = _MONTHS_CASES[case]
+    js = run_js("to17", {"months": months, "how": how})
+    backend = to_17(list(months), how)
+
+    assert len(backend) == 17
+    for i in range(17):
+        where = f"{how}/{case}[{i}]" + (" 월" if i < 12 else " 분기" if i < 16 else " 연간")
+        assert (js["calc"][i] is None) == (backend[i] is None), f"미등록 여부가 다르다: {where}"
+        if backend[i] is not None:
+            assert js["calc"][i] == pytest.approx(backend[i]), f"값이 다르다: {where}"
+
+
+@pytest.mark.parametrize("how", ["sum", "avg", "avgnz"])
+@pytest.mark.parametrize("case", list(_MONTHS_CASES))
+def test_17_column_core_js_fills_blanks_with_zero(how, case):
+    """core.js의 ov17은 미등록을 0으로 채운다 — 값이 있는 칸은 백엔드와 같아야 한다.
+
+    이 차이는 결함이 아니라 설계 차이다(core.js는 num()으로 null을 0으로 바꿔 읽는다,
+    test_blank_cell_handling_differs_by_design 참조). 여기서 고정하는 건 **값이 있는 칸은
+    세 구현이 같다**는 것과, 차이가 "미등록을 0으로 본다"는 그 한 가지뿐이라는 점이다.
+    Phase 6에서 백엔드가 유일한 계산자가 되면 이 차이도 사라진다.
+    """
+    months = _MONTHS_CASES[case]
+    js = run_js("to17", {"months": months, "how": how})
+    backend = to_17(list(months), how)
+
+    for i in range(17):
+        where = f"{how}/{case}[{i}]"
+        if backend[i] is not None:
+            assert js["core"][i] == pytest.approx(backend[i]), f"값이 있는 칸이 다르다: {where}"
+        else:
+            # 백엔드가 미등록이라고 본 칸 → core.js는 0을 준다(그 외 값이면 설계 차이가 아니다)
+            assert js["core"][i] in (0, 0.0, None), f"미등록 칸에 0이 아닌 값이 있다: {where} = {js['core'][i]!r}"

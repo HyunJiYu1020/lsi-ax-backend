@@ -133,6 +133,12 @@ const CASES = {
     return { core: run(core), calc: run(calc) };
   },
 
+  // ov17: 12개월 → 17칸(월 12 + 분기 4 + 연간). 백엔드 to_17과 짝이다.
+  // 미등록(null)과 0을 가르는 규칙이 셋(sum·avg·avgnz) 다 달라서 모드별로 비교한다.
+  to17({ months, how }, core, calc) {
+    return { core: core.ov17(months, how), calc: calc.ov17(months, how) };
+  },
+
   // 집계 그룹 정의 자체(어느 행이 어느 하위를 더하는가). 백엔드 cost_groups.GROUP_CALC와 짝이다.
   group_defs(_input, core, calc) {
     const defs = (impl) => Object.fromEntries(impl.OV_EL.filter((e) => e.calc).map((e) => [e.k, e.calc]));

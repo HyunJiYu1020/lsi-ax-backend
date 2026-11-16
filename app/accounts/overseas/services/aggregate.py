@@ -85,3 +85,40 @@ def krw_months(
         * 1000
         for j in range(12)
     ]
+
+
+# ---------- 17열(월 12 + 분기 4 + 연간 1) ----------
+# 프런트 ov17과 같은 규칙이다(core.js · calc.js). 집계표·증감분석이 모두 이 모양으로 숫자를 본다.
+# 어긋나면 화면 숫자 ≠ 챗봇 숫자가 되므로 tests/overseas/test_formula_crosscheck.py가 대조한다.
+
+QUARTER_IX: tuple[tuple[int, ...], ...] = ((0, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11))
+YEAR_IX: tuple[int, ...] = tuple(range(12))
+
+
+def to_17(months: list[float | None], how: str = "sum") -> list[float | None]:
+    """12개월 → 17칸(월 12 + 분기 4 + 연간). how: sum | avg | avgnz.
+
+    미등록(None)과 0을 가른다 — 공통 RULE(빈칸 처리). 그래서 집계 방식이 셋이다:
+    - sum   : 있는 값만 더한다. 전부 미등록이면 결과도 미등록(0이 아니다)
+    - avg   : **있는 달로만** 평균. 미등록 달을 0으로 세면 인원 평균이 실제보다 낮게 나온다
+    - avgnz : 0도 제외하고 평균. 환율처럼 "0일 수가 없는" 값에 쓴다 — 0은 "아직 안 넣은 달"이다
+
+    프런트 ov17과 같은 규칙이어야 한다(그쪽은 null, 여기는 None).
+    """
+    if how not in ("sum", "avg", "avgnz"):
+        raise ValueError(f"how는 sum | avg | avgnz만 쓸 수 있다: {how!r}")
+
+    def agg(ix: tuple[int, ...]) -> float | None:
+        if how == "sum":
+            vals = [months[j] for j in ix if j < len(months) and months[j] is not None]
+            return float(sum(vals)) if vals else None
+        if how == "avg":
+            vals = [months[j] for j in ix if j < len(months) and months[j] is not None]
+        else:  # avgnz — 0도 뺀다
+            vals = [months[j] for j in ix if j < len(months) and months[j]]
+        return float(sum(vals) / len(vals)) if vals else None
+
+    out: list[float | None] = [months[j] if j < len(months) else None for j in range(12)]
+    out.extend(agg(q) for q in QUARTER_IX)
+    out.append(agg(YEAR_IX))
+    return out
