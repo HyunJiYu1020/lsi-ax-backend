@@ -29,13 +29,20 @@ BASIS_YEAR = 2026
 HARNESS = Path(__file__).parent / "js_formula_harness.mjs"
 REPO = Path(__file__).resolve().parents[3]  # tests/overseas/ → backend → S.LSI (프런트가 옆에 있다)
 
-# 프런트 소스나 node가 없는 환경(CI 컨테이너에 백엔드만 올린 경우)에서는 대조할 상대가 없으므로 스킵한다.
+# 대조할 상대가 **있는 만큼** 비교한다. 예전에는 calc.js가 없으면 core.js 대조까지 통째로
+# 스킵했는데, 그러면 React 폴더가 사라진 순간 가드레일 34개가 조용히 꺼지고 테스트는 녹색으로
+# 남는다(실제로 그렇게 됐다). 보호가 꺼진 걸 모르는 게 보호가 없는 것보다 나쁘다.
+HAS_NODE = shutil.which("node") is not None
+HAS_CORE = (REPO / "frontend-html/shared/core.js").exists()   # 목업
+HAS_CALC = (REPO / "frontend/src/logic/calc.js").exists()     # React
+
+# 목업조차 없으면 비교할 게 없다 — 그때만 전체를 스킵한다.
 pytestmark = pytest.mark.skipif(
-    shutil.which("node") is None
-    or not (REPO / "frontend-html/shared/core.js").exists()
-    or not (REPO / "frontend/src/logic/calc.js").exists(),
-    reason="node 또는 프런트 소스(core.js · calc.js)가 없어 대조할 수 없다",
+    not HAS_NODE or not HAS_CORE,
+    reason="node 또는 목업 소스(frontend-html/shared/core.js)가 없어 대조할 수 없다",
 )
+# React만 없을 때 쓰는 표시. 이걸 단 테스트는 calc.js가 필요하다.
+needs_calc = pytest.mark.skipif(not HAS_CALC, reason="React 소스(frontend/src/logic/calc.js)가 없다")
 
 MONTHS = range(12)
 
@@ -52,6 +59,13 @@ def run_js(case: str, inp: dict | None = None, labs: list[dict] | None = None) -
             f"js_formula_harness.mjs를 같이 고칠 것:\n{p.stderr[-3000:]}"
         )
     return json.loads(p.stdout)
+
+
+def calc_of(js: dict):
+    """harness 응답의 calc 쪽. React 소스가 없으면 None이다 — 그 경우 호출부는 목업 대조만 한다.
+    None을 조용히 통과시키지 않고 호출부가 명시적으로 건너뛰게 만드는 게 중요하다(가드레일이
+    꺼진 걸 모르는 게 보호가 없는 것보다 나쁘다)."""
+    return js.get("calc")
 
 
 def z(v: float | None) -> float:
@@ -135,9 +149,11 @@ def test_group_rollup_matches_three_implementations():
         for j in MONTHS:
             backend = sum(PD_USD.get(leaf, [0] * 12)[j] for leaf in leaves)
             assert z(js["core"][k][j]) == pytest.approx(backend), f"core.js ≠ 백엔드: {k}[{j}]"
-            assert z(js["calc"][k][j]) == pytest.approx(backend), f"calc.js ≠ 백엔드: {k}[{j}]"
+            if calc_of(js):
+                assert z(js["calc"][k][j]) == pytest.approx(backend), f"calc.js ≠ 백엔드: {k}[{j}]"
 
 
+@needs_calc
 def test_group_definitions_cover_the_same_keys():
     """GROUP_CALC(백엔드)와 OV_EL의 calc(프런트)가 같은 집계 행을 같은 하위로 정의하는지.
 
@@ -185,12 +201,14 @@ def test_krw_aggregation_matches_three_implementations():
                 backend[j] += months[j] if k != "hc" else months[j] / 1000
         for j in MONTHS:
             assert z(js["core"][k][j]) == pytest.approx(backend[j], rel=1e-9), f"core.js ≠ 백엔드: {k}[{j}]"
-            assert z(js["calc"][k][j]) == pytest.approx(backend[j], rel=1e-9), f"calc.js ≠ 백엔드: {k}[{j}]"
+            if calc_of(js):
+                assert z(js["calc"][k][j]) == pytest.approx(backend[j], rel=1e-9), f"calc.js ≠ 백엔드: {k}[{j}]"
 
 
 # ---------- ② 인건비 분해 (인원 효과 vs 단가 효과) ----------
 
 
+@needs_calc
 def test_labor_split_matches_between_frontends():
     """core.js ovLaborSplit = calc.js ovLaborSplit (고정 입력).
 
@@ -275,7 +293,8 @@ def test_labor_split_matches_backend(db, lab_scope):
     }
     js = run_js("labor_split", inp)
 
-    for impl in ("core", "calc"):
+    # calc(React)는 소스가 없으면 None이다 — 그때는 목업만 대조한다.
+    for impl in [i for i in ("core", "calc") if js.get(i)]:
         got = js[impl]
         assert got["hcC"] == pytest.approx(result.hc_cur, rel=1e-9), f"{impl}: 당월 인원"
         assert got["hcB"] == pytest.approx(result.hc_base, rel=1e-9), f"{impl}: 비교 인원"
@@ -328,6 +347,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
 # ---------- ④ 수식이 쓰는 기준정보 ----------
 
 
+@needs_calc
 def test_lab_currency_tables_agree(db):
     """연구소 → 현지통화 표가 DB · core.js · calc.js에서 같은지.
 
@@ -361,6 +381,7 @@ def test_lab_currency_tables_agree(db):
     assert front_core["TDC"] == front_calc["TDC"] == db_cur["TDC"] == "USD"
 
 
+@needs_calc
 def test_blank_cell_handling_differs_by_design():
     """미등록 칸(빈칸) 처리가 세 구현에서 다르다는 사실을 고정해 둔다.
 
@@ -391,6 +412,7 @@ _MONTHS_CASES = {
 
 @pytest.mark.parametrize("how", ["sum", "avg", "avgnz"])
 @pytest.mark.parametrize("case", list(_MONTHS_CASES))
+@needs_calc
 def test_17_column_aggregation_matches_calc_js(how, case):
     """to_17(백엔드) = ov17(calc.js) — 미등록(None) 여부까지 똑같아야 한다.
 

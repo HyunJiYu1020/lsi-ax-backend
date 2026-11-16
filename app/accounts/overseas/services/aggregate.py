@@ -122,3 +122,40 @@ def to_17(months: list[float | None], how: str = "sum") -> list[float | None]:
     out.extend(agg(q) for q in QUARTER_IX)
     out.append(agg(YEAR_IX))
     return out
+
+
+def agg_months(
+    cats: dict[str, list[float | None]],
+    extra: dict[str, list[float]],
+    tree: set[str],
+    rate: list[float] | None = None,
+) -> list[float | None]:
+    """그 연구소의 월별 집계값. rate를 주면 원화(값 × 환율 × 1000), 안 주면 저장 단위(K$) 그대로.
+
+    krw_months와 같은 계산이지만 **미등록(None)을 보존한다** — 그 달에 아무 리프도 안 올라왔으면
+    0이 아니라 미등록이다(공통 RULE: 빈칸 처리). krw_months는 히어로 카드처럼 "합계만 필요한"
+    자리에서 쓰여 0으로 접어도 됐지만, 집계표는 빈칸과 0원을 구분해 그려야 한다.
+    """
+    leaves = [k for k in tree if k not in GROUP_CALC]
+    out: list[float | None] = []
+    for j in range(12):
+        vals = [cats[leaf][j] for leaf in leaves if leaf in cats and j < len(cats[leaf]) and cats[leaf][j] is not None]
+        extras = [months[j] for key, months in extra.items() if key in tree]
+        if not vals and not extras:
+            out.append(None)  # 그 달에 올라온 게 하나도 없다 → 빈칸
+            continue
+        total = sum(float(v) for v in vals) + sum(extras)
+        out.append(total * rate[j] * 1000 if rate else total)
+    return out
+
+
+def pct_17(numerator: list[float | None], denominator: list[float | None]) -> list[float | None]:
+    """비율 17칸 = 분자 ÷ 분모 × 100. 프런트 ovPct17과 같은 규칙.
+
+    분자가 미등록이거나 분모가 0·미등록이면 비율을 낼 수 없다 — 0%가 아니라 빈칸이다.
+    (0%로 보여주면 "비율이 0"과 "계산할 수 없음"이 구분되지 않는다.)
+    """
+    return [
+        None if (numerator[i] is None or not denominator[i]) else numerator[i] / denominator[i] * 100
+        for i in range(len(numerator))
+    ]

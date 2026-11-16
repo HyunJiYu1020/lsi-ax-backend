@@ -160,8 +160,19 @@ async function main() {
   const fn = CASES[job.case];
   if (!fn) throw new Error(`알 수 없는 케이스: ${job.case}`);
   const core = loadCore(job.labs);
-  const calc = { ...(await import(CALC_JS)), ...(await import(CONST_JS)) };
-  process.stdout.write(JSON.stringify(fn(job.input || {}, core, calc)));
+
+  // React(calc.js)는 없을 수도 있다(폴더를 따로 관리하므로). 그때도 목업 대조는 계속해야 하니
+  // core로 대신 돌린 뒤 calc 결과만 null로 비운다 — 호출부가 "React는 비교 못 했다"를 알 수 있게.
+  // 예전에는 calc.js가 없으면 테스트 전체를 스킵해서, 폴더가 사라진 순간 가드레일이 조용히 꺼졌다.
+  let calc = null;
+  try {
+    calc = { ...(await import(CALC_JS)), ...(await import(CONST_JS)) };
+  } catch {
+    calc = null;
+  }
+  const out = fn(job.input || {}, core, calc || core);
+  if (!calc) out.calc = null;
+  process.stdout.write(JSON.stringify(out));
 }
 
 main().catch((e) => {
