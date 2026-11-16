@@ -892,6 +892,35 @@ class ActualStageShiftResult(BaseModel):
 
 
 # ---------- 집계 화면: CP 계약 · 확정 사전점검 · 인건비율 ----------
+class AggregateRow(BaseModel):
+    """집계표 한 줄 × 17칸(월 12 + 분기 4 + 연간).
+
+    values의 None은 미등록(빈칸)이고 0.0은 "0원으로 올라왔다"는 뜻이다 — 화면이 둘을 다르게
+    그려야 한다(공통 RULE: 빈칸 처리).
+    """
+
+    key: str
+    label: str
+    label_en: str = ""
+    level: int = 0  # 손익계산서형 들여쓰기 단계
+    format: str = "krw"  # krw(금액) | usd(K$) | hc(명) | pct(%)
+    memo: bool = False  # 참고 행(IT 관련 비용·외주용역비) — 개발비 합계에 들어가지 않는다
+    values: list[float | None]
+
+
+class AggregateTable(BaseModel):
+    """집계 화면 표 한 장. 캡션·안내 문장까지 서버가 만들어 준다 — 화면과 챗봇이 같은 설명을
+    쓰게 하려는 것이다(/overseas/summary의 coverage_note와 같은 방식)."""
+
+    basis_year: int
+    basis_month: int
+    version: str
+    mode: str  # usd | krw
+    caption: str
+    note: str
+    rows: list[AggregateRow]
+
+
 class CpContractPoc(BaseModel):
     """CP 계약의 POC 한 건(직급 행을 접은 값). 금액 단위는 저장값과 같은 $다."""
 

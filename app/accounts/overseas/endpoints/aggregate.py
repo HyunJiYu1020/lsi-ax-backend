@@ -27,6 +27,7 @@ from app.accounts.overseas.services.extra_rows import read_extra_rows
 from app.accounts.overseas.services.state import build_state
 from app.accounts.overseas.services.variance import compute_reason_check
 from app.accounts.overseas.services.aggregate import (
+    pl_rows,
     LABOR_TREE,
     TOT_TREE,
     cp_quarter_amounts,
@@ -37,6 +38,8 @@ from app.db.session import get_db
 from app.accounts.overseas.models import OverseasCpRow
 from app.shared.models.common import CostEntry, CostEntryDetail
 from app.accounts.overseas.schemas import (
+    AggregateRow,
+    AggregateTable,
     CpContractOut,
     CpContractPoc,
     OverseasConfirmCheck,
@@ -304,3 +307,69 @@ def get_labor_ratio(
             "— 0%로 말하면 안 된다. 올라온 연구소만 들어간다."
         ),
     )
+
+
+@router.get("/overseas/aggregate-table", response_model=AggregateTable)
+def get_aggregate_table(
+    basis_year: int,
+    version: str = "cur",
+    mode: str = "krw",
+    db: Session = Depends(get_db),
+) -> AggregateTable:
+    """집계 화면 ① 전체 계정 표(손익계산서형 45행 × 17칸)를 **서버가 계산해서** 내려준다.
+
+    PLAN.md Phase 6: 같은 수식이 core.js · calc.js · 백엔드 세 곳에 복제돼 있어서 한 곳만
+    고치면 화면 숫자와 챗봇 숫자가 달라졌다. 백엔드가 유일한 계산자가 되고 프런트는 표시만
+    하게 만드는 중이고, 이 표가 그 첫 조각이다.
+
+    mode=krw면 월별 적용 환율로 환산한다(실적 구간은 말일/월평균 규칙을 따른다). usd면 저장
+    단위(K$) 그대로다 — 환율을 안 거치므로 환율이 안 들어간 달도 값이 보인다.
+    """
+    if version not in ("cur", "prev", "prior", "plan"):
+        raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
+    if mode not in ("usd", "krw"):
+        raise HTTPException(400, "mode는 usd | krw만 쓸 수 있다.")
+
+    state = build_state(db, basis_year)
+    month = state.basis_month or 1
+    vd = state.V.get(version)
+    if vd is None:
+        raise HTTPException(404, f"그런 버전이 없다: {version!r}")
+
+    # 전실행·전년은 실적(actual) 슬롯에, 나머지는 속보(forecast) 슬롯에 저장된다 — 이 모듈의
+    # 다른 엔드포인트와 같은 관례다(위 get_labor_ratio 참조).
+    api_version = "actual" if version in ("prev", "prior") else "forecast"
+    labs = {lab.pk: lab for lab in lab_views(db, yyyymm(basis_year, month))}
+    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 —
+    # 넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다.
+    pks = [
+        pk for pk, lab in labs.items()
+        if lab.is_active and pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+    ]
+    extras = extra_row_months(
+        read_extra_rows(db, yyyymm=yyyymm(basis_year, month), version=api_version)
+    )
+
+    rate = None
+    if mode == "krw":
+        local = {labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"}
+        rate = rate_arrays(db, basis_year, month, api_version, local, tuple(range(12)))["USD"]
+
+    rows = pl_rows(pks, vd.d, extras, mode, rate)
+    unit = "K$" if mode == "usd" else "원"
+    return AggregateTable(
+        basis_year=basis_year,
+        basis_month=month,
+        version=version,
+        mode=mode,
+        caption=f"① 전체 계정 (연구소 {len(pks)}곳 단순 합산, {unit})",
+        note=(
+            "업로드한 양식 그대로 연구소를 합친 표다 — CP도 연구소가 보낸 PL(매월 금액) 그대로이고 "
+            "분기 정산은 반영하지 않는다. 소계·분기·연간은 서버가 계산한다. "
+            "빈칸은 아직 안 올라온 달이고 0은 0원으로 보고된 달이다. "
+            "MARK UP 비율(%)은 MARK UP ÷ 개발비(매출)다. "
+            "IT 관련 비용과 외주용역비는 참고 행이라 개발비 합계에 들어가지 않는다."
+        ),
+        rows=[AggregateRow(**r) for r in rows],
+    )
+
