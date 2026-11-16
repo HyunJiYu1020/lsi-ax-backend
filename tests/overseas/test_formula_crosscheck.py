@@ -21,7 +21,7 @@ import pytest
 from app.accounts.overseas.endpoints.collect import yyyymm, get_labor_split, get_overseas_state
 from app.accounts.overseas.services.labs import lab_views
 from app.accounts.overseas.services.entries import current_basis_month
-from app.accounts.overseas.services.aggregate import group_tree, krw_months, to_17
+from app.accounts.overseas.services.aggregate import group_tree, krw_months, pl_rows, to_17
 from app.accounts.overseas.cost_groups import GROUP_CALC, resolve_leaves
 from app.accounts.overseas.services.fxcalc import rate_arrays
 
@@ -458,3 +458,53 @@ def test_17_column_core_js_fills_blanks_with_zero(how, case):
         else:
             # 백엔드가 미등록이라고 본 칸 → core.js는 0을 준다(그 외 값이면 설계 차이가 아니다)
             assert js["core"][i] in (0, 0.0, None), f"미등록 칸에 0이 아닌 값이 있다: {where} = {js['core'][i]!r}"
+
+
+# ---------- ⑥ 집계 ① 전체 계정 표 (45행 × 17칸) ----------
+
+
+@pytest.mark.parametrize("mode", ["usd", "krw"])
+def test_pl_rows_matches_mockup(mode):
+    """pl_rows(백엔드) = ovPLRows(목업). 집계 화면 ① 전체 계정 표 전체를 행·칸 단위로 대조한다.
+
+    이 표가 Phase 6의 핵심이다 — 백엔드가 계산해서 내려주면 프런트는 그리기만 한다.
+    45행 전부를 비교하는 이유: 한 행만 빠뜨려도(또는 들여쓰기·단위가 어긋나도) 화면이
+    다른 표를 그린다. 대조 테스트가 이미 두 건을 잡았다 —
+    ① ov17 avg가 안 올라온 달을 0으로 세던 것, ② 비율의 분모가 A vs tot로 갈려 있던 것.
+    """
+    d = {PK_USD: flat(PD_USD), PK_LOCAL: flat(PD_LOCAL)}
+    pks = [PK_USD, PK_LOCAL]
+    rate = RATE_KRW if mode == "krw" else None
+    js = run_js("pl_rows", {"d": d, "pks": pks, "mode": mode, "rate": RATE_KRW})
+    backend = pl_rows(pks, d, {}, mode, rate)
+
+    assert len(backend) == len(js["core"]) == 45, "행 수가 다르다 — 표 구성이 어긋났다"
+
+    for i, (row, front) in enumerate(zip(backend, js["core"])):
+        # 행 식별자(목업은 rk로 담는다)와 표시 형식이 같아야 같은 행이다.
+        assert row["key"] == front["key"], f"{i}번째 행의 키가 다르다: {row['key']} ≠ {front['key']}"
+        assert row["format"] == front["f"], f"{row['key']}: 표시 형식이 다르다"
+        for j in range(17):
+            where = f"{mode}/{row['key']}[{j}]" + (" 월" if j < 12 else " 분기" if j < 16 else " 연간")
+            b, f = row["values"][j], front["v"][j]
+            # 목업은 미등록을 0으로 채운다(설계 차이) — 값이 있는 칸만 비교한다.
+            if b is None:
+                assert f in (0, 0.0, None), f"백엔드는 빈칸인데 목업에 값이 있다: {where} = {f!r}"
+            else:
+                assert f == pytest.approx(b, rel=1e-9), f"값이 다르다: {where}"
+
+
+def test_pl_rows_memo_rows_are_outside_the_total():
+    """참고 행(IT 관련 비용·외주용역비)은 개발비 합계에 들어가지 않는다.
+
+    들어가면 개발비(매출)가 부풀어 보고 숫자가 틀어진다. 목업도 memo:1로 표시해 합계에서 빼고 있다.
+    """
+    cats = {"sal": [10.0] * 12, "B": [2.0] * 12, "eda": [99.0] * 12, "outs": [77.0] * 12}
+    by = {r["key"]: r for r in pl_rows([PK_USD], {PK_USD: cats}, {}, "usd", None)}
+
+    assert by["tot"]["values"][0] == pytest.approx(12.0), "참고 행이 합계에 섞였다"
+    assert by["eda"]["values"][0] == pytest.approx(99.0)
+    assert by["outs"]["values"][0] == pytest.approx(77.0)
+    assert by["itx"]["values"][0] == pytest.approx(99.0), "itx는 하위(eda 등)의 합이다"
+    assert all(by[k]["memo"] for k in ("itx", "eda", "outs"))
+    assert not by["tot"]["memo"] and not by["labor"]["memo"]

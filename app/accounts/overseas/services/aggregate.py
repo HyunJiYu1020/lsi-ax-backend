@@ -12,7 +12,13 @@ tests/test_formula_crosscheck.py가 세 구현을 실제로 실행해서 잡는�
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.accounts.overseas.cost_groups import CATEGORY_LABELS, GROUP_CALC, resolve_leaves
+from app.accounts.overseas.cost_groups import (
+    AGGREGATE_ROWS,
+    CATEGORY_LABELS,
+    CATEGORY_LABELS_EN,
+    GROUP_CALC,
+    resolve_leaves,
+)
 from app.shared.core.values import n
 from app.accounts.overseas.models import OverseasCpRow
 
@@ -159,3 +165,77 @@ def pct_17(numerator: list[float | None], denominator: list[float | None]) -> li
         None if (numerator[i] is None or not denominator[i]) else numerator[i] / denominator[i] * 100
         for i in range(len(numerator))
     ]
+
+
+def agg_across(
+    pks: list[str],
+    d: dict[str, dict[str, list[float | None]]],
+    extras: dict[str, dict[str, list[float]]],
+    tree: set[str],
+    rate: list[float] | None = None,
+) -> list[float | None]:
+    """연구소 여러 곳을 묶어 월별 집계. 프런트 ovAgg가 pks를 훑어 더하는 것과 같다.
+
+    미등록 더하기 규칙: 아무 연구소도 그 달 값을 안 올렸으면 미등록(None), 하나라도 올렸으면
+    올린 것만 더한다. "안 올린 연구소를 0으로 세는 것"과 결과가 같지만, 전부 안 올린 달을
+    0원으로 보여주지 않는 게 다르다(공통 RULE: 빈칸 처리).
+    """
+    out: list[float | None] = [None] * 12
+    for pk in pks:
+        months = agg_months(d.get(pk, {}), extras.get(pk, {}), tree, rate)
+        for j in range(12):
+            if months[j] is None:
+                continue
+            out[j] = months[j] if out[j] is None else out[j] + months[j]
+    return out
+
+
+def pl_rows(
+    pks: list[str],
+    d: dict[str, dict[str, list[float | None]]],
+    extras: dict[str, dict[str, list[float]]],
+    mode: str,
+    rate: list[float] | None,
+) -> list[dict]:
+    """집계 화면 ① 전체 계정 표(손익계산서형) 45행 × 17칸. 프런트 ovPLRows와 같은 표다.
+
+    mode: usd(저장 단위 K$ 그대로) | krw(원화 환산 — rate 필요)
+
+    세 가지가 행마다 다르다:
+    - 인력(hc)은 금액이 아니라 명수다 → 환율을 곱하지 않고, 분기·연간은 **합이 아니라 평균**이다
+    - 비율(pct)은 MARK UP(B) ÷ **개발비(매출)(tot)** × 100 → 분모가 없으면 빈칸(0%가 아니다).
+      분모가 tot인 근거는 화면이 사용자에게 적어 주는 문장이다 — "합계 화면은 MARK UP ÷
+      개발비(매출) 계산값"(core.js의 집계표 안내). React(calc.js)는 분모를 A로 쓰고 있어서
+      같은 표에서 다른 비율이 나온다 — 대조 테스트가 그 차이를 잡았다(React 쪽 버그다)
+    - 그 외는 리프를 더해 17칸으로 접는다
+    """
+    if mode not in ("usd", "krw"):
+        raise ValueError(f"mode는 usd | krw만 쓸 수 있다: {mode!r}")
+    if mode == "krw" and rate is None:
+        raise ValueError("krw 모드는 환율 배열이 필요하다")
+    money_rate = rate if mode == "krw" else None
+    money_fmt = "usd" if mode == "usd" else "krw"
+
+    # 비율의 분모는 개발비(매출)=tot이다(A가 아니다) — 위 docstring의 근거 참조.
+    tot17 = to_17(agg_across(pks, d, extras, group_tree("tot"), money_rate))
+    b17 = to_17(agg_across(pks, d, extras, group_tree("B"), money_rate))
+
+    rows: list[dict] = []
+    for key, level, unit, memo in AGGREGATE_ROWS:
+        if unit == "pct":
+            values, fmt = pct_17(b17, tot17), "pct"
+        elif unit == "hc":
+            # 인력은 환율과 무관하고(명수), 기간 집계는 평균이다 — 월별 인원을 더하면 뜻이 없다.
+            values, fmt = to_17(agg_across(pks, d, extras, group_tree(key), None), "avg"), "hc"
+        else:
+            values, fmt = to_17(agg_across(pks, d, extras, group_tree(key), money_rate)), money_fmt
+        rows.append({
+            "key": key,
+            "label": CATEGORY_LABELS.get(key, key),
+            "label_en": CATEGORY_LABELS_EN.get(key, ""),
+            "level": level,
+            "format": fmt,
+            "memo": memo,
+            "values": values,
+        })
+    return rows

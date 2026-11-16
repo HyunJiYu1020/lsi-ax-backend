@@ -129,3 +129,22 @@ VARIANCE_ROWS: tuple[tuple[str, int, str], ...] = (
     ("B", 0, "krw"),
     ("pct", 0, "pct"),
 )
+
+
+# 집계 화면 ① 전체 계정 표의 행 구성 — (key, 들여쓰기, 단위, 참고행인지).
+# 프런트 OV_EL과 1:1로 맞춰야 한다(core.js · calc.js). VARIANCE_ROWS(증감분석 표)와 달리
+# "참고 행"(memo)을 포함한다 — IT 관련 비용 분해와 외주용역비는 개발비 합계에 들어가지 않고
+# 따로 보여주는 값이다(그래서 resolve_leaves("tot")에도 없다).
+# 라벨은 CATEGORY_LABELS / CATEGORY_LABELS_EN에서 가져온다 — 이름을 두 번 적지 않기 위함이다.
+AGGREGATE_ROWS: tuple[tuple[str, int, str, bool], ...] = tuple(
+    (key, level, unit, False) for key, level, unit in VARIANCE_ROWS
+) + (
+    # 참고 행 — 합계와 무관하다. itx는 아래 5개의 합(GROUP_CALC에 정의돼 있다).
+    ("itx", 0, "krw", True),
+    ("eda", 1, "krw", True),
+    ("emu", 1, "krw", True),
+    ("swl", 1, "krw", True),
+    ("svr", 1, "krw", True),
+    ("itoth", 1, "krw", True),
+    ("outs", 0, "krw", True),
+)

@@ -46,7 +46,7 @@ const CONST_JS = path.join(REPO, "frontend/src/data/overseasConstants.js");
 // 조용히 넘어가면 안 된다).
 const CORE_EXPORTS = [
   "num", "ovL", "ovLcOf", "ovPks", "OV_LABS", "OV_EL", "OV_ELK", "OVQ",
-  "ovPartEl", "ovAgg", "ovLaborSplit", "ov17",
+  "ovPartEl", "ovAgg", "ovLaborSplit", "ov17", "ovPLRows", "ovPct17",
 ];
 
 // core.js를 실행시키기 위한 가짜 브라우저. 무슨 속성을 읽어도 "호출해도 되고 또 아무 속성이나
@@ -95,6 +95,7 @@ function loadCore(labs) {
   return vm.runInContext(src + epilogue, vm.createContext(browserStub()), { filename: CORE_JS });
 }
 
+const mon17 = (a) => Array.from({ length: 17 }, (_x, i) => (a && a[i] !== undefined ? a[i] : null));
 const mon12 = (a) => Array.from({ length: 12 }, (_x, j) => (a && a[j] !== undefined ? a[j] : null));
 
 // 두 구현의 ovPartEl 결과를 묶어 "캐시"(el + rate) 모양으로 만든다. core.js의 ovPartEl은
@@ -131,6 +132,18 @@ const CASES = {
     const run = (impl) =>
       impl.ovLaborSplit(pks, ix, buildCache(impl, cur.d, cur.rate), buildCache(impl, base.d, base.rate));
     return { core: run(core), calc: run(calc) };
+  },
+
+  // ovPLRows: 집계 ① 전체 계정 표(손익계산서형) 45행 × 17칸. 백엔드 pl_rows와 짝이다.
+  pl_rows({ d, pks, mode, rate }, core, calc) {
+    const rates = { std: rate, cp: rate };
+    const pick = (rows) =>
+      rows.map((r) => ({ key: r.key ?? r.rk ?? null, f: r.f, v: mon17(r.v) }));
+    core.setCache(buildCache(core, d, rates));
+    return {
+      core: pick(core.ovPLRows("cur", pks, mode)),
+      calc: pick(calc.ovPLRows(buildCache(calc, d, rates), pks, mode)),
+    };
   },
 
   // ov17: 12개월 → 17칸(월 12 + 분기 4 + 연간). 백엔드 to_17과 짝이다.
