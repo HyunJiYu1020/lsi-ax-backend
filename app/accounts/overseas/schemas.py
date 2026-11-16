@@ -921,6 +921,46 @@ class AggregateTable(BaseModel):
     rows: list[AggregateRow]
 
 
+class LabTableRow(BaseModel):
+    """집계 ②③④ 탭의 한 줄 × 17칸. ①(AggregateRow)과 달리 계정이 아니라 **연구소** 줄이라
+    category key가 없고, 대신 표시 규칙(합계줄·굵게·참고줄)을 서버가 같이 내려준다 — 행 구성이
+    표마다 다르기 때문이다(③ 달러 표만 "CP·SRCX 제외" 줄이 없고, ②·④만 SARC 하위 줄이 있다).
+
+    values의 None은 미등록(빈칸), 0.0은 "0으로 올라왔다"다(공통 RULE: 빈칸 처리).
+    """
+
+    label: str
+    level: int = 0  # 들여쓰기 단계(0 = 합계·소계, 1 = 연구소, 2 = 연구소 하위 파트)
+    format: str = "krw"  # krw(억원) | usd(K$) | rate(원/$)
+    total: bool = False  # 표 맨 위 합계줄
+    bold: bool = False  # 소계줄(예: 개발비(A,CP제외))
+    muted: bool = False  # 참고줄(하위 파트 · 적용 환율)
+    values: list[float | None]
+
+
+class LabTable(BaseModel):
+    """집계 ②③④ 탭 한 장."""
+
+    caption: str
+    note: str
+    rows: list[LabTableRow]
+
+
+class LabTablesOut(BaseModel):
+    """집계 ②③④ 탭을 한 번에. 탭을 누를 때마다 따로 받지 않는 이유: 비싼 건 표 조립이 아니라
+    화면 상태를 읽는 일이고 그건 여섯 표가 같이 쓴다 — 여섯 번 부르면 같은 읽기를 여섯 번 한다.
+
+    tables의 키는 화면 탭 키와 같다: t2u · t2k(② 개발비 달러·원화), t3 · t4(③ 인건비 달러·원화),
+    t5 · t6(④ CP 보정 인건비·인건비외). 환율이 없으면 원화 표가, CP 계약이 없으면 ④가 빠진다 —
+    재료 없이 만든 0원 표를 내려보내지 않으려는 것이다.
+    """
+
+    basis_year: int
+    basis_month: int
+    version: str
+    tables: dict[str, LabTable]
+
+
 class CpContractPoc(BaseModel):
     """CP 계약의 POC 한 건(직급 행을 접은 값). 금액 단위는 저장값과 같은 $다."""
 

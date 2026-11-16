@@ -27,19 +27,25 @@ from app.accounts.overseas.services.extra_rows import read_extra_rows
 from app.accounts.overseas.services.state import build_state
 from app.accounts.overseas.services.variance import compute_reason_check
 from app.accounts.overseas.services.aggregate import (
+    LabGroup,
     pl_rows,
+    lab_tables,
     LABOR_TREE,
     TOT_TREE,
     cp_quarter_amounts,
     extra_row_months,
     krw_months,
 )
+from dataclasses import dataclass
+
 from app.db.session import get_db
 from app.accounts.overseas.models import OverseasCpRow
 from app.shared.models.common import CostEntry, CostEntryDetail
 from app.accounts.overseas.schemas import (
     AggregateRow,
     AggregateTable,
+    LabTable,
+    LabTablesOut,
     CpContractOut,
     CpContractPoc,
     OverseasConfirmCheck,
@@ -309,26 +315,23 @@ def get_labor_ratio(
     )
 
 
-@router.get("/overseas/aggregate-table", response_model=AggregateTable)
-def get_aggregate_table(
-    basis_year: int,
-    version: str = "cur",
-    mode: str = "krw",
-    db: Session = Depends(get_db),
-) -> AggregateTable:
-    """집계 화면 ① 전체 계정 표(손익계산서형 45행 × 17칸)를 **서버가 계산해서** 내려준다.
+@dataclass(frozen=True)
+class _TableInputs:
+    """집계표가 공통으로 쓰는 재료. ①과 ②③④가 같은 읽기를 하므로 한 곳에 모았다 —
+    따로 적어 두면 "어느 연구소를 넣는가" 같은 규칙이 표마다 갈린다(PLAN P1-3의 교훈)."""
 
-    PLAN.md Phase 6: 같은 수식이 core.js와 백엔드 두 곳에 복제돼 있어서 한 곳만
-    고치면 화면 숫자와 챗봇 숫자가 달라졌다. 백엔드가 유일한 계산자가 되고 프런트는 표시만
-    하게 만드는 중이고, 이 표가 그 첫 조각이다.
+    basis_month: int
+    api_version: str
+    labs: dict
+    pks: list[str]
+    d: dict
+    extras: dict
+    rate: list[float] | None
 
-    mode=krw면 월별 적용 환율로 환산한다(실적 구간은 말일/월평균 규칙을 따른다). usd면 저장
-    단위(K$) 그대로다 — 환율을 안 거치므로 환율이 안 들어간 달도 값이 보인다.
-    """
+
+def _table_inputs(db: Session, basis_year: int, version: str, with_rate: bool) -> _TableInputs:
     if version not in ("cur", "prev", "prior", "plan"):
         raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
-    if mode not in ("usd", "krw"):
-        raise HTTPException(400, "mode는 usd | krw만 쓸 수 있다.")
 
     state = build_state(db, basis_year)
     month = state.basis_month or 1
@@ -351,11 +354,96 @@ def get_aggregate_table(
     )
 
     rate = None
-    if mode == "krw":
+    if with_rate:
         local = {labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"}
         rate = rate_arrays(db, basis_year, month, api_version, local, tuple(range(12)))["USD"]
 
-    rows = pl_rows(pks, vd.d, extras, mode, rate)
+    return _TableInputs(month, api_version, labs, pks, vd.d, extras, rate)
+
+
+def _lab_groups(labs: dict, pks: list[str]) -> list[LabGroup]:
+    """표의 연구소 줄 순서. 프런트 ovLabsFromApi와 같은 규칙으로 묶고 정렬해야 한다 —
+    화면은 /overseas/labs 목록을 lab_code로 묶고 sort_order로 정렬해서 행을 그린다.
+
+    하위 줄 라벨은 파트 이름에서 뽑는다("SARC+ACL · GPU (ACL)" → "GPU (ACL)"). 프런트는
+    여기를 SARC:CPU · SARC:GPU로 **하드코딩**해 뒀는데, 그러면 파트 구성이 바뀔 때 화면이
+    못 따라간다 — 서버는 기준정보를 보고 만든다.
+    """
+    by_code: dict[str, list] = {}
+    for pk in sorted(pks, key=lambda pk: (labs[pk].sort_order, pk)):
+        by_code.setdefault(labs[pk].lab_code, []).append(labs[pk])
+
+    groups = []
+    for code, rows in by_code.items():
+        first = rows[0]
+        multi = len(rows) > 1
+        name = first.name.split(" · ")[0] if multi else first.name
+        parts = tuple(
+            (r.pk, r.name.split(" · ", 1)[1] if " · " in r.name else (r.part_code or r.pk))
+            for r in rows
+        ) if multi else ()
+        groups.append(LabGroup(code, name, first.country or "", tuple(r.pk for r in rows), parts))
+    return groups
+
+
+@router.get("/overseas/lab-tables", response_model=LabTablesOut)
+def get_lab_tables(
+    basis_year: int,
+    version: str = "cur",
+    db: Session = Depends(get_db),
+) -> LabTablesOut:
+    """집계 화면 ②③④ 탭(연구소별 표 6장)을 **서버가 계산해서** 내려준다.
+
+    PLAN.md Phase 6. ①(aggregate-table)에 이어 나머지 탭도 서버 계산으로 옮긴 것이다.
+    여섯 표를 한 번에 주는 이유: 비싼 건 표 조립이 아니라 화면 상태를 읽는 일이고, 그 읽기를
+    여섯 표가 같이 쓴다 — 탭마다 따로 부르면 같은 읽기를 여섯 번 한다.
+
+    ②·④는 **CP 분기 정산**을 반영한다 — CP는 분기 계약이라 올라온 월별 PL 대신 기준정보 ›
+    CP 계약 금액 ÷ 4를 3 · 6 · 9 · 12월에 넣는다. ③은 올라온 PL 그대로다(그래서 표 제목에
+    "CP 분기 정산 미반영"이라고 적혀 있다).
+
+    CP 계약이 없는 해는 ④를 빼고 돌려준다 — 보정할 재료가 없는데 표를 내면 "보정했다"고 읽히는
+    빈 표가 나간다. 화면은 받은 표만 서버 값으로 그리고 나머지는 그대로 둔다.
+    """
+    inp = _table_inputs(db, basis_year, version, with_rate=True)
+    cp_total, cp_labor = cp_quarter_amounts(db, basis_year)
+    tables = lab_tables(
+        _lab_groups(inp.labs, inp.pks),
+        inp.d,
+        inp.extras,
+        inp.rate,
+        (cp_total, cp_labor) if (cp_total or cp_labor) else None,
+    )
+    return LabTablesOut(
+        basis_year=basis_year,
+        basis_month=inp.basis_month,
+        version=version,
+        tables={k: LabTable(**v) for k, v in tables.items()},
+    )
+
+
+@router.get("/overseas/aggregate-table", response_model=AggregateTable)
+def get_aggregate_table(
+    basis_year: int,
+    version: str = "cur",
+    mode: str = "krw",
+    db: Session = Depends(get_db),
+) -> AggregateTable:
+    """집계 화면 ① 전체 계정 표(손익계산서형 45행 × 17칸)를 **서버가 계산해서** 내려준다.
+
+    PLAN.md Phase 6: 같은 수식이 core.js와 백엔드 두 곳에 복제돼 있어서 한 곳만
+    고치면 화면 숫자와 챗봇 숫자가 달라졌다. 백엔드가 유일한 계산자가 되고 프런트는 표시만
+    하게 만드는 중이고, 이 표가 그 첫 조각이다.
+
+    mode=krw면 월별 적용 환율로 환산한다(실적 구간은 말일/월평균 규칙을 따른다). usd면 저장
+    단위(K$) 그대로다 — 환율을 안 거치므로 환율이 안 들어간 달도 값이 보인다.
+    """
+    if mode not in ("usd", "krw"):
+        raise HTTPException(400, "mode는 usd | krw만 쓸 수 있다.")
+
+    inp = _table_inputs(db, basis_year, version, with_rate=(mode == "krw"))
+    month, pks, rate = inp.basis_month, inp.pks, inp.rate
+    rows = pl_rows(pks, inp.d, inp.extras, mode, rate)
     unit = "K$" if mode == "usd" else "원"
     return AggregateTable(
         basis_year=basis_year,

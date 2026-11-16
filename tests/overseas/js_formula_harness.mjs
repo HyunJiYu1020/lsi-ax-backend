@@ -69,11 +69,24 @@ function browserStub() {
 // 바인딩을 클로저로 잡고 있어서 재대입이 그대로 먹는다.
 function loadCore(labs) {
   const src = fs.readFileSync(CORE_JS, "utf8");
+  // OV_TBL_ORDER도 같이 바꿔야 한다 — ovTables()의 연구소 행 순서와 `ex()`(특정 연구소 제외)가
+  // 이 배열을 훑으므로, OV_LABS만 바꾸면 없는 연구소를 찾다가 터진다(ovSyncLabs가 실제로 셋을
+  // 한꺼번에 맞춘다).
   const inject = labs
-    ? `\n;OV_LABS = ${JSON.stringify(labs)};OV_ALLPK = [].concat(...OV_LABS.map(ovPks));`
+    ? `\n;OV_LABS = ${JSON.stringify(labs)};OV_TBL_ORDER = OV_LABS.map((L) => L.c);` +
+      `OV_ALLPK = [].concat(...OV_LABS.map(ovPks));`
     : "";
   const epilogue = `${inject}
-;({ ${CORE_EXPORTS.join(", ")}, setCache: (c) => { ovCache = () => c; } })`;
+;({ ${CORE_EXPORTS.join(", ")}, setCache: (c) => { ovCache = () => c; },
+   // ovTables()는 ovAgg보다 전역 의존이 넓다(환율 · CP 계약 · 기준월). 수식은 그대로 돌리고
+   // **입력만** 바꿔 꽂는다 — 여기서 ovCPc나 ovTables 자체를 흉내내면 그게 복제본이 된다.
+   setTableInputs: (c, rate, cpPocs) => {
+     ovCache = () => c;
+     ovRateOV = () => rate;
+     ovCpEnsure = () => ({ pocs: cpPocs });
+     fxEnsure = () => {};
+   },
+   tables: () => ovTables() })`;
   return vm.runInContext(src + epilogue, vm.createContext(browserStub()), { filename: CORE_JS });
 }
 
@@ -132,6 +145,21 @@ const CASES = {
   // 집계 그룹 정의 자체(어느 행이 어느 하위를 더하는가). 백엔드 cost_groups.GROUP_CALC와 짝이다.
   group_defs(_input, core) {
     return { core: Object.fromEntries(core.OV_EL.filter((e) => e.calc).map((e) => [e.k, e.calc])) };
+  },
+
+  // 집계 ②③④ 탭(연구소별 표). 백엔드 lab_tables와 짝이다. ①(pl_rows)과 달리 행이 연구소별이고
+  // CP는 분기 계약 금액으로 치환되므로(usdq · krwq), 행 순서·라벨까지 대조해야 같은 표가 된다.
+  lab_tables({ d, rate, cpPocs }, core) {
+    core.setTableInputs(buildCache(core, d, { std: rate, cp: rate }), rate, cpPocs || []);
+    const T = core.tables();
+    const pick = (t) => ({
+      caption: t.cap,
+      rows: (t.rows || []).map((r) => ({
+        label: r.label, level: r.lv || 0, format: r.f,
+        total: !!r.t, bold: !!r.b, muted: !!r.rt, v: mon17(r.v),
+      })),
+    });
+    return { core: Object.fromEntries(["t2u", "t2k", "t3", "t4", "t5", "t6"].map((k) => [k, pick(T[k])])) };
   },
 
   // 연구소 코드 → 현지통화 표. 수식이 아니라 수식이 쓰는 기준정보지만, 여기가 어긋나면 환차 분해가
