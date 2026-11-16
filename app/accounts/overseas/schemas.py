@@ -64,6 +64,20 @@ class VendorRow(BaseModel):
     source_file: str = ""
 
 
+class VendorRowsIn(BaseModel):
+    """외주용역 전용 저장 요청(PUT /overseas/vendor-rows). PLAN.md Phase 5.
+
+    rows에 들어온 (연구소, 버전) 조합만 통째로 바뀐다 — 보내지 않은 조합은 건드리지 않는다.
+    빈 rows로 한 조합을 비울 수는 없다(무엇을 비울지 알 수 없으므로). 그건 행 삭제 API의 일이다.
+    """
+
+    basis_year: int  # 월 금액을 어느 해 디테일로 저장할지
+    rows: list[VendorRow]
+    # 동시 편집 보호 — /overseas/state와 같은 지문을 쓴다(한 화면의 자료라 충돌 판정도 같아야 한다).
+    # 빈 문자열이면 검사하지 않는다(토큰을 모르는 클라이언트 호환).
+    state_token: str = ""
+
+
 class CpRow(BaseModel):
     """CP 계약 업로드 1행(POC×직급). overseas_cp_rows와 1:1 — POC 헤더값은 각 행에 반복된다."""
 

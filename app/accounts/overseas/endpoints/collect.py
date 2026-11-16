@@ -69,6 +69,7 @@ from app.accounts.overseas.services.extra_rows import (
     read_extra_rows,
 )
 from app.accounts.overseas.services.state import build_state, latest_uploads_stmt, state_token
+from app.accounts.overseas.services.vendor import replace_vendor_rows
 from app.accounts.overseas.services.labs import (
     ACCOUNT_KEY,
     ALL_SCOPE,
@@ -82,6 +83,7 @@ from app.accounts.overseas.services.labs import (
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.shared.core.enums import CodeGroup
 from app.accounts.overseas.schemas import (
+    VendorRowsIn,
     ActualSnapshot,
     LaborSplitLab,
     LaborSplitResult,
@@ -360,40 +362,9 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
         raise HTTPException(status_code=400, detail=f"알 수 없는 연구소 코드(증감사유): {sorted(unknown_reason_codes)}")
     _bulk_upsert_reason_rows(db, state.reason)
 
-    # 4-2) 외주용역 상세 (연구소×버전 단위 전체 교체 — 행 수가 업로드마다 달라서 upsert만 하면
-    # 지워진 행이 남는다. 보내지 않은 연구소·버전은 그대로 둔다. 월 금액은 디테일에 월 1행씩.)
-    unknown_vendor_codes = {r.lab_code for r in state.vendor if r.lab_code not in lab_codes}
-    if unknown_vendor_codes:
-        raise HTTPException(status_code=400, detail=f"알 수 없는 연구소 코드(외주용역): {sorted(unknown_vendor_codes)}")
-    for lab_code, version in {(r.lab_code, r.version) for r in state.vendor}:
-        db.execute(
-            delete(OverseasVendorRow).where(
-                OverseasVendorRow.lab_code == lab_code, OverseasVendorRow.version == version
-            )
-        )
-    if state.vendor:
-        new_ids = (
-            db.execute(
-                insert(OverseasVendorRow).returning(OverseasVendorRow.id, sort_by_parameter_order=True),
-                [
-                    {
-                        "lab_code": r.lab_code, "version": r.version, "row_no": r.row_no, "category": r.category,
-                        "project": r.project, "company": r.company, "description": r.description,
-                        "source_file": r.source_file,
-                    }
-                    for r in state.vendor
-                ],
-            )
-            .scalars()
-            .all()
-        )
-        vendor_details = [
-            {"vendor_row_id": new_id, "year": state.basis_year, "month": month, "amount": float(amount)}
-            for new_id, r in zip(new_ids, state.vendor)
-            for month, amount in enumerate(r.m[:12], start=1)
-        ]
-        if vendor_details:
-            db.execute(insert(OverseasVendorRowDetail), vendor_details)
+    # 4-2) 외주용역 상세 — 전용 저장 API(PUT /overseas/vendor-rows)와 **같은 함수**를 부른다.
+    # 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서 겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다.
+    replace_vendor_rows(db, state.basis_year, state.vendor, lab_codes)
 
     # 4-3) CP 계약 (연도 단위 전체 교체 — 연 1회 올리는 파일이라 사라진 POC·직급은 지운다)
     cp_years = {r.year for r in state.cp}
@@ -429,6 +400,39 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     # 저장 뒤 새 토큰을 같이 돌려준다 — 안 주면 화면이 들고 있는 토큰이 낡아서, 같은 화면에서
     # 두 번째로 저장할 때 자기 자신과 충돌한 것처럼 409가 난다(테스트가 그걸 잡았다).
     return {"status": "ok", "state_token": state_token(db)}
+
+
+@router.put("/overseas/vendor-rows")
+def save_vendor_rows(body: VendorRowsIn, db: Session = Depends(get_db)) -> dict[str, object]:
+    """외주용역 상세만 저장한다 — 연구소×버전 단위 전체 교체.
+
+    왜 따로 있나 (PLAN.md Phase 5): 저장이 `PUT /overseas/state` 하나에 뭉쳐 있어서 외주용역 한
+    시트를 올려도 화면이 가진 상태 전부가 전송됐다(메모 하나 고쳐도 마찬가지다). 외주용역은 이미
+    "단위 교체" 의미라 떼어내기 가장 쉬운 자리다.
+
+    `PUT /overseas/state`와 **같은 서비스 함수**를 부른다 — 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서
+    겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다. 그래서 구 경로(일괄)와 신 경로(개별)를
+    같이 둬도 결과가 갈리지 않는다(PLAN Phase 5의 롤백 조건: 두 경로 병행 유지 후 전환).
+    """
+    if body.state_token:
+        if body.state_token != state_token(db):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                    "화면을 다시 불러온 뒤 다시 올려 주세요."
+                ),
+            )
+    lab_codes = {lab.lab_code for lab in all_labs(db)}
+    replaced = replace_vendor_rows(db, body.basis_year, body.rows, lab_codes)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
+    # 저장 뒤 새 지문을 같이 준다 — 안 주면 화면이 들고 있는 토큰이 낡아서 다음 저장이 409가 된다.
+    return {"status": "ok", "replaced": replaced, "state_token": state_token(db)}
+
 
 
 # ---------- 인건비 증감의 원인: 인원 효과 vs 단가 효과 ----------
