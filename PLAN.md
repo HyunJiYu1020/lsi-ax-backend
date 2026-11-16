@@ -259,7 +259,7 @@ close_account_stages (변경 후)
 - 같이 고친 것 ③: **`seed.py`가 연구소 통화를 아예 안 넣고 있었다.** 통화는 마이그레이션의 1회성 백필에만 의존해서, "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 컬럼 기본값 USD로 깔렸다 — 현지통화 연구소의 환차 분해(현지→$ 단계)가 통째로 사라지는 상태다. 통화는 환산의 입력이라 시드가 직접 책임지도록 `OVERSEAS_LABS`에 넣었다
 - 롤백: 테스트 추가 + 조회 정렬 2곳 (DB 무변경, `git revert`로 끝)
 
-**Phase 1 — 코드 배치 리팩토링 (DB 무변경)** — 🔄 거의 완료 (2026-11-16)
+**Phase 1 — 코드 배치 리팩토링 (DB 무변경)** — ✅ 2026-11-16 완료
 
 끝난 것:
 - `core/periods.py`(기간) · `core/values.py`(n·source_hash) — 순수 유틸
@@ -270,11 +270,21 @@ close_account_stages (변경 후)
 - `overseas_variance.py`는 `overseas.py`를 **전혀 import하지 않는다**
 - `_month` 중복 정의 통합(P3)
 
-남은 것 — 라우트 핸들러 직접 호출 2건(P1-1의 가장 나쁜 부분):
-- `overseas_aggregate.py` → `get_overseas_state` (상태 조립을 `services/overseas/state.py`로 내려야 함)
-- `overseas_aggregate.py` → `check_variance_reasons`
-- `overseas_close.py` → `overseas_variance._active_labs` · `_load_cost_version`
-- `overseas_aggregate.py` → `overseas.list_extra_rows` (조회 핸들러 — 추가 행 읽기를 services로)
+- `services/overseas/state.py`(화면 상태 조립) · `variance.py`(증감 계산) · `extra_rows.py`(추가 행 읽기)
+- **라우트 핸들러 직접 호출 전부 제거** — `get_overseas_state` · `check_variance_reasons` ·
+  `list_extra_rows`를 services 함수로 대체했다
+
+완료 조건 4개를 모두 만족한다(검증 명령은 아래):
+1. 엔드포인트 간 import 0건 2. services → endpoints 역방향 0건
+3. 밑줄 이름 교차 import 0건 4. 라우트 핸들러 직접 호출 0건
+
+`overseas.py` 3,049 → 2,371줄, `overseas_variance.py` 1,474 → 694줄.
+services 1,895줄 + core 65줄로 빠져나왔다.
+
+**증감분석을 가른 방법**: 의존을 하나씩 쫓아 옮기다 꼬였다(`_plan_revisions` → `ManagementPlanVersion`
+→ `_has_cost_data` …). 원칙으로 한 번에 가르는 게 맞았다 — **@router가 붙은 라우트 핸들러만
+엔드포인트에 남기고 나머지 전부 services로.** 그러면 의존 폐쇄를 계산할 필요가 없다(라우트 14개 /
+도메인 44개로 갈렸다).
 
 **이름 짓기 교훈**: 공용으로 올리는 이름은 흔한 지역 변수명과 겹치지 않게 고른다. `_yyyymm`→`yyyymm`,
 `_labs`→`labs`, `_basis_month`→`basis_month`로 바꿨을 때 각각 `UnboundLocalError`로 2건·41건·12건이

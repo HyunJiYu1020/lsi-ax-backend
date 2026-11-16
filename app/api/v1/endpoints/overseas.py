@@ -69,7 +69,16 @@ from app.services.overseas.entries import (
     upsert_entry_months,
 )
 from app.services.overseas.fxcalc import rate_arrays
-from app.services.overseas.labs import ACCOUNT_KEY, LAB_EPOCH, LabView, all_labs, lab_views, overseas_account
+from app.services.overseas.extra_rows import (
+    OP_SYMBOL,
+    check_lab_pk,
+    check_version,
+    eval_row_formula,
+    months_by_category,
+    read_extra_rows,
+)
+from app.services.overseas.state import build_state, latest_uploads_stmt
+from app.services.overseas.labs import ACCOUNT_KEY, ALL_SCOPE, LAB_EPOCH, LabView, all_labs, lab_views, overseas_account
 # 환산 기준(말일 vs 월평균)의 기본값을 읽는 헬퍼. fx.py는 overseas.py를 import하지 않으므로 순환이
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.core.enums import CodeGroup
@@ -194,21 +203,8 @@ def _lab_attrs(labs: list[OverseasLab]) -> dict:
     }
 
 
-# 집계 화면의 파생 행이 쓰는 "전체 연구소 합산" 범위. cost_entries.scope_code 주석에 이미 적혀 있는
-# 관례("없는 계정은 상수 ALL")를 그대로 쓴다 — 연구소 하나가 아니라 전체를 가리키는 행이라는 뜻이다.
-# 비율 파생 행(인당인건비 등)은 연구소별로 계산해서 더하면 뜻이 없어지므로, 집계에서는 재료를 전체
-# 합산한 뒤 계산해야 해서 이 범위가 필요하다.
-ALL_SCOPE = "ALL"
 
 
-def _check_lab_pk(db: Session, pk: str, allow_all: bool = False) -> str:
-    """scope_code(=연구소 pk)가 overseas_labs에 실재하는지 검증한다. DB가 FK로 못 막아주는 부분이라 여기서 확인.
-    allow_all=True면 전체 합산 범위("ALL")도 받아준다(집계 화면의 파생 행 전용)."""
-    if allow_all and pk == ALL_SCOPE:
-        return pk
-    if not db.scalar(select(OverseasLab.id).where(OverseasLab.pk == pk)):
-        raise HTTPException(status_code=400, detail=f"알 수 없는 연구소 코드: {pk}")
-    return pk
 
 
 def _check_category(db: Session, category_key: str) -> str:
@@ -247,22 +243,6 @@ def _current_user_id() -> int | None:
 
 
 
-def _latest_uploads_stmt(lab_pks: set[str], versions: list[str]):
-    """(version, scope_key) 조합마다 가장 최근 업로드 1건만 고르는 쿼리.
-
-    uploads는 지울 일이 없이 계속 쌓이기만 하는 이력 테이블이라, 계정 전체를 파이썬으로 끌어와
-    마지막 것만 남기는 방식은 업로드가 늘수록 그대로 느려진다. DISTINCT ON으로 DB에서 바로
-    최신 행만 받아 온다(연구소·버전 필터도 같이 밀어 넣어 쓸모없는 행은 아예 안 읽는다)."""
-    return (
-        select(Upload)
-        .where(
-            Upload.account_key == ACCOUNT_KEY,
-            Upload.scope_key.in_(lab_pks),
-            Upload.version.in_(versions),
-        )
-        .distinct(Upload.version, Upload.scope_key)
-        .order_by(Upload.version, Upload.scope_key, Upload.uploaded_at.desc(), Upload.id.desc())
-    )
 
 
 
@@ -277,242 +257,9 @@ def _latest_uploads_stmt(lab_pks: set[str], versions: list[str]):
 
 @router.get("/overseas/state", response_model=OverseasState)
 def get_overseas_state(basis_year: int, db: Session = Depends(get_db)) -> OverseasState:
-    acct = overseas_account(db)
-    labs = all_labs(db)
-    lab_pks = {lab.pk for lab in labs}
-    lab_codes = {lab.lab_code for lab in labs}
-
-    progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
-    step = progress.current_step_order if progress else 1
-
-    V: dict[str, VersionData] = {v: VersionData(d={}, etc=[0.0] * 12) for v in ("cur", "prev", "prior", "plan")}
-    basis_month = current_basis_month(db)
-
-    # 연구소가 직접 추가한 행(label이 있는 cost_entries 행)은 extra-rows 엔드포인트가 따로 내려주므로
-    # d[pk]에서는 제외한다(두 군데서 중복·drift 방지).
-    custom_keys: set[tuple[str, str]] = set(
-        db.execute(
-            select(CostEntry.scope_code, CostEntry.category_code).where(
-                CostEntry.account_code == ACCOUNT_KEY, CostEntry.label.is_not(None)
-            )
-        ).all()
-    )
-
-    actualV: dict[str, ActualSnapshot] = {}
-
-    # cur("속보") = forecast 버전 중 지금 기준월(basis_month) 1건
-    if basis_month:
-        forecast_yyyymm = yyyymm(basis_year, basis_month)
-        forecast_entries = [
-            entry
-            for entry in db.scalars(
-                select(CostEntry).where(
-                    CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast", CostEntry.yyyymm == forecast_yyyymm,
-                )
-            )
-            if entry.scope_code in lab_pks and (entry.scope_code, entry.category_code) not in custom_keys
-        ]
-        forecast_months = entry_months_bulk(db, forecast_entries)
-        for entry in forecast_entries:
-            pk = entry.scope_code
-            months = forecast_months[entry.id]
-            if pk == "_ETC":
-                V["cur"].etc = months
-            else:
-                V["cur"].d.setdefault(pk, {})[entry.category_code] = months
-
-    # cur의 "실적" 스냅샷 = actual 버전 중 올해(basis_year) 안에서 가장 최근(마감월 최댓값) 확정분
-    actual_rows = list(
-        db.scalars(
-            select(CostEntry).where(
-                CostEntry.account_code == ACCOUNT_KEY,
-                CostEntry.version == "actual",
-                CostEntry.yyyymm.like(f"{basis_year:04d}%"),
-            )
-        )
-    )
-    if actual_rows:
-        latest_yyyymm = max(e.yyyymm for e in actual_rows)
-        athru = ym_month(latest_yyyymm)
-        snap = ActualSnapshot(thru_month=athru, d={}, etc=[0.0] * 12)
-        latest_actual_entries = [
-            entry
-            for entry in actual_rows
-            if entry.yyyymm == latest_yyyymm
-            and entry.scope_code in lab_pks
-            and (entry.scope_code, entry.category_code) not in custom_keys
-        ]
-        latest_actual_months = entry_months_bulk(db, latest_actual_entries)
-        for entry in latest_actual_entries:
-            pk = entry.scope_code
-            months = latest_actual_months[entry.id]
-            if pk == "_ETC":
-                snap.etc = months
-            else:
-                snap.d.setdefault(pk, {})[entry.category_code] = months
-        actualV["cur"] = snap
-        # prev(전실행) = cur의 "실적" 스냅샷(가장 최근에 마감된 달) 그대로.
-        V["prev"].d = {pk: dict(cats) for pk, cats in snap.d.items()}
-        V["prev"].etc = list(snap.etc)
-
-    # prior(전년 실적) = 작년(basis_year - 1) actual 중 마감월이 가장 큰(그 해 마감 시점) 스냅샷.
-    prior_year = basis_year - 1
-    prior_rows = list(
-        db.scalars(
-            select(CostEntry).where(
-                CostEntry.account_code == ACCOUNT_KEY,
-                CostEntry.version == "actual",
-                CostEntry.yyyymm.like(f"{prior_year:04d}%"),
-            )
-        )
-    )
-    if prior_rows:
-        latest_prior_yyyymm = max(e.yyyymm for e in prior_rows)
-        latest_prior_entries = [
-            entry
-            for entry in prior_rows
-            if entry.yyyymm == latest_prior_yyyymm
-            and entry.scope_code in lab_pks
-            and (entry.scope_code, entry.category_code) not in custom_keys
-        ]
-        latest_prior_months = entry_months_bulk(db, latest_prior_entries)
-        for entry in latest_prior_entries:
-            pk = entry.scope_code
-            months = latest_prior_months[entry.id]
-            if pk == "_ETC":
-                V["prior"].etc = months
-            else:
-                V["prior"].d.setdefault(pk, {})[entry.category_code] = months
-
-    # plan(경영계획) = management_plan_entries(plan_no="P00")에서.
-    plan_entries = [
-        entry
-        for entry in db.scalars(
-            select(ManagementPlanEntry).where(
-                ManagementPlanEntry.account_code == ACCOUNT_KEY,
-                ManagementPlanEntry.year == basis_year,
-                ManagementPlanEntry.plan_no == PLAN_NO,
-            )
-        )
-        if entry.scope_code in lab_pks
-    ]
-    plan_months = plan_entry_months_bulk(db, [e.id for e in plan_entries])
-    for entry in plan_entries:
-        pk = entry.scope_code
-        months = plan_months[entry.id]
-        if pk == "_ETC":
-            V["plan"].etc = months
-        else:
-            V["plan"].d.setdefault(pk, {})[entry.category_code] = months
-
-    files: dict[str, dict[str, FileInfo]] = {v: {} for v in ("cur", "prev", "prior", "plan")}
-    latest_upload: dict[tuple[str, str], Upload] = {
-        (up.version, up.scope_key): up
-        for up in db.scalars(_latest_uploads_stmt(lab_pks, list(files)))
-    }
-    for (version, pk), up in latest_upload.items():
-        files[version][pk] = FileInfo(file=up.filename, at=up.uploaded_at.strftime("%m.%d %H:%M"))
-
-    note: dict[str, dict[str, str]] = {}
-    for n in db.scalars(select(Note).where(Note.account_key == ACCOUNT_KEY)):
-        key = f"{n.base_version}|{n.period}|{n.scope}"
-        note.setdefault(key, {})[n.category_key] = n.note_text
-
-    reason = [
-        ReasonRow(
-            lab_code=r.lab_code,
-            version=r.version,
-            category_key=r.category_key,
-            block=r.block,
-            mon_label=r.mon_label,
-            plan_value=float(r.plan_value),
-            prev_value=float(r.prev_value),
-            cur_value=float(r.cur_value),
-            diff_plan=float(r.diff_plan),
-            diff_prev=float(r.diff_prev),
-            remark_plan=r.remark_plan,
-            remark_prev=r.remark_prev,
-            prev_label=r.prev_label,
-            cur_label=r.cur_label,
-            source_file=r.source_file,
-        )
-        # 정렬 키는 유니크 키(lab_code, version, category_key, block)와 같게 둔다 — 정렬을 안 하면
-        # 같은 요청이 매번 다른 순서를 돌려준다(upsert가 행을 건드리면 물리 순서가 바뀐다). 화면의
-        # 증감사유 표가 새로 고칠 때마다 섞이고, 챗봇이 "위에서 세 번째 줄"처럼 위치로 말할 때도
-        # 어긋난다. 외주용역(아래)은 처음부터 order_by가 있었다.
-        for r in db.scalars(
-            select(OverseasReasonRow)
-            .where(OverseasReasonRow.lab_code.in_(lab_codes))
-            .order_by(
-                OverseasReasonRow.lab_code,
-                OverseasReasonRow.version,
-                OverseasReasonRow.category_key,
-                OverseasReasonRow.block,
-            )
-        )
-    ]
-
-    # 외주용역 상세 — 마스터(행) + 디테일(월 금액)을 12개월 배열로 합쳐 내려준다.
-    vendor_rows = list(
-        db.scalars(
-            select(OverseasVendorRow)
-            .where(OverseasVendorRow.lab_code.in_(lab_codes))
-            .order_by(OverseasVendorRow.lab_code, OverseasVendorRow.row_no)
-        )
-    )
-    vendor_months: dict[int, list[float]] = {}
-    if vendor_rows:
-        for d in db.scalars(
-            select(OverseasVendorRowDetail).where(
-                OverseasVendorRowDetail.vendor_row_id.in_([r.id for r in vendor_rows]),
-                OverseasVendorRowDetail.year == basis_year,
-            )
-        ):
-            vendor_months.setdefault(d.vendor_row_id, [0.0] * 12)[d.month - 1] = float(d.amount)
-    vendor = [
-        VendorRow(
-            lab_code=r.lab_code, version=r.version, row_no=r.row_no, category=r.category, project=r.project,
-            company=r.company, description=r.description, m=vendor_months.get(r.id, [0.0] * 12),
-            source_file=r.source_file,
-        )
-        for r in vendor_rows
-    ]
-
-    cp = [
-        CpRow(
-            year=r.year,
-            poc_type=r.poc_type,
-            poc_proj=r.poc_proj,
-            poc_desc=r.poc_desc,
-            title=r.title,
-            dedicated=float(r.dedicated),
-            common=float(r.common),
-            man_month=float(r.man_month),
-            cost_year=float(r.cost_year),
-            poc_cost_sum=float(r.poc_cost_sum),
-            poc_mm_sum=float(r.poc_mm_sum),
-            poc_direct=float(r.poc_direct),
-            poc_ovh=float(r.poc_ovh),
-            poc_total=float(r.poc_total),
-            source_file=r.source_file,
-        )
-        # 화면은 기준연도의 CP만 그리므로(core.js가 r.year === 기준연도로 거른다) 그 연도만 내려보낸다.
-        # 저장은 보낸 연도만 교체하므로 다른 연도 행은 영향받지 않는다.
-        # 정렬은 증감사유와 같은 이유로 유니크 키 순서로 고정한다 — 연도 단위로 전체를 지우고 다시
-        # 넣는 경로라(아래 4-3) 순서가 보장되지 않으면 POC·직급 표가 저장할 때마다 섞인다.
-        for r in db.scalars(
-            select(OverseasCpRow)
-            .where(OverseasCpRow.year == f"{basis_year:04d}")
-            .order_by(
-                OverseasCpRow.year, OverseasCpRow.poc_type, OverseasCpRow.poc_proj, OverseasCpRow.title
-            )
-        )
-    ]
-
-    return OverseasState(
-        step=step, basis_year=basis_year, basis_month=basis_month, V=V, actualV=actualV, files=files, note=note,
-        reason=reason, vendor=vendor, cp=cp,
-    )
+    """취합 화면이 처음 열릴 때 받는 전체 상태. 조립은 services가 한다 —
+    집계 엔드포인트가 이 핸들러를 함수로 직접 부르던 걸 끊기 위함이다(PLAN.md P1-1)."""
+    return build_state(db, basis_year)
 
 
 @router.put("/overseas/state")
@@ -574,7 +321,7 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     # pk×version 조합마다 따로 조회하지 않고, 이 계정의 업로드 이력을 한 번에 읽어 메모리에서 비교한다.
     latest_filename: dict[tuple[str, str], str] = {
         (up.version, up.scope_key): up.filename
-        for up in db.scalars(_latest_uploads_stmt(lab_pks, list(state.files)))
+        for up in db.scalars(latest_uploads_stmt(lab_pks, list(state.files)))
     }
     for version, pk_files in state.files.items():
         for pk, info in pk_files.items():
@@ -690,7 +437,7 @@ def get_labor_split(
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
-    state = get_overseas_state(basis_year=basis_year, db=db)
+    state = build_state(db, basis_year)
     cur_d, base_d = state.V["cur"].d, state.V[base_version].d
     if not cur_d:
         raise HTTPException(404, f"{basis_year}년 당월 속보 데이터가 없다.")
@@ -835,7 +582,7 @@ def get_overseas_summary(
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
-    state = get_overseas_state(basis_year=basis_year, db=db)
+    state = build_state(db, basis_year)
     vd = state.V[version]
     if not vd.d:
         label = {"cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[version]
@@ -858,7 +605,7 @@ def get_overseas_summary(
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
 
     api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = extra_row_months(list_extra_rows(yyyymm=yyyymm(basis_year, basis_month), version=api_version, db=db))
+    extras = extra_row_months(read_extra_rows(db, yyyymm=yyyymm(basis_year, basis_month), version=api_version))
     cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
 
     total = labor = 0.0
@@ -1288,10 +1035,6 @@ def delete_lab_sheet(lab_code: str, sheet_key: str, db: Session = Depends(get_db
     return {"status": "ok"}
 
 
-def _check_version(version: str) -> str:
-    if version not in ("forecast", "actual"):
-        raise HTTPException(status_code=400, detail='version은 "forecast" 또는 "actual"이어야 합니다.')
-    return version
 
 
 @router.get("/overseas/cost-entries", response_model=list[CostEntryOut])
@@ -1307,9 +1050,9 @@ def list_cost_entries(
     이어지고 year도 그만큼 넘어간다(기간을 12개월 너머로 늘려 받을 때 쓰는 확장 지점)."""
     stmt = select(CostEntry).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.yyyymm == yyyymm)
     if version:
-        stmt = stmt.where(CostEntry.version == _check_version(version))
+        stmt = stmt.where(CostEntry.version == check_version(version))
     if lab_pk:
-        stmt = stmt.where(CostEntry.scope_code == _check_lab_pk(db, lab_pk))
+        stmt = stmt.where(CostEntry.scope_code == check_lab_pk(db, lab_pk))
     if category_key:
         stmt = stmt.where(CostEntry.category_code == category_key)
     entries = list(db.scalars(stmt))
@@ -1331,8 +1074,8 @@ def list_cost_entries(
 
 @router.put("/overseas/cost-entries", response_model=CostEntryOut)
 def upsert_cost_entry(body: CostEntryIn, db: Session = Depends(get_db)) -> CostEntryOut:
-    _check_lab_pk(db, body.lab_pk)
-    _check_version(body.version)
+    check_lab_pk(db, body.lab_pk)
+    check_version(body.version)
     _check_category(db, body.category_key)
     entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.category_key, body.yyyymm)
     base_year = ym_year(body.yyyymm)
@@ -1359,7 +1102,7 @@ def list_uploads(
     if version:
         stmt = stmt.where(Upload.version == version)
     if lab_pk:
-        stmt = stmt.where(Upload.scope_key == _check_lab_pk(db, lab_pk))
+        stmt = stmt.where(Upload.scope_key == check_lab_pk(db, lab_pk))
     return [
         UploadOut(lab_pk=u.scope_key, version=u.version, filename=u.filename, uploaded_at=u.uploaded_at, s3_key=u.s3_key)
         for u in db.scalars(stmt)
@@ -1368,7 +1111,7 @@ def list_uploads(
 
 @router.post("/overseas/uploads", response_model=UploadOut)
 def record_upload(body: UploadIn, db: Session = Depends(get_db)) -> UploadOut:
-    _check_lab_pk(db, body.lab_pk)
+    check_lab_pk(db, body.lab_pk)
     up = Upload(account_key=ACCOUNT_KEY, scope_key=body.lab_pk, version=body.version, filename=body.filename)
     db.add(up)
     db.commit()
@@ -1388,7 +1131,7 @@ async def upload_raw_file(
     되돌릴 유일한 근거이고, 양식이 바뀐 뒤 과거 파일을 그때 양식으로 다시 읽을 때도 필요하다.
     보관에 실패해도 s3_key만 NULL로 남을 뿐 업로드 이력 자체는 기록된다 — 이 엔드포인트가 막혀도
     /overseas/state 저장 흐름(파싱 결과)에는 영향이 없다."""
-    _check_lab_pk(db, lab_pk)
+    check_lab_pk(db, lab_pk)
     data = await file.read()
     # 파일명은 사용자가 준 값이라 경로 구분자나 ".."가 섞일 수 있다 — 보관 키에 그대로 쓰면 폴더
     # 밖을 가리킬 수 있어 마지막 경로 조각만 남기고 위험한 문자를 지운다(로컬 보관 시 특히 중요).
@@ -1660,16 +1403,16 @@ def scan_anomalies(body: AnomalyScanIn, db: Session = Depends(get_db)) -> Anomal
     ([계정 확정] 전에 "아직 남아 있는 이상"을 세는 경로). 비교할 전실행(base_*)을 안 주면
     급변·단위(배수) 검사는 건너뛰고 그 사실을 skipped로 알린다 — 조용히 빠지면 "이상 없음"으로
     읽힌다."""
-    _check_lab_pk(db, body.lab_pk, allow_all=True)
-    _check_version(body.version)
+    check_lab_pk(db, body.lab_pk, allow_all=True)
+    check_version(body.version)
     vals = body.vals
     if vals is None:
-        vals = _months_by_category(db, body.lab_pk, body.version, body.yyyymm)
+        vals = months_by_category(db, body.lab_pk, body.version, body.yyyymm)
     base_vals = None
     skipped: list[str] = []
     if body.base_yyyymm and body.base_version:
-        _check_version(body.base_version)
-        base_vals = _months_by_category(db, body.lab_pk, body.base_version, body.base_yyyymm)
+        check_version(body.base_version)
+        base_vals = months_by_category(db, body.lab_pk, body.base_version, body.base_yyyymm)
         if not base_vals:
             base_vals = None
     if base_vals is None:
@@ -1751,8 +1494,8 @@ def carry_forward_defs(body: CarryForwardIn, db: Session = Depends(get_db)) -> C
 
     이미 to 버전에 같은 행·열이 있으면 건너뛴다 — 덮어쓰면 새 버전에서 사람이 고친 계산식이
     지난 버전 것으로 되돌아간다. 두 번 호출해도 결과가 같다(새 버전을 여러 번 열어도 안전)."""
-    _check_version(body.from_version)
-    _check_version(body.to_version)
+    check_version(body.from_version)
+    check_version(body.to_version)
     if (body.from_yyyymm, body.from_version) == (body.to_yyyymm, body.to_version):
         raise HTTPException(status_code=400, detail="같은 버전으로는 복제할 수 없습니다.")
     defs = list(db.scalars(select(CarryDef).where(CarryDef.account_key == ACCOUNT_KEY)))
@@ -1860,7 +1603,7 @@ def _match_candidates(db: Session, yyyymm: str, version: str | None) -> list[dic
         CostEntry.is_derived.is_(False),
     )
     if version:
-        stmt = stmt.where(CostEntry.version == _check_version(version))
+        stmt = stmt.where(CostEntry.version == check_version(version))
     by_norm: dict[str, dict] = {}
     for entry in db.scalars(stmt):
         label = (entry.label or "").strip()
@@ -2013,7 +1756,7 @@ def list_memo_cols(
     if version:
         stmt = stmt.where(MemoCol.version == version)
     if lab_pk:
-        stmt = stmt.where(MemoCol.scope_key == _check_lab_pk(db, lab_pk))
+        stmt = stmt.where(MemoCol.scope_key == check_lab_pk(db, lab_pk))
     return [
         MemoColOut(lab_pk=c.scope_key, version=c.version, col_key=c.col_key, label=c.label) for c in db.scalars(stmt)
     ]
@@ -2021,7 +1764,7 @@ def list_memo_cols(
 
 @router.put("/overseas/memo-cols", response_model=MemoColOut)
 def upsert_memo_col(body: MemoColIn, db: Session = Depends(get_db)) -> MemoColOut:
-    _check_lab_pk(db, body.lab_pk)
+    check_lab_pk(db, body.lab_pk)
     stmt = pg_insert(MemoCol).values(
         account_key=ACCOUNT_KEY, scope_key=body.lab_pk, version=body.version, col_key=body.col_key, label=body.label,
     )
@@ -2037,7 +1780,7 @@ def upsert_memo_col(body: MemoColIn, db: Session = Depends(get_db)) -> MemoColOu
 @router.delete("/overseas/memo-cols")
 def delete_memo_col(lab_pk: str, version: str, col_key: str, db: Session = Depends(get_db)) -> dict[str, str]:
     """메모 열을 지운다 — DB가 FK로 못 묶어주므로 그 열에 달린 메모 셀(memos)도 같이 지운다."""
-    _check_lab_pk(db, lab_pk)
+    check_lab_pk(db, lab_pk)
     db.execute(
         delete(Memo).where(
             Memo.account_key == ACCOUNT_KEY, Memo.scope_key == lab_pk, Memo.version == version, Memo.col_key == col_key
@@ -2061,7 +1804,7 @@ def list_memos(version: str | None = None, lab_pk: str | None = None, db: Sessio
     if version:
         stmt = stmt.where(Memo.version == version)
     if lab_pk:
-        stmt = stmt.where(Memo.scope_key == _check_lab_pk(db, lab_pk))
+        stmt = stmt.where(Memo.scope_key == check_lab_pk(db, lab_pk))
     return [
         MemoOut(lab_pk=m.scope_key, version=m.version, row_key=m.row_key, col_key=m.col_key, text=m.text)
         for m in db.scalars(stmt)
@@ -2070,7 +1813,7 @@ def list_memos(version: str | None = None, lab_pk: str | None = None, db: Sessio
 
 @router.put("/overseas/memos", response_model=MemoOut)
 def upsert_memo(body: MemoIn, db: Session = Depends(get_db)) -> MemoOut:
-    _check_lab_pk(db, body.lab_pk)
+    check_lab_pk(db, body.lab_pk)
     stmt = pg_insert(Memo).values(
         account_key=ACCOUNT_KEY,
         scope_key=body.lab_pk,
@@ -2121,8 +1864,6 @@ def _check_delete_step(step: str | None, is_derived: bool, what: str) -> None:
             f"(지금 단계: '{step or '알 수 없음'}'). '{required}' 화면으로 이동한 뒤 지워주세요."
         ),
     )
-# 근거 문장에 쓰는 연산 기호 — 사용자에게 "인건비 ÷ 인력"처럼 보여주기 위함.
-_OP_SYMBOL = {"sum_elementwise": " + ", "div_elementwise": " ÷ "}
 
 
 def _check_row_formula(formula: dict | None) -> dict:
@@ -2155,79 +1896,10 @@ def _check_col_formula(formula: dict | None) -> dict:
     return {"op": op, "months": months}
 
 
-def _months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> dict[str, list[float]]:
-    """그 연구소·버전·연월에 저장된 모든 행의 월별 값을 category_code -> 월 배열로 모아 온다.
-    파생 행(is_derived)은 제외한다 — 파생값을 다시 파생의 재료로 쓰면 평가가 꼬이고 순환할 수 있다.
-    lab_pk가 ALL_SCOPE면 전체 연구소를 계정별로 합산한다(집계 화면의 파생 행이 쓰는 범위) —
-    비율은 연구소별로 따로 계산해서 더하면 뜻이 없어지므로, 재료를 먼저 다 더한 뒤 계산해야 한다."""
-    stmt = select(CostEntry).where(
-        CostEntry.account_code == ACCOUNT_KEY,
-        CostEntry.version == version,
-        CostEntry.yyyymm == yyyymm,
-        CostEntry.is_derived.is_(False),
-    )
-    if lab_pk != ALL_SCOPE:
-        stmt = stmt.where(CostEntry.scope_code == lab_pk)
-    entries = list(db.scalars(stmt))
-    months_by_entry = entry_months_bulk(db, entries)
-    out: dict[str, list[float]] = {}
-    for e in entries:
-        acc = out.setdefault(e.category_code, [])
-        for i, v in enumerate(months_by_entry[e.id]):
-            # 파생 행의 재료 — 미등록은 0으로 보고 더한다(있는 값만 더하는 것과 결과가 같다).
-            if i < len(acc):
-                acc[i] += n(v)
-            else:
-                acc.append(n(v))
-    return out
 
 
-def _operand_months(key: str, by_category: dict[str, list[float]], width: int) -> list[float]:
-    """계정 키 하나를 월 배열로 바꾼다. 집계 그룹(인건비 등)이면 리프까지 전개해서 월별로 더한다."""
-    out = [0.0] * width
-    for leaf in resolve_leaves(key):
-        for i, v in enumerate(by_category.get(leaf, [])[:width]):
-            out[i] += v
-    return [round(v, 4) for v in out]
 
 
-def _eval_row_formula(by_category: dict[str, list[float]], formula: dict) -> tuple[list[float], dict]:
-    """파생 행의 계산식을 지금 저장된 원본 값으로 평가해 (월별 값, 근거)를 돌려준다.
-    근거는 "인건비 1,000 ÷ 인력 10 = 100"처럼 사용자·챗봇에게 그대로 보여줄 수 있는 형태로 만든다.
-    by_category는 _months_by_category 결과 — 파생 행이 여러 개일 때 매번 다시 조회하지 않도록
-    호출부에서 (연구소·버전·연월)당 한 번만 구해서 넘긴다."""
-    op, operand_keys = formula["op"], formula["operands"]
-    # 재료들의 월 개수가 다를 수 있어(어떤 계정만 24개월치가 들어온 경우) 가장 긴 쪽에 맞춘다.
-    width = max((len(v) for v in by_category.values()), default=12) or 12
-    series = [_operand_months(k, by_category, width) for k in operand_keys]
-
-    values: list[float] = []
-    for i in range(width):
-        if op == "sum_elementwise":
-            values.append(round(sum(s[i] for s in series), 4))
-        else:  # div_elementwise — 분모가 0인 달은 계산할 수 없어 0으로 둔다(근거에 그대로 드러난다)
-            numerator, denominator = series[0][i], series[1][i]
-            values.append(round(numerator / denominator, 4) if denominator else 0.0)
-
-    operands_basis = [
-        {"key": k, "label": category_label(k), "months": s, "sum": round(sum(s), 4)}
-        for k, s in zip(operand_keys, series)
-    ]
-    # 연간 근거: 합이면 각 재료의 연간합을 더하고, 나누기면 "분자 연간합 ÷ 분모 연간합"으로 낸다
-    # (월별 비율 12개를 더하는 건 뜻이 없다 — 연간 인당인건비는 연간 인건비 ÷ 연간 인력이다).
-    sums = [o["sum"] for o in operands_basis]
-    annual = round(sum(sums), 4) if op == "sum_elementwise" else (round(sums[0] / sums[1], 4) if sums[1] else 0.0)
-    basis = {
-        "text": _OP_SYMBOL[op].join(o["label"] for o in operands_basis),
-        "op": op,
-        "operands": operands_basis,
-        "months": [
-            {"month": i + 1, "values": [s[i] for s in series], "result": values[i]}
-            for i in range(min(width, 12))
-        ],
-        "annual": {"values": sums, "result": annual},
-    }
-    return values, basis
 
 
 def _eval_col_formula(formula: dict, row_months: list[float]) -> tuple[float, dict]:
@@ -2244,42 +1916,6 @@ def _eval_col_formula(formula: dict, row_months: list[float]) -> tuple[float, di
     }
 
 
-@router.get("/overseas/extra-rows", response_model=list[ExtraRowOut])
-def list_extra_rows(
-    yyyymm: str,
-    version: str | None = None,
-    lab_pk: str | None = None,
-    db: Session = Depends(get_db),
-) -> list[ExtraRowOut]:
-    stmt = select(CostEntry).where(
-        CostEntry.account_code == ACCOUNT_KEY, CostEntry.label.is_not(None), CostEntry.yyyymm == yyyymm,
-    )
-    if version:
-        stmt = stmt.where(CostEntry.version == _check_version(version))
-    if lab_pk:
-        stmt = stmt.where(CostEntry.scope_code == _check_lab_pk(db, lab_pk, allow_all=True))
-
-    entries = list(db.scalars(stmt))
-    months_by_entry = entry_months_bulk(db, entries)
-    # 파생 행은 저장된 월값이 없고 계산식으로 매번 계산한다. 재료값(원시 행 전체)은 그 행이 속한
-    # (연구소·버전) 조합당 한 번만 조회해서 돌려 쓴다 — 파생 행 수만큼 다시 조회하지 않도록.
-    by_category_cache: dict[tuple[str, str], dict[str, list[float]]] = {}
-    out: list[ExtraRowOut] = []
-    for entry in entries:
-        values, basis = months_by_entry[entry.id], None
-        if entry.is_derived and entry.formula:
-            cache_key = (entry.scope_code, entry.version)
-            if cache_key not in by_category_cache:
-                by_category_cache[cache_key] = _months_by_category(db, entry.scope_code, entry.version, yyyymm)
-            values, basis = _eval_row_formula(by_category_cache[cache_key], entry.formula)
-        out.append(
-            ExtraRowOut(
-                lab_pk=entry.scope_code, version=entry.version, row_key=entry.category_code, label=entry.label,
-                label_en=entry.label_en or "", yyyymm=yyyymm, anchor_key=entry.anchor_key, v=values,
-                is_derived=entry.is_derived, formula=entry.formula, basis=basis,
-            )
-        )
-    return out
 
 
 @router.put("/overseas/extra-rows", response_model=ExtraRowOut)
@@ -2293,8 +1929,8 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
         raise HTTPException(status_code=400, detail="v는 12개월치 값이거나(기본), 12의 배수(24·36…)여야 합니다.")
     # 전체 합산 범위(ALL)는 집계 화면의 파생 행 전용이다 — 원시 행(연구소가 실제로 보고한 값)은
     # 반드시 실재하는 연구소에 붙어야 하므로 ALL을 받지 않는다.
-    _check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
-    _check_version(body.version)
+    check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
+    check_version(body.version)
     # row_key가 하필 고정 계정 code(예: "sal")와 같으면 _get_or_create_entry가 그 업로드된 실제
     # 행을 "찾아서" 돌려주고, 아래 update가 그 label·월별 값을 custom row 내용으로 덮어써 버린다 —
     # 업로드 데이터가 조용히 사라지는 사고를 막기 위해 미리 막는다(label이 NULL인 기존 행 = 업로드행).
@@ -2335,8 +1971,8 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
         # 방금 저장한 계산식을 바로 평가해서 값과 근거를 함께 돌려준다 — 호출부(화면·챗봇)가
         # 저장 직후 다시 조회하지 않고도 "인건비 1,000 ÷ 인력 10 = 100"을 보여줄 수 있게.
         result.formula = formula
-        result.v, result.basis = _eval_row_formula(
-            _months_by_category(db, body.lab_pk, body.version, body.yyyymm), formula
+        result.v, result.basis = eval_row_formula(
+            months_by_category(db, body.lab_pk, body.version, body.yyyymm), formula
         )
     return result
 
@@ -2349,8 +1985,8 @@ def delete_extra_row(
     행만 지운다 — label.is_not(None) 조건이 없으면 row_key가 하필 고정 계정 code(예: "sal")와 같을 때
     업로드된 실제 데이터까지 지워버릴 수 있다.
     step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다."""
-    _check_lab_pk(db, lab_pk, allow_all=True)
-    _check_version(version)
+    check_lab_pk(db, lab_pk, allow_all=True)
+    check_version(version)
     target = db.scalar(
         select(CostEntry).where(
             CostEntry.account_code == ACCOUNT_KEY,
@@ -2384,10 +2020,10 @@ def list_extra_cols(
 ) -> list[ExtraColOut]:
     stmt = select(ExtraCol).where(ExtraCol.account_key == ACCOUNT_KEY, ExtraCol.yyyymm == yyyymm)
     if version:
-        stmt = stmt.where(ExtraCol.version == _check_version(version))
+        stmt = stmt.where(ExtraCol.version == check_version(version))
     if lab_pk:
         # 집계 화면은 전체 합산 범위(ALL)로도 조회한다 — 그 범위에 열은 없어서 빈 목록이 맞는 답이다.
-        stmt = stmt.where(ExtraCol.scope_key == _check_lab_pk(db, lab_pk, allow_all=True))
+        stmt = stmt.where(ExtraCol.scope_key == check_lab_pk(db, lab_pk, allow_all=True))
     return [
         ExtraColOut(
             lab_pk=c.scope_key, version=c.version, yyyymm=c.yyyymm, label=c.label,
@@ -2403,8 +2039,8 @@ def upsert_extra_col(body: ExtraColIn, db: Session = Depends(get_db)) -> ExtraCo
     파생 열은 칸 값 없이 이 등록만으로 끝난다(값은 계산식으로 매번 계산되므로)."""
     # 집계 화면의 파생 열은 연구소 하나가 아니라 전체 합산 범위(ALL)에 붙는다 — 행과 같은 규칙.
     # 원시 열(사람이 칸마다 값을 넣는 열)은 반드시 실재하는 연구소에 붙어야 하므로 ALL을 받지 않는다.
-    _check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
-    _check_version(body.version)
+    check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
+    check_version(body.version)
     formula = _check_col_formula(body.formula) if body.is_derived else None
     stmt = pg_insert(ExtraCol).values(
         account_key=ACCOUNT_KEY, scope_key=body.lab_pk, version=body.version, yyyymm=body.yyyymm,
@@ -2429,9 +2065,9 @@ def list_cost_extras(
 ) -> list[ExtraValueOut]:
     stmt = select(CostEntry).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.yyyymm == yyyymm)
     if version:
-        stmt = stmt.where(CostEntry.version == _check_version(version))
+        stmt = stmt.where(CostEntry.version == check_version(version))
     if lab_pk:
-        stmt = stmt.where(CostEntry.scope_code == _check_lab_pk(db, lab_pk, allow_all=True))
+        stmt = stmt.where(CostEntry.scope_code == check_lab_pk(db, lab_pk, allow_all=True))
     entries = list(db.scalars(stmt))
     entries_by_id = {e.id: e for e in entries}
     if not entries_by_id:
@@ -2481,8 +2117,8 @@ def list_cost_extras(
 
 @router.put("/overseas/cost-extras", response_model=ExtraValueOut)
 def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> ExtraValueOut:
-    _check_lab_pk(db, body.lab_pk)
-    _check_version(body.version)
+    check_lab_pk(db, body.lab_pk)
+    check_version(body.version)
     # 칸 값을 넣으면 그 열이 원시 열로 등록돼 있어야 한다(아직 없으면 지금 등록). 파생 열에는 칸 값을
     # 직접 넣을 수 없다 — 계산식 결과와 수동 입력값이 섞이면 어느 쪽이 참인지 알 수 없어진다.
     existing_col = db.scalar(
@@ -2525,8 +2161,8 @@ def delete_extra_col(
 ) -> dict[str, str]:
     """열 등록을 지우고, 그 열(label)이 달린 같은 yyyymm의 모든 행에서 칸 값도 같이 지운다.
     step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다."""
-    _check_lab_pk(db, lab_pk, allow_all=True)
-    _check_version(version)
+    check_lab_pk(db, lab_pk, allow_all=True)
+    check_version(version)
     target = db.scalar(
         select(ExtraCol).where(
             ExtraCol.account_key == ACCOUNT_KEY, ExtraCol.scope_key == lab_pk,
@@ -2602,7 +2238,7 @@ def list_sheet_rows(
     if version:
         stmt = stmt.where(SheetRow.version == version)
     if lab_pk:
-        stmt = stmt.where(SheetRow.scope_key == _check_lab_pk(db, lab_pk))
+        stmt = stmt.where(SheetRow.scope_key == check_lab_pk(db, lab_pk))
     if sheet_key:
         stmt = stmt.where(SheetRow.sheet_key == sheet_key)
     return [
@@ -2615,7 +2251,7 @@ def list_sheet_rows(
 
 @router.put("/overseas/sheet-rows", response_model=SheetRowOut)
 def upsert_sheet_row(body: SheetRowIn, db: Session = Depends(get_db)) -> SheetRowOut:
-    _check_lab_pk(db, body.lab_pk)
+    check_lab_pk(db, body.lab_pk)
     stmt = pg_insert(SheetRow).values(
         account_key=ACCOUNT_KEY,
         scope_key=body.lab_pk,
@@ -2636,7 +2272,7 @@ def upsert_sheet_row(body: SheetRowIn, db: Session = Depends(get_db)) -> SheetRo
 
 @router.delete("/overseas/sheet-rows")
 def delete_sheet_row(lab_pk: str, version: str, sheet_key: str, row_key: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    _check_lab_pk(db, lab_pk)
+    check_lab_pk(db, lab_pk)
     db.execute(
         delete(SheetRow).where(
             SheetRow.account_key == ACCOUNT_KEY,
@@ -2653,7 +2289,7 @@ def delete_sheet_row(lab_pk: str, version: str, sheet_key: str, row_key: str, db
 @router.delete("/overseas/sheet-rows/all")
 def delete_sheet_rows_all(lab_pk: str, version: str, sheet_key: str, db: Session = Depends(get_db)) -> dict[str, str]:
     """시트를 다시 업로드할 때 이전 행을 한 번에 지우기 위한 용도(행 개수가 매번 다를 수 있어서)."""
-    _check_lab_pk(db, lab_pk)
+    check_lab_pk(db, lab_pk)
     db.execute(
         delete(SheetRow).where(
             SheetRow.account_key == ACCOUNT_KEY,
@@ -2724,3 +2360,12 @@ def _bulk_upsert_reason_rows(db: Session, reason_rows: list[ReasonRow]) -> None:
     db.execute(stmt)
 
 
+@router.get("/overseas/extra-rows", response_model=list[ExtraRowOut])
+def list_extra_rows(
+    yyyymm: str,
+    version: str | None = None,
+    lab_pk: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[ExtraRowOut]:
+    """연구소가 추가한 행. 읽기는 services가 한다 — 집계도 같은 함수를 부른다(PLAN.md P1-1)."""
+    return read_extra_rows(db, yyyymm=yyyymm, version=version, lab_pk=lab_pk)

@@ -26,11 +26,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.v1.endpoints.overseas_variance import _active_labs, _load_cost_version
 from app.core.cost_groups import resolve_leaves
 from app.core.periods import month_value, yyyymm
 from app.core.values import n
 from app.services.overseas.fxcalc import rate_arrays
+from app.services.overseas.variance import active_labs, load_cost_version
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.core.voucher_match import match_rule, normalize, suggest_lab, suggest_rules
 from app.db.session import get_db
@@ -125,7 +125,7 @@ def _vouchers(db: Session, year: int, month: int, account_key: str | None = None
 
 def _lab_list(db: Session, year: int, month: int) -> list[dict]:
     """AI 매칭에 넘길 연구소 목록. 합계 행·원화 기타는 _active_labs가 이미 빼 준다."""
-    labs = _active_labs(db, year, month)
+    labs = active_labs(db, year, month)
     return [
         {"pk": lab.pk, "lab_code": lab.lab_code, "name": lab.name}
         for lab in sorted(labs.values(), key=lambda x: (x.sort_order, x.pk))
@@ -511,13 +511,13 @@ def _prev_lab_krw(db: Session, year: int, month: int) -> tuple[dict[str, float],
 
     속보 금액은 K$로 저장돼 있고 전표는 원화라서, 비교하려면 한쪽을 환산해야 한다. 속보 쪽을 원화로
     바꾸는 이유: 전표 금액을 건드리면 ERP와 안 맞아진다(공통 RULE: 원본 보관)."""
-    labs = _active_labs(db, year, month)
+    labs = active_labs(db, year, month)
     if not labs:
         return {}, 0.0
     j = month - 1
     rate = rate_arrays(db, year, month, "forecast", set(), (j,))
     usd_krw = rate["USD"][j]
-    data = _load_cost_version(db, "forecast", yyyymm(year, month), set(labs))
+    data = load_cost_version(db, "forecast", yyyymm(year, month), set(labs))
     leaves = resolve_leaves("tot")
     out: dict[str, float] = {}
     for pk in labs:
@@ -634,7 +634,7 @@ def get_overseas_mapping(basis_year: int, basis_month: int, db: Session = Depend
     상단 표와 전표 목록을 한 응답으로 내려주는 이유: 두 번 호출해서 합치면 연구소 합계와 전표 합이
     서로 다른 시점 값이 되어, 합계는 맞는데 전표를 세면 안 맞는 표가 나온다."""
     _check_month(basis_month)
-    labs = _active_labs(db, basis_year, basis_month)
+    labs = active_labs(db, basis_year, basis_month)
     prev_by_pk, prev_total = _prev_lab_krw(db, basis_year, basis_month)
     rows = _vouchers(db, basis_year, basis_month, ACCOUNT_KEY)
     maps = _map_rows(db, basis_year, basis_month)
@@ -761,7 +761,7 @@ def put_overseas_mapping(body: MapEditIn, db: Session = Depends(get_db)) -> MapE
     저장 직후 규칙 제안을 같이 내려준다 — 화면이 [저장] 다음 화면에서 바로 "앞으로 이렇게 할까요?"를
     물을 수 있어야 담당자가 그 자리에서 답한다(따로 호출하면 그 질문을 아무도 안 본다)."""
     _check_month(body.basis_month)
-    labs = _active_labs(db, body.basis_year, body.basis_month)
+    labs = active_labs(db, body.basis_year, body.basis_month)
     names = _account_names(db)
     saved = 0
     for edit in body.edits:

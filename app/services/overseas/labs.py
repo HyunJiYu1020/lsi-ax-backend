@@ -19,6 +19,12 @@ from app.models import Account, OverseasLab, OverseasLabRevision
 # cost_entries 등 공용 테이블은 account_code로 계정을 구분한다. 이 계정은 해외연구소 고정.
 ACCOUNT_KEY = "overseas"
 
+# 집계 화면의 파생 행이 쓰는 "전체 연구소 합산" 범위. cost_entries.scope_code 주석에 이미 적혀 있는
+# 관례("없는 계정은 상수 ALL")를 그대로 쓴다 — 연구소 하나가 아니라 전체를 가리키는 행이라는 뜻이다.
+# 비율 파생 행(인당인건비 등)은 연구소별로 계산해서 더하면 뜻이 없어지므로, 집계에서는 재료를 전체
+# 합산한 뒤 계산해야 해서 이 범위가 필요하다.
+ALL_SCOPE = "ALL"
+
 
 def overseas_account(db: Session) -> Account:
     acct = db.scalar(select(Account).where(Account.key == ACCOUNT_KEY))

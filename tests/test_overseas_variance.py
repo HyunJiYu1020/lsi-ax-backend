@@ -9,7 +9,7 @@
 - [1차 고정]은 보고까지 끝난 값을 지키는 장치라, 켜진 동안 쓰기가 실제로 막혀야 한다.
 
 환차 분해는 DB에 "두 버전의 환율이 서로 다른" 상황을 만들기 어려워서(시드는 속보·실적 환율이
-같다) 계산 함수(_variance_cells)에 환율 배열을 직접 넣어 검증한다 — 식 자체가 틀렸는지를 보는
+같다) 계산 함수(services의 variance_cells)에 환율 배열을 직접 넣어 검증한다 — 식 자체가 틀렸는지를 보는
 테스트라 DB를 거칠 필요가 없다.
 """
 
@@ -17,6 +17,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.v1.endpoints import overseas_variance as ov
+from app.services.overseas import variance as varsvc
 from app.api.v1.endpoints.overseas import LabView
 from app.models import CloseAccountStage
 from app.services.overseas.entries import current_basis_month
@@ -93,11 +94,11 @@ def _lab(pk: str, currency: str) -> LabView:
 
 
 def _cells_with_rates(monkeypatch, labs, cur_d, base_d, rate_cur, rate_base, ix=(0,)):
-    """rate_arrays를 고정 환율로 바꿔치고 _variance_cells만 돌린다 — 시드 환율은 속보·실적이
+    """rate_arrays를 고정 환율로 바꿔치고 variance_cells만 돌린다 — 시드 환율은 속보·실적이
     같아서 DB로는 "환율이 움직인 상황"을 만들 수 없다."""
     calls = iter([rate_cur, rate_base])
-    monkeypatch.setattr(ov, "rate_arrays", lambda *a, **k: next(calls))
-    return ov._variance_cells(
+    monkeypatch.setattr(varsvc, "rate_arrays", lambda *a, **k: next(calls))
+    return varsvc.variance_cells(
         None, labs, list(labs), cur_d, base_d, ix, (2026, 9, "forecast"), (2026, 8, "actual"), True
     )
 

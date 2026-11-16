@@ -23,6 +23,9 @@ from app.core.values import n
 from app.services.overseas.fxcalc import rate_arrays
 from app.services.overseas.entries import current_basis_month
 from app.services.overseas.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
+from app.services.overseas.extra_rows import read_extra_rows
+from app.services.overseas.state import build_state
+from app.services.overseas.variance import compute_reason_check
 from app.services.overseas.aggregate import (
     LABOR_TREE,
     TOT_TREE,
@@ -30,11 +33,6 @@ from app.services.overseas.aggregate import (
     extra_row_months,
     krw_months,
 )
-from app.api.v1.endpoints.overseas import (
-    list_extra_rows,
-    get_overseas_state,
-)
-from app.api.v1.endpoints.overseas_variance import check_variance_reasons
 from app.db.session import get_db
 from app.models import CostEntry, CostEntryDetail, OverseasCpRow
 from app.schemas.overseas import (
@@ -182,7 +180,7 @@ def check_overseas_confirm(
     # 필요한 항목. 판정은 증감분석 화면과 같은 함수를 쓴다(두 군데서 따로 세면 숫자가 어긋난다).
     reason_missing = reason_stale = 0
     try:
-        chk = check_variance_reasons(basis_year=basis_year, basis_month=month, kind=kind, db=db)
+        chk = compute_reason_check(db, basis_year=basis_year, basis_month=month, kind=kind)
         reason_missing, reason_stale = len(chk.missing), len(chk.stale)
     except HTTPException:
         # 비교 기준(전실행 등)이 아직 없으면 사유를 따질 수 없다 — 그건 경고가 아니라 "해당 없음"이다.
@@ -240,7 +238,7 @@ def get_labor_ratio(
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
-    state = get_overseas_state(basis_year=basis_year, db=db)
+    state = build_state(db, basis_year)
     vd = state.V[version]
     if not vd.d:
         label = {"cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[version]
@@ -259,7 +257,7 @@ def get_labor_ratio(
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
     api_version = "actual" if version in ("prev", "prior") else "forecast"
     extras = extra_row_months(
-        list_extra_rows(yyyymm=yyyymm(basis_year, basis_month), version=api_version, db=db)
+        read_extra_rows(db, yyyymm=yyyymm(basis_year, basis_month), version=api_version)
     )
     cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
 
