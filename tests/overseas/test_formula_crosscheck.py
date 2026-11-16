@@ -27,7 +27,7 @@ from app.accounts.overseas.services.fxcalc import rate_arrays
 
 BASIS_YEAR = 2026
 HARNESS = Path(__file__).parent / "js_formula_harness.mjs"
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]  # tests/overseas/ → backend → S.LSI (프런트가 옆에 있다)
 
 # 프런트 소스나 node가 없는 환경(CI 컨테이너에 백엔드만 올린 경우)에서는 대조할 상대가 없으므로 스킵한다.
 pytestmark = pytest.mark.skipif(

@@ -36,7 +36,7 @@ register(
 );
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const REPO = path.resolve(HERE, "../..");
+const REPO = path.resolve(HERE, "../../..");  // tests/overseas/ → tests → backend → S.LSI
 const CORE_JS = path.join(REPO, "frontend-html/shared/core.js");
 const CALC_JS = path.join(REPO, "frontend/src/logic/calc.js");
 const CONST_JS = path.join(REPO, "frontend/src/data/overseasConstants.js");
