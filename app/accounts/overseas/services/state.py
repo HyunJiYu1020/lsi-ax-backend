@@ -16,7 +16,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.shared.core.periods import ym_month, yyyymm
-from app.accounts.overseas.models import OverseasCpRow, OverseasReasonRow, OverseasVendorRow, OverseasVendorRowDetail
+from app.accounts.overseas.models import OverseasReasonRow, OverseasVendorRow, OverseasVendorRowDetail
 from app.shared.models.account import AccountProgress
 from app.shared.models.common import CostEntry, Note, Upload
 from app.shared.models.plan import ManagementPlanEntry
@@ -29,8 +29,9 @@ from app.accounts.overseas.schemas import (
     VendorRow,
     VersionData,
 )
+from app.accounts.overseas.services.cp import cp_rows_at
 from app.accounts.overseas.services.entries import (
-    PLAN_NO,
+    applied_plan_no,
     current_basis_month,
     entry_months_bulk,
     plan_entry_months_bulk,
@@ -164,14 +165,17 @@ def build_state(db: Session, basis_year: int) -> OverseasState:
             else:
                 V["prior"].d.setdefault(pk, {})[entry.category_code] = months
 
-    # plan(경영계획) = management_plan_entries(plan_no="P00")에서.
-    plan_entries = [
+    # plan(경영계획) = management_plan_entries의 **적용 차수**에서 읽는다 — ★(공식 비교 기준) →
+    # 확정된 차수 중 최신 → 최신 순이다(services/entries.pick_plan_no). 전에는 "P00" 고정이라
+    # P01·P02를 확정해도 화면·챗봇이 계속 P00을 보고 있었다.
+    plan_no = applied_plan_no(db, basis_year)
+    plan_entries = [] if not plan_no else [
         entry
         for entry in db.scalars(
             select(ManagementPlanEntry).where(
                 ManagementPlanEntry.account_code == ACCOUNT_KEY,
                 ManagementPlanEntry.year == basis_year,
-                ManagementPlanEntry.plan_no == PLAN_NO,
+                ManagementPlanEntry.plan_no == plan_no,
             )
         )
         if entry.scope_code in lab_pks
@@ -278,20 +282,20 @@ def build_state(db: Session, basis_year: int) -> OverseasState:
         )
         # 화면은 기준연도의 CP만 그리므로(core.js가 r.year === 기준연도로 거른다) 그 연도만 내려보낸다.
         # 저장은 보낸 연도만 교체하므로 다른 연도 행은 영향받지 않는다.
-        # 정렬은 증감사유와 같은 이유로 유니크 키 순서로 고정한다 — 연도 단위로 전체를 지우고 다시
-        # 넣는 경로라(아래 4-3) 순서가 보장되지 않으면 POC·직급 표가 저장할 때마다 섞인다.
-        for r in db.scalars(
-            select(OverseasCpRow)
-            .where(OverseasCpRow.year == f"{basis_year:04d}")
-            .order_by(
-                OverseasCpRow.year, OverseasCpRow.poc_type, OverseasCpRow.poc_proj, OverseasCpRow.title
-            )
-        )
+        #
+        # 그 연도의 **모든** 세트가 아니라 이 버전 시점의 세트 하나만 보낸다 — 시점별 스냅샷이라
+        # 전부 보내면 화면이 같은 POC를 여러 벌 받아 계약액이 배로 보인다(services/cp.py 참고).
+        # 정렬은 cp_rows_at이 유니크 키 순서로 고정해 준다(순서가 흔들리면 POC·직급 표가 저장할
+        # 때마다 섞인다 — 증감사유와 같은 이유).
+        for r in cp_rows_at(db, basis_year, f"{basis_year:04d}-{(basis_month or 12):02d}")
     ]
 
     return OverseasState(
         step=step, basis_year=basis_year, basis_month=basis_month, V=V, actualV=actualV, files=files, note=note,
         reason=reason, vendor=vendor, cp=cp,
+        # V["plan"]이 어느 차수인지 — 화면이 "P02 기준"이라고 밝힐 수 있어야 한다. 빈 문자열은
+        # 그 해 경영계획 차수가 아예 없다는 뜻이다(0원이 아니라 데이터 없음).
+        plan_no=plan_no,
         # 이 응답을 만든 시점의 지문. PUT이 이걸 돌려보내면 그 사이 다른 저장이 있었는지 알 수 있다.
         state_token=state_token(db),
     )

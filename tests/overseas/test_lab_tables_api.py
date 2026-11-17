@@ -123,3 +123,27 @@ def test_lab_groups_follow_the_screen_order(db):
         assert all((inp.labs[pk].part_code or "").upper() != "TOTAL" for pk in g.pks), (
             f"{g.code}: 합계 파트(TOTAL)가 섞여 이중 합산이 된다"
         )
+
+
+def test_basis_month_and_kind_pick_the_version(db):
+    """②③④도 ①과 같은 파라미터로 버전을 받는다(2026-11-17) — 한쪽만 버전을 따라가면 같은
+    화면의 ① 탭과 ③ 탭이 서로 다른 버전을 그린다."""
+    f = get_lab_tables(basis_year=BASIS_YEAR, basis_month=9, kind="forecast", db=db)
+    a = get_lab_tables(basis_year=BASIS_YEAR, basis_month=8, kind="actual", db=db)
+
+    assert (f.basis_month, f.kind, f.version_label) == (9, "forecast", "26.09 속보")
+    assert (a.basis_month, a.kind, a.version_label) == (8, "actual", "26.08 실적")
+    f_tot = next(r for r in f.tables["t3"].rows if r.total).values[16]
+    a_tot = next(r for r in a.tables["t3"].rows if r.total).values[16]
+    assert f_tot != a_tot, "속보와 실적이 같은 값이면 버전이 안 먹은 것이다"
+
+
+def test_rejects_bad_month(db):
+    """범위를 벗어난 기준월은 거부한다. 0은 거부가 아니라 "안 보냄"과 같다 — 증감분석 API와
+    같은 관례이고(basis_month or 최신 속보), 둘을 다르게 두면 같은 화면의 두 호출이 다르게 떨어진다."""
+    with pytest.raises(HTTPException) as e:
+        get_lab_tables(basis_year=BASIS_YEAR, basis_month=13, kind="forecast", db=db)
+    assert e.value.status_code == 400
+
+    default = get_lab_tables(basis_year=BASIS_YEAR, db=db).basis_month
+    assert get_lab_tables(basis_year=BASIS_YEAR, basis_month=0, kind="forecast", db=db).basis_month == default

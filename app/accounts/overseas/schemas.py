@@ -118,6 +118,10 @@ class CpRowsIn(BaseModel):
 
     rows: list[CpRow]
     state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
+    # 이 계약이 적용되기 시작하는 편성 기준연월 "YYYY-MM". 연구소 기준정보(LabIn)와 같은 규칙이다 —
+    # 이 달보다 이전 버전은 바뀌기 전 계약으로 분기 정산액이 계속 계산된다. 안 주면 지금 편성 중인
+    # 기준월(= "이 버전부터"). 과거 계약을 고쳐야 하는 경우에만 직접 준다.
+    effective_from: str | None = None
 
 
 class OverseasState(BaseModel):
@@ -131,6 +135,10 @@ class OverseasState(BaseModel):
     reason: list[ReasonRow] = []  # 증감사유 업로드 (연구소×버전×항목×구간 키로 upsert, cost처럼 누적)
     vendor: list[VendorRow] = []  # 외주용역 상세 (연구소×버전 단위로 전체 교체 — 업로드마다 행 수가 달라짐)
     cp: list[CpRow] = []  # CP 계약 업로드 (연도 단위로 전체 교체 — 연 1회 올리는 파일)
+    # 경영계획 차수. GET에서는 V["plan"]이 **어느 차수인지**(적용 차수 — ★ → 확정 최신 → 최신),
+    # PUT에서는 V["plan"]을 **어느 차수에 쓸지**다. PUT에서 비워 보내면 확정되지 않은 최신 차수에
+    # 쓰고, 확정된 차수는 덮지 않는다(확정을 화면 저장이 덮으면 지난 보고가 소급해서 바뀐다).
+    plan_no: str = ""
     # 동시 편집 보호(PLAN.md P1-2). GET이 "지금 상태의 지문"을 담아 내려주고, PUT은 그걸 그대로
     # 돌려보낸다. 그 사이 다른 세션이 저장했으면 지문이 달라져 있어 409로 막는다.
     # 빈 문자열이면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
@@ -151,6 +159,17 @@ class LabOut(BaseModel):
     sort_order: int
     currency: str
     is_active: bool
+
+
+class LabOneOut(LabOut):
+    """연구소 하나를 저장했을 때의 응답(PUT /overseas/labs/one). 기준정보 값에 더해, 그 통화로
+    환산할 환율이 실제로 있는지 확인한 결과를 같이 준다.
+
+    왜 응답에 끼워 넣나: 환율이 없는 통화로 연구소를 잡아도 집계는 멈추지 않고 조용히 환산을
+    건너뛴다(services/fxcalc.lab_currency_warning 주석). 따로 조회해야 알 수 있게 두면 호출하는
+    쪽(챗봇·스크립트)이 빼먹고, 빼먹은 티도 안 난다 — 저장 응답에 같이 실어 보내면 안 볼 수 없다."""
+
+    fx_warning: str | None = None
 
 
 class LabIn(BaseModel):
@@ -276,7 +295,10 @@ class ExtraRowIn(BaseModel):
     # 원시 행(is_derived=False)의 월별 값. 12개월(기본) 또는 12의 배수(24·36…, 기간을 12개월 너머로
     # 늘려 받을 때). 파생 행은 값을 저장하지 않고 formula로 매번 계산하므로 비워 보내면 된다.
     # None인 달은 미등록(빈칸)이라 저장하지 않는다 — 0으로 올라온 달과 구분된다.
-    v: list[float | None] = []
+    # None은 "금액은 건드리지 마라"는 뜻이다(이미 있는 행의 이름·위치만 고칠 때) — []와 구분한다.
+    # 금액을 되보내게 하면 그 왕복에서 값이 상할 수 있다: 화면이 $ 단위면 서버가 받은 금액을
+    # 1000으로 나누는데(chat.py _to_kdollar), 조회해서 받은 K$ 값을 그대로 되보내면 1000배 작아진다.
+    v: list[float | None] | None = None
     # True면 실제로 수집한 비용이 아니라 다른 계정들을 조합(합산·비율 등)해 계산한 파생 행이라는 뜻.
     # 취합에서 추가한 원시 행과 집계에서 추가한 파생 행을 저장 후에도 구분하기 위해 DB에 남긴다 —
     # 삭제 권한(원시=취합에서만, 파생=집계에서만)과 표시 규칙(원시=양쪽, 파생=집계만), 그리고
@@ -356,6 +378,9 @@ class LaborSplitResult(BaseModel):
     두 효과의 합(+ 인력 없는 연구소 몫)은 fx_outside와 정확히 일치한다."""
 
     basis_year: int
+    basis_month: int = 0  # 어느 버전의 분해인가(0 = 응답을 만든 서버가 최신 속보로 떨어뜨렸다)
+    kind: str = "forecast"  # forecast(속보) | actual(실적) — 집계표·증감 표와 같은 뜻
+    base_label: str = ""  # 비교 대상 라벨("26.08 실적") — 무엇과 비교한 분해인지
     period: str  # y(연간) | q1~q4 | m1~m12
     base_version: str  # prev(전실행) | prior(전년 실적) | plan(경영계획)
     lab_scope: str  # "ALL" 또는 연구소 코드/pk
@@ -987,6 +1012,11 @@ class AggregateTable(BaseModel):
     basis_year: int
     basis_month: int
     version: str
+    # 어느 버전의 표인가 — 요청한 기준연월·종류를 되돌려준다. 화면이 과거 버전을 띄울 때
+    # "지금 받은 게 그 버전 맞나"를 확인할 자리가 필요하다(연도만으로는 구분이 안 된다).
+    kind: str = "forecast"  # forecast(속보) | actual(실적) | plan(경영계획)
+    plan_no: str = ""  # kind=plan 또는 version=plan일 때의 차수("P02")
+    version_label: str = ""  # "26.08 실적" · "2026년 경영계획 P02"
     mode: str  # usd | krw
     caption: str
     note: str
@@ -1030,6 +1060,9 @@ class LabTablesOut(BaseModel):
     basis_year: int
     basis_month: int
     version: str
+    kind: str = "forecast"  # ①(AggregateTable)과 같은 뜻 — 어느 버전의 표인가
+    plan_no: str = ""
+    version_label: str = ""
     tables: dict[str, LabTable]
 
 
@@ -1062,6 +1095,48 @@ class CpContractOut(BaseModel):
     uploaded_at: str = ""
     pocs: list[CpContractPoc] = []
     note: str = ""
+
+
+class CpContractAmountIn(BaseModel):
+    """CP 계약 "금액만" 바꾸는 요청(PUT /overseas/cp-contract-amount).
+
+    업로드(PUT /overseas/cp-rows)는 파일 하나로 표 전체를 갈아끼우는 경로고, 이건 "2026 계약액을
+    5.2M$로 바꿔줘"처럼 **금액 하나만** 고치는 경로다. 직급 행·인원·맨먼스는 그대로 두고 금액
+    항목만 같은 비율로 움직인다(services/cp.rescale_rows).
+
+    금액 단위는 저장값과 같은 **$**다(K$가 아니다) — 5.2M$는 5200000이다. 집계 표가 K$로 보여주는
+    건 그쪽이 1000으로 나누기 때문이고, 여기 들어오는 값은 계약서 금액 그대로다.
+
+    두 가지 중 하나만 쓴다:
+    - year_total: 그 해 연 계약 총액을 이 값으로($). POC가 여러 개면 **지금 비중대로** 나눠 가진다.
+    - poc_proj(+poc_type) + poc_total: POC 하나의 계약액만 이 값으로. 나머지 POC는 그대로.
+
+    둘 다 주거나 둘 다 안 주면 거부한다 — "연 합계를 바꾸려던 건지 POC 하나를 바꾸려던 건지"는
+    금액이 몇 배씩 달라지는 차이라, 서버가 짐작하면 안 된다.
+    """
+
+    year: int
+    year_total: float | None = None
+    poc_type: str | None = None
+    poc_proj: str | None = None
+    poc_total: float | None = None
+    # 연구소 기준정보·CP 업로드와 같은 규칙 — 안 주면 지금 편성 중인 기준월부터 적용되고,
+    # 그 달보다 이전 버전은 바뀌기 전 계약으로 분기 정산액이 계속 계산된다.
+    effective_from: str | None = None
+    state_token: str = ""
+
+
+class CpContractChangeOut(BaseModel):
+    """계약액 변경 결과 — 전·후를 같이 돌려준다.
+
+    왜 after만 주지 않나: 이 변경의 핵심은 "얼마가 얼마로 바뀌고, 분기 정산액이 어떻게 되는가"다.
+    after만 주면 부르는 쪽(챗봇·화면)이 before를 따로 조회해 둬야 하고, 그걸 빼먹으면 사용자는
+    바뀐 숫자만 보게 된다."""
+
+    before: CpContractOut
+    after: CpContractOut
+    effective_from: str  # 이 버전부터 새 계약이 적용된다
+    note: str  # 사람이 그대로 읽어도 되는 전후 요약
 
 
 class OverseasConfirmCheck(BaseModel):
@@ -1114,6 +1189,9 @@ class OverseasLaborRatio(BaseModel):
     basis_month: int
     period: str  # y(연간) | q1~q4 | m1~m12
     version: str
+    kind: str = "forecast"  # 집계표(AggregateTable)와 같은 뜻 — 읽은 버전의 종류
+    plan_no: str = ""
+    version_label: str = ""  # "26.08 실적"
     rows: list[OverseasLaborRatioRow]
     note: str = ""
 

@@ -25,7 +25,58 @@ from app.accounts.overseas.services.labs import ACCOUNT_KEY
 # 분기 → 그 분기에 드는 월(1-based). cost.py의 QUARTERS와 같은 정의다 — 분기·연간을 두 경로가
 # 다르게 자르면 같은 데이터가 다른 합계를 갖는다.
 QUARTERS: dict[int, tuple[int, int, int]] = {1: (1, 2, 3), 2: (4, 5, 6), 3: (7, 8, 9), 4: (10, 11, 12)}
-PLAN_NO = "P00"
+# 경영계획 차수를 고르는 규칙이 여기 한 곳에 있다(2026-11-17). 전에는 `PLAN_NO = "P00"` 상수였다 —
+# 차수가 쌓여도(P00 → P01 → P02) 읽기·쓰기 모두 P00만 보고 있어서, 확정한 새 차수가 화면·챗봇
+# 어디에도 반영되지 않았다.
+#
+# 규칙(읽기): ★(is_final, 그 연도의 공식 비교 기준)이 지정돼 있으면 그것 → 없으면 **확정된
+# (is_confirmed) 차수 중 가장 최근** → 확정된 게 없으면 가장 최근 차수. 마지막 단계는 작성 중인
+# 차수를 보여 주는 것이라, 쓰는 쪽은 "어느 차수를 보고 있는지"를 라벨로 밝혀야 한다.
+#
+# 왜 ★가 확정보다 앞인가: ★는 "이 차수를 올해 비교 기준으로 쓴다"는 사람의 명시적 지정이고,
+# 확정은 "그 차수 작성이 끝났다"는 상태다. 둘이 어긋날 때는 지정이 이긴다.
+FIRST_PLAN_NO = "P00"  # 그 해 차수가 아예 없을 때 만들어 쓰는 첫 차수
+
+
+def pick_plan_no(rows) -> str:
+    """차수 목록(plan_no · is_final · is_confirmed를 가진 것들) → 적용할 차수. 위 규칙 그대로다.
+
+    ManagementPlanVersion 행과 PlanRevisionOut 둘 다 받는다(필드 이름이 같다) — 규칙을 두 군데에
+    적으면 화면이 보는 차수와 챗봇이 보는 차수가 갈린다."""
+    ordered = sorted(rows, key=lambda r: r.plan_no)
+    if not ordered:
+        return ""
+    for r in ordered:
+        if r.is_final:
+            return r.plan_no
+    confirmed = [r for r in ordered if r.is_confirmed]
+    if confirmed:
+        return confirmed[-1].plan_no
+    return ordered[-1].plan_no
+
+
+def plan_version_rows(db: Session, year: int) -> list[ManagementPlanVersion]:
+    return list(
+        db.scalars(
+            select(ManagementPlanVersion)
+            .where(ManagementPlanVersion.year == year)
+            .order_by(ManagementPlanVersion.plan_no)
+        )
+    )
+
+
+def applied_plan_no(db: Session, year: int) -> str:
+    """그 해에 **적용되는** 경영계획 차수. 없으면 빈 문자열(= 경영계획 데이터 없음)."""
+    return pick_plan_no(plan_version_rows(db, year))
+
+
+def writable_plan_no(db: Session, year: int) -> str:
+    """업로드가 **덮어써도 되는** 차수 = 확정되지 않은 차수 중 가장 최근. 없으면 빈 문자열.
+
+    적용 차수(applied_plan_no)와 일부러 다르게 둔다 — 확정한 차수를 화면 저장이 덮으면 "확정"이
+    뜻을 잃고, 이미 보고한 경영계획 대비 숫자가 소급해서 바뀐다(공통 RULE: 지난 버전 무영향)."""
+    drafts = [r for r in plan_version_rows(db, year) if not r.is_confirmed]
+    return drafts[-1].plan_no if drafts else ""
 
 
 def resync_summaries(db: Session, entry_years: set[tuple[int, int]]) -> None:
@@ -176,20 +227,27 @@ def bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, l
     resync_summaries(db, {(v["cost_entry_id"], v["year"]) for v in detail_values})
 
 
-def bulk_upsert_plan_entries(db: Session, rows: list[tuple[str, str, int, list[float | None]]]) -> None:
+def bulk_upsert_plan_entries(
+    db: Session, rows: list[tuple[str, str, int, list[float | None]]], plan_no: str
+) -> None:
     """(scope_code, category_code, year, months) 목록을 헤더·디테일 각각 단일 upsert 문으로 처리한다
-    (_bulk_upsert_cost_entries와 같은 이유)."""
+    (_bulk_upsert_cost_entries와 같은 이유).
+
+    plan_no는 **어느 차수에 쓰는가**이고 생략할 수 없다 — 기본값을 두면 호출부 하나가 빠뜨렸을 때
+    조용히 다른 차수에 쌓인다(전에 모든 저장이 P00으로 들어갔던 자리다)."""
+    if not plan_no:
+        raise ValueError("경영계획을 저장할 차수(plan_no)가 필요하다")
     dedup = {(r[0], r[1], r[2]): r[3] for r in rows}
     if not dedup:
         return
     for year in {year for _, _, year in dedup}:
-        ensure_plan_version(db, year)
+        ensure_plan_version(db, year, plan_no)
 
     header_stmt = pg_insert(ManagementPlanEntry).values(
         [
             {
                 "account_code": ACCOUNT_KEY, "scope_code": scope_code, "year": year,
-                "plan_no": PLAN_NO, "category_code": category_code,
+                "plan_no": plan_no, "category_code": category_code,
             }
             for scope_code, category_code, year in dedup
         ]
@@ -238,13 +296,14 @@ def get_or_create_entry(db: Session, scope_code: str, version: str, category_cod
     )
 
 
-def ensure_plan_version(db: Session, year: int) -> None:
+def ensure_plan_version(db: Session, year: int, plan_no: str) -> None:
+    """그 해 그 차수가 없으면 만든다(작성 중 상태로). 확정 여부는 건드리지 않는다."""
     if not db.scalar(
         select(ManagementPlanVersion.year).where(
-            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no == PLAN_NO
+            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no == plan_no
         )
     ):
-        db.add(ManagementPlanVersion(year=year, plan_no=PLAN_NO))
+        db.add(ManagementPlanVersion(year=year, plan_no=plan_no))
         db.flush()
 
 

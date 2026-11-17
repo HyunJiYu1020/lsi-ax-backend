@@ -22,7 +22,7 @@ from app.accounts.overseas.cost_groups import (
     resolve_leaves,
 )
 from app.shared.core.values import n
-from app.accounts.overseas.models import OverseasCpRow
+from app.accounts.overseas.services.cp import cp_rows_at
 
 
 TOT_LEAVES = tuple(resolve_leaves("tot"))
@@ -52,17 +52,50 @@ LABOR_TREE = group_tree("labor")
 # 똑같이 기타경비(misc)로 떨어뜨린다.
 ANCHORABLE = frozenset(CATEGORY_LABELS) - {"hc"}
 
-def cp_quarter_amounts(db: Session, year: int) -> tuple[float, float]:
-    """그 해 CP 계약의 분기 금액 (개발비 총액, 인건비) — 단위는 저장값과 같은 K$.
+def cp_quarter_amounts(db: Session, year: int, as_of: str) -> tuple[float, float]:
+    """그 해 CP 계약의 분기 금액 (개발비 총액, 인건비) — **K$**로 돌려준다.
+
+    저장값(overseas_cp_rows)은 계약서 그대로 $ 단위라 1000으로 나눠서 집계 단위(K$)에 맞춘다 —
+    아래 식의 ÷4는 분기 분할이고 ÷1000이 그 환산이다(프런트 ovCPc도 같은 두 번의 나눗셈을 한다).
     POC 헤더값(poc_total · poc_cost_sum)은 직급 행마다 반복 저장돼 있어 POC 단위로 접어서 더한다
-    (행마다 더하면 직급 수만큼 부풀려진다). 연 금액을 4로 나눠 분기 하나치를 만든다 — core.js ovCPc."""
+    (행마다 더하면 직급 수만큼 부풀려진다). 연 금액을 4로 나눠 분기 하나치를 만든다 — core.js ovCPc.
+
+    as_of("YYYY-MM")는 보고 있는 버전의 기준연월이다. 이 값은 **생략할 수 없다** — 분기 정산액은
+    저장된 값이 아니라 여기서 매번 다시 계산되는 값이라, 시점 없이 "지금 계약"을 읽으면 이미
+    마감한 과거 버전의 분기 정산액까지 새 계약액으로 다시 계산된다(services/cp.py 참고)."""
     pocs = {
         (r.poc_type, r.poc_proj): (float(r.poc_total), float(r.poc_cost_sum))
-        for r in db.scalars(select(OverseasCpRow).where(OverseasCpRow.year == f"{year:04d}"))
+        for r in cp_rows_at(db, year, as_of)
     }
     total = sum(v[0] for v in pocs.values()) / 4 / 1000
     labor = sum(v[1] for v in pocs.values()) / 4 / 1000
     return total, labor
+
+# 참고 행(IT 관련 비용 분해 · 외주용역비)에 붙은 추가 행은 그 참고 행 합계에만 잡힌다.
+#
+# 규칙은 하나다: **추가 행은 자기가 붙은 자리의 합계에 더해진다.** 전산비 아래에 넣으면
+# 전산비 → 일반운영비 → 개발비 → 개발비(매출)로 타고 올라가고, IT 관련 비용 아래에 넣으면
+# IT 관련 비용 합계까지만 간다(그 줄 자체가 어느 총계에도 안 올라가기 때문 —
+# cost_groups.AGGREGATE_ROWS의 "참고 행"). 빼면 그 합계에서 빠진다.
+#
+# 한때 참고 행에 붙은 추가 행만 개발비 합계에도 더해 보았는데, 그러면 "행이 붙은 자리"와 "그 금액이
+# 세어지는 자리"가 달라져서 규칙을 설명할 수 없게 된다. 어느 합계에 넣고 싶은지는 자리를 고를 때
+# 정하면 되는 일이다. 화면도 같은 규칙이다(core.js ovPartEl) — 어긋나면 test_formula_crosscheck가 잡는다.
+REF_ONLY_ANCHORS = frozenset(ANCHORABLE - TOT_TREE - {"pct"})
+
+
+def extra_keys(extra: dict[str, list[float]], tree: set[str]) -> list[str]:
+    """이 트리로 세어야 할 추가 행의 anchor 키들 — 그 트리 안에 붙은 행만.
+
+    합계와 "있냐 없냐"를 따로 쓰는 호출부가 있어 키 목록을 돌려준다 — 값이 0인 추가 행도 "있는"
+    것이라, 합계가 0이라는 이유로 빈칸으로 접으면 방금 만든 행이 화면에서 사라진다."""
+    return [key for key in extra if key in tree]
+
+
+def extra_total(extra: dict[str, list[float]], tree: set[str], j: int) -> float:
+    """그 달(j)에 이 트리로 세어야 할 추가 행 금액의 합."""
+    return sum(extra[key][j] for key in extra_keys(extra, tree))
+
 
 def extra_row_months(rows) -> dict[str, dict[str, list[float]]]:
     """연구소 pk -> 얹힐 계정 키 -> 월별 금액(K$). 화면 ovCustExtra와 같은 규칙으로 anchor_key에 접는다.
@@ -87,7 +120,7 @@ def krw_months(
     return [
         (
             sum(n(cats.get(leaf, [None] * 12)[j]) for leaf in leaves)
-            + sum(months[j] for key, months in extra.items() if key in tree)
+            + extra_total(extra, tree, j)
         )
         * rate[j]
         * 1000
@@ -148,11 +181,11 @@ def agg_months(
     out: list[float | None] = []
     for j in range(12):
         vals = [cats[leaf][j] for leaf in leaves if leaf in cats and j < len(cats[leaf]) and cats[leaf][j] is not None]
-        extras = [months[j] for key, months in extra.items() if key in tree]
-        if not vals and not extras:
+        keys = extra_keys(extra, tree)
+        if not vals and not keys:
             out.append(None)  # 그 달에 올라온 게 하나도 없다 → 빈칸
             continue
-        total = sum(float(v) for v in vals) + sum(extras)
+        total = sum(float(v) for v in vals) + sum(extra[key][j] for key in keys)
         out.append(total * rate[j] * 1000 if rate else total)
     return out
 

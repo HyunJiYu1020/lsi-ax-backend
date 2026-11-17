@@ -141,7 +141,10 @@ VARIANCE_ROWS: tuple[tuple[str, int, str], ...] = (
 AGGREGATE_ROWS: tuple[tuple[str, int, str, bool], ...] = tuple(
     (key, level, unit, False) for key, level, unit in VARIANCE_ROWS
 ) + (
-    # 참고 행 — 합계와 무관하다. itx는 아래 5개의 합(GROUP_CALC에 정의돼 있다).
+    # 참고 행 — 합계와 무관하다(이미 다른 분류에 잡힌 금액을 다른 각도로 묶어 보여주는 줄이라,
+    # 총계에 또 더하면 같은 돈을 두 번 세게 된다). 여기에 붙인 추가 행도 이 줄 합계까지만 잡힌다 —
+    # 추가 행은 자기가 붙은 자리의 합계에 더해진다(services/aggregate.py의 extra_keys).
+    # itx는 아래 5개의 합(GROUP_CALC에 정의돼 있다).
     ("itx", 0, "krw", True),
     ("eda", 1, "krw", True),
     ("emu", 1, "krw", True),

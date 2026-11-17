@@ -54,13 +54,16 @@ from app.accounts.overseas.services.entries import (
     current_basis_month,
     bulk_upsert_cost_entries,
     bulk_upsert_plan_entries,
+    FIRST_PLAN_NO,
+    plan_version_rows,
+    writable_plan_no,
     ensure_plan_version,
     entry_months_bulk,
     get_or_create_entry,
     plan_entry_months_bulk,
     upsert_entry_months,
 )
-from app.accounts.overseas.services.fxcalc import rate_arrays
+from app.accounts.overseas.services.fxcalc import lab_currency_warning, rate_arrays
 from app.accounts.overseas.services.extra_rows import (
     OP_SYMBOL,
     check_lab_pk,
@@ -74,7 +77,7 @@ from app.accounts.overseas.services.labor_split import (
     split_for as labor_split_for,
 )
 from app.accounts.overseas.services.state import build_state, latest_uploads_stmt, state_token
-from app.accounts.overseas.services.cp import replace_cp_rows
+from app.accounts.overseas.services.cp import contract_at, cp_rows_at, replace_cp_rows, rescale_rows
 from app.accounts.overseas.services.reason_rows import upsert_reason_rows
 from app.accounts.overseas.services.vendor import replace_vendor_rows
 from app.accounts.overseas.services.labs import (
@@ -90,6 +93,8 @@ from app.accounts.overseas.services.labs import (
 # 생기지 않고, 기본값 폴백 규칙을 여기에 두 번 적어 두 곳이 어긋나는 걸 피하려고 그대로 가져다 쓴다.
 from app.shared.core.enums import CodeGroup
 from app.accounts.overseas.schemas import (
+    CpContractAmountIn,
+    CpContractChangeOut,
     CpRowsIn,
     ReasonRowsIn,
     VendorRowsIn,
@@ -109,6 +114,7 @@ from app.accounts.overseas.schemas import (
     ExtraValueOut,
     FileInfo,
     LabIn,
+    LabOneOut,
     LabOut,
     LabSheetIn,
     LabSheetOut,
@@ -157,8 +163,8 @@ router = APIRouter()
 
 # 경영계획(plan) 역할태그는 cost_entries에 저장하지 않고 management_plan_entries가 담당한다
 # (plan_no별로 영구 보관·비교해야 해서 cost_entries의 forecast/actual과는 다른 테이블).
-# 해외연구소 화면엔 plan_no 선택 UI가 아직 없어 "P00" 고정 버전 하나만 쓴다.
-PLAN_NO = "P00"
+# 어느 차수에 쓰는지는 services/entries.py가 정한다 — 전에는 여기 "P00" 상수가 있어서, 화면이
+# P02를 보고 있어도 저장은 늘 P00에 들어갔다.
 
 
 def _current_basis_ym(db: Session) -> str:
@@ -332,7 +338,25 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
             if "_ETC" in lab_pks:
                 plan_rows.append(("_ETC", "etc", state.basis_year, vd.etc))
     bulk_upsert_cost_entries(db, cost_rows)
-    bulk_upsert_plan_entries(db, plan_rows)
+    # 경영계획은 **확정되지 않은 차수**에만 쓴다. 확정한 차수를 화면 저장이 덮으면 "확정"이 뜻을
+    # 잃고, 이미 보고한 경영계획 대비 숫자가 소급해서 바뀐다(공통 RULE: 지난 버전 무영향).
+    # 보낸 차수가 확정됐거나 쓸 차수가 없으면 **막지 않고 건너뛰고** 응답에 밝힌다 — 경영계획은
+    # 이 화면의 입력물이 아니라 비교용으로 들고 있는 값이라, 저장 전체를 세울 이유가 없다.
+    plan_skipped = ""
+    if plan_rows:
+        rows = plan_version_rows(db, state.basis_year)
+        # 그 해 차수가 아예 없으면 첫 차수를 만들어 쓴다(종전 동작 그대로) — 차수가 하나라도
+        # 있으면 "확정되지 않은 것"만 대상이다.
+        target = state.plan_no or writable_plan_no(db, state.basis_year) or (FIRST_PLAN_NO if not rows else "")
+        if not target:
+            plan_skipped = (
+                f"{state.basis_year}년 경영계획은 저장하지 않았다 — 확정되지 않은 차수가 없다"
+                "(기준정보 › 경영계획에서 새 차수를 열어야 한다)."
+            )
+        elif any(r.plan_no == target and r.is_confirmed for r in rows):
+            plan_skipped = f"{state.basis_year}년 경영계획 {target}은 확정된 차수라 덮어쓰지 않았다."
+        else:
+            bulk_upsert_plan_entries(db, plan_rows, target)
 
     # 1-1) "N월실적" 헤더로 업로드된 확정 실적 스냅샷 (있을 때만, 지금은 cur만 사용)
     actual_cost_rows: list[tuple[str, str, str, str, list[float]]] = []
@@ -376,7 +400,9 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
     replace_vendor_rows(db, state.basis_year, state.vendor, lab_codes)
 
     # 4-3) CP 계약 — 전용 저장 API(PUT /overseas/cp-rows)와 **같은 함수**를 부른다.
-    replace_cp_rows(db, state.cp)
+    # 적용 시점은 연구소 기준정보와 같은 규칙이다(공통 RULE: 변경한 버전부터 적용, 지난 버전 무영향) —
+    # 지금 편성 중인 기준월부터 이 계약이 적용되고, 이미 마감한 버전은 바뀌기 전 세트를 계속 본다.
+    replace_cp_rows(db, state.cp, _check_effective_from(None, db))
 
     # 5) 진행 단계
     progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
@@ -393,7 +419,11 @@ def save_overseas_state(state: OverseasState, db: Session = Depends(get_db)) -> 
 
     # 저장 뒤 새 토큰을 같이 돌려준다 — 안 주면 화면이 들고 있는 토큰이 낡아서, 같은 화면에서
     # 두 번째로 저장할 때 자기 자신과 충돌한 것처럼 409가 난다(테스트가 그걸 잡았다).
-    return {"status": "ok", "state_token": state_token(db)}
+    out: dict[str, object] = {"status": "ok", "state_token": state_token(db)}
+    if plan_skipped:
+        # 조용히 버리지 않는다 — 화면이 "저장됐다"고만 알리면 경영계획이 안 들어간 걸 아무도 모른다.
+        out["plan_skipped"] = plan_skipped
+    return out
 
 
 @router.put("/overseas/vendor-rows")
@@ -443,13 +473,108 @@ def save_cp_rows(body: CpRowsIn, db: Session = Depends(get_db)) -> dict[str, obj
                 "화면을 다시 불러온 뒤 다시 올려 주세요."
             ),
         )
-    replaced = replace_cp_rows(db, body.rows)
+    replaced = replace_cp_rows(db, body.rows, _check_effective_from(body.effective_from, db))
     try:
         db.commit()
     except IntegrityError as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
     return {"status": "ok", "replaced": replaced, "state_token": state_token(db)}
+
+
+@router.put("/overseas/cp-contract-amount", response_model=CpContractChangeOut)
+def change_cp_contract_amount(body: CpContractAmountIn, db: Session = Depends(get_db)) -> CpContractChangeOut:
+    """CP 계약의 **금액만** 바꾼다 — "2026 계약액 5.2M$로 바꿔줘" 같은 요청용.
+
+    업로드(PUT /overseas/cp-rows)는 파일로 표 전체를 갈아끼우는 경로이고, 이건 지금 올라와 있는
+    계약을 그대로 두고 금액 항목만 같은 비율로 움직인다. 인원·맨먼스는 건드리지 않는다 —
+    "계약액이 얼마로 바뀌었다"는 말은 돈 이야기지 인력 구성 이야기가 아니다.
+
+    적용 시점은 연구소 기준정보와 같은 규칙이다(공통 RULE: 변경한 버전부터 적용, 지난 버전 무영향).
+    9월에 바꾸면 9월 이후 버전만 새 계약액으로 분기 정산액이 계산되고, 8월 이하 버전은 바뀌기 전
+    금액 그대로다. 응답은 전·후를 같이 준다 — 이 변경의 핵심이 "얼마가 얼마로, 분기 정산액은
+    어떻게"라서, 바뀐 숫자만 주면 사용자가 무엇을 승인했는지 되짚을 수 없다.
+    """
+    if body.state_token and body.state_token != state_token(db):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                "화면을 다시 불러온 뒤 다시 시도해 주세요."
+            ),
+        )
+
+    by_year_total = body.year_total is not None
+    by_poc = body.poc_total is not None
+    if by_year_total == by_poc:
+        raise HTTPException(
+            400,
+            "연 계약 총액(year_total)이나 POC 하나의 계약액(poc_proj + poc_total) 중 **하나만** "
+            "줘야 한다. 어느 쪽인지에 따라 금액이 몇 배씩 달라지므로 서버가 짐작하지 않는다.",
+        )
+    new_amount = body.year_total if by_year_total else body.poc_total
+    if new_amount is None or new_amount <= 0:
+        raise HTTPException(400, f"계약액은 0보다 커야 한다(받은 값: {new_amount}).")
+
+    effective_from = _check_effective_from(body.effective_from, db)
+    before = contract_at(db, body.year, effective_from)
+    if not before.registered:
+        raise HTTPException(
+            400,
+            f"{body.year}년 CP 계약이 {effective_from} 버전 시점에 등록되어 있지 않아 금액만 바꿀 수 "
+            "없다. 기준정보 › CP 계약에서 계약 파일을 먼저 올려야 한다.",
+        )
+
+    rows = cp_rows_at(db, body.year, effective_from)
+    if by_year_total:
+        # 연 합계를 바꾼다 — POC가 여럿이면 지금 비중대로 나눠 가진다. 비중을 모르면(합이 0) 나눌
+        # 방법이 없으므로 짐작하지 않고 멈춘다.
+        if before.year_total <= 0:
+            raise HTTPException(
+                400,
+                "지금 계약액이 0이라 연 합계를 POC들에 나눌 비중이 없다. POC 하나씩 "
+                "(poc_proj + poc_total) 지정해서 바꿔야 한다.",
+            )
+        factor = new_amount / before.year_total
+        factors = {(p.poc_type, p.poc_proj): factor for p in before.pocs}
+        target = f"{body.year}년 연 계약액"
+    else:
+        matched = [
+            p for p in before.pocs
+            if p.poc_proj == body.poc_proj and (body.poc_type is None or p.poc_type == body.poc_type)
+        ]
+        if len(matched) != 1:
+            names = ", ".join(f"{p.poc_type}/{p.poc_proj}" for p in before.pocs)
+            raise HTTPException(
+                400,
+                f"그 POC를 하나로 특정할 수 없다(찾은 개수: {len(matched)}). 등록된 POC: {names or '없음'}.",
+            )
+        poc = matched[0]
+        if poc.total <= 0:
+            raise HTTPException(400, f"POC '{poc.poc_proj}'의 지금 계약액이 0이라 비율로 바꿀 수 없다.")
+        factors = {(poc.poc_type, poc.poc_proj): new_amount / poc.total}
+        target = f"POC '{poc.poc_proj}' 계약액"
+
+    replace_cp_rows(db, rescale_rows(rows, factors), effective_from)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
+
+    after = contract_at(db, body.year, effective_from)
+    # 금액은 저장 단위인 $로 적고, 집계 표가 쓰는 K$를 괄호로 같이 보여준다 — 둘 중 하나만 적으면
+    # 승인하는 사람이 자기가 보고 있는 표의 숫자와 못 맞춰 본다(두 화면의 단위가 1000배 다르다).
+    note = (
+        f"{target}을 {before.year_total:,.0f}$ → {after.year_total:,.0f}$로 바꿨다"
+        f"({effective_from} 버전부터). 분기 정산액은 {before.quarter_total:,.0f}$ → "
+        f"{after.quarter_total:,.0f}$가 되고(집계 표에는 {before.quarter_total / 1000:,.1f}K$ → "
+        f"{after.quarter_total / 1000:,.1f}K$로 보인다), 3 · 6 · 9 · 12월에 들어간다. "
+        f"인건비(분기)는 {before.quarter_labor:,.0f}$ → {after.quarter_labor:,.0f}$다. "
+        f"{effective_from}보다 이전 버전은 바뀌기 전 금액 그대로다."
+        + (f" POC {len(before.pocs)}개에 지금 비중대로 나눴다." if by_year_total and len(before.pocs) > 1 else "")
+    )
+    return CpContractChangeOut(before=before, after=after, effective_from=effective_from, note=note)
 
 
 @router.put("/overseas/reason-rows")
@@ -494,17 +619,23 @@ def get_labor_split(
     base_version: str = "prev",
     period: str = "y",
     lab_scope: str = "ALL",
+    basis_month: int | None = None,
+    kind: str = "forecast",
     db: Session = Depends(get_db),
 ) -> LaborSplitResult:
     """인건비 증감을 인원 효과 · 단가 효과로 나눈다(한 기간).
 
     계산은 services/labor_split.py에 있다 — 증감분석 표(17기간)와 **같은 함수**를 쓴다.
     식이 두 벌이 되면 화면과 챗봇이 다른 답을 하고, 그건 PLAN P1-3에서 이미 겪은 사고다.
+
+    basis_month · kind는 "어느 버전을 보고 있는가"다(집계표·증감 표와 같은 파라미터). 안 주면
+    지금 편성 중인 속보로 떨어진다 — 과거 버전의 분해를 보려면 같이 보내야 한다.
     """
     ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
-    return labor_split_for(db, labor_split_prepare(db, basis_year, base_version, lab_scope), period, ix)
+    inp = labor_split_prepare(db, basis_year, base_version, lab_scope, basis_month, kind)
+    return labor_split_for(db, inp, period, ix)
 
 
 
@@ -565,7 +696,7 @@ def get_overseas_summary(
 
     api_version = "actual" if version in ("prev", "prior") else "forecast"
     extras = extra_row_months(read_extra_rows(db, yyyymm=yyyymm(basis_year, basis_month), version=api_version))
-    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
+    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year, f"{basis_year:04d}-{basis_month:02d}")
 
     total = labor = 0.0
     for lab in labs:
@@ -880,8 +1011,8 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
     ]
 
 
-@router.put("/overseas/labs/one", response_model=LabOut)
-def upsert_lab(body: LabIn, db: Session = Depends(get_db)) -> LabOut:
+@router.put("/overseas/labs/one", response_model=LabOneOut)
+def upsert_lab(body: LabIn, db: Session = Depends(get_db)) -> LabOneOut:
     """연구소 하나만 추가하거나 수정한다 — 다른 연구소는 전혀 건드리지 않는다. 연구소를 하나 추가·
     수정하는 거라면(예: 에이전트·스크립트) `PUT /overseas/labs`(전체 목록 교체, 빠뜨린 연구소는
     삭제됨) 대신 반드시 이걸 써라. 화면에 보이는 "연구소 기준정보 편집" 그리드(ovLabPage)의 저장만
@@ -927,9 +1058,12 @@ def upsert_lab(body: LabIn, db: Session = Depends(get_db)) -> LabOut:
         raise HTTPException(status_code=400, detail=f"저장 실패 (제약조건 위반): {e.orig}") from e
 
     lab = db.scalars(select(OverseasLab).where(OverseasLab.lab_code == body.lab_code)).first()
-    return LabOut(
+    return LabOneOut(
         pk=lab.pk, lab_code=lab.lab_code, part_code=lab.part_code, name=lab.name, country=lab.country,
         sort_order=lab.sort_order, currency=lab.currency, is_active=lab.is_active,
+        # 통화는 환율표와 따로 관리돼서, 환율 없는 통화를 잡아도 아무도 안 막는다 — 저장은 그대로
+        # 하되(사용자가 환율보다 연구소를 먼저 등록할 수 있다) 환산이 안 된다는 사실을 같이 돌려준다.
+        fx_warning=lab_currency_warning(db, lab.currency, effective_from),
     )
 
 
@@ -1927,8 +2061,6 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
     formula = None
     if body.is_derived:
         formula = _check_row_formula(body.formula)
-    elif not body.v or len(body.v) % 12 != 0:
-        raise HTTPException(status_code=400, detail="v는 12개월치 값이거나(기본), 12의 배수(24·36…)여야 합니다.")
     # 전체 합산 범위(ALL)는 집계 화면의 파생 행 전용이다 — 원시 행(연구소가 실제로 보고한 값)은
     # 반드시 실재하는 연구소에 붙어야 하므로 ALL을 받지 않는다.
     check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
@@ -1948,6 +2080,22 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
             status_code=400,
             detail=f"row_key '{body.row_key}'는 업로드된 고정 계정과 같습니다. 다른 row_key를 쓰세요.",
         )
+    # v를 아예 안 보내면(None) "금액은 그대로 두고 이름·위치만 고친다"는 뜻이다 — 이미 있는 행을
+    # 다른 항목 아래로 옮길 때 쓴다. 금액을 되보내게 하면 그 왕복에서 값이 상할 수 있다:
+    # 화면이 $ 단위면 서버가 받은 금액을 1000으로 나누는데(chat.py _to_kdollar), 조회해서 받은 K$
+    # 값을 그대로 되보내면 1000배 작아진다. 옮기는 데 금액이 필요 없으니 아예 안 받는다.
+    #
+    # 없는 행에는 이 뜻이 성립하지 않는다 — 옮길 금액이 없으니 그냥 빈 행이 생긴다. 그래서
+    # "이미 있는 행"일 때만 허용하고, 아니면 금액을 요구한다(행을 새로 만들 때는 전부 0으로 보낸다).
+    keep_months = not body.is_derived and body.v is None and existing is not None
+    if not body.is_derived and not keep_months and (not body.v or len(body.v) % 12 != 0):
+        detail = (
+            "v는 12개월치 값이거나(기본), 12의 배수(24·36…)여야 합니다."
+            if body.v is not None
+            else f"'{body.row_key}' 행이 아직 없습니다. 새로 만들 때는 v(월별 금액, 보통 전부 0)를 "
+            "같이 보내세요 — v를 빼는 건 이미 있는 행의 자리·이름만 고칠 때만 쓸 수 있습니다."
+        )
+        raise HTTPException(status_code=400, detail=detail)
     entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
     db.execute(
         update(CostEntry).where(CostEntry.id == entry_id)
@@ -1964,11 +2112,16 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
                 CostEntryDetail.cost_entry_id == entry_id, CostEntryDetail.period_type == "MONTH"
             )
         )
-    else:
+    elif not keep_months:
         upsert_entry_months(db, entry_id, ym_year(body.yyyymm), body.v)
     db.commit()
 
     result = ExtraRowOut(**body.model_dump())
+    if keep_months:
+        # 금액을 안 받았으니 응답에도 지금 저장돼 있는 값을 실어 보낸다 — 빈 배열을 돌려주면
+        # 부르는 쪽이 "옮겼더니 금액이 지워졌다"로 읽는다.
+        entry = db.get(CostEntry, entry_id)
+        result.v = entry_months_bulk(db, [entry]).get(entry_id, [])
     if body.is_derived:
         # 방금 저장한 계산식을 바로 평가해서 값과 근거를 함께 돌려준다 — 호출부(화면·챗봇)가
         # 저장 직후 다시 조회하지 않고도 "인건비 1,000 ÷ 인력 10 = 100"을 보여줄 수 있게.

@@ -33,7 +33,7 @@ class FxAppliedRate(Base):
     """적용 환율(기준시점 × 대상월 × 통화) — 실적/속보/경영을 화면의 "적용 환율" 탭과 같은 날짜
     규칙으로 조합한 계산 결과. 기준(basis_year·basis_month·basis_kind)이 가리키는 시점 이전 대상월은
     실적(rule에 따라 평균 또는 말일), 이후 대상월은 그 시점 속보 값을 쓴다. 원본이 아니라 파생값이라
-    실적·속보·경영 쪽 데이터가 바뀌면 다시 계산해 채워야 한다(원본 3개 테이블이 source of truth)."""
+    원본(fx_rates)이 바뀌면 다시 계산해 채워야 한다 — source of truth는 fx_rates 하나다."""
 
     __tablename__ = "fx_applied_rates"
     __table_args__ = (
@@ -51,7 +51,11 @@ class FxAppliedRate(Base):
     rule: Mapped[str] = mapped_column(String(10), default="avg", comment="과거 대상월의 실적 기준: avg(평균) | last(말일)")
     target_month: Mapped[int] = mapped_column(SmallInteger, comment="적용 환율이 매겨지는 대상 월(1~12)")
     currency_code: Mapped[str] = mapped_column(String(3))
-    rate: Mapped[float] = mapped_column(Numeric(14, 4), default=0, comment="원/통화 적용 환율")
+    rate: Mapped[float | None] = mapped_column(
+        Numeric(14, 4),
+        nullable=True,
+        comment="원/통화 적용 환율. NULL은 '그 달 원본 환율이 없어 적용할 환율이 없다'는 뜻이다 — 0(환율이 0원)과 구분한다",
+    )
     source: Mapped[str] = mapped_column(String(10), comment="이 값의 출처: forecast | actual")
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

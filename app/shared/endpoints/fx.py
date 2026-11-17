@@ -1,8 +1,9 @@
+import re
 from bisect import bisect_right
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import delete, insert, select
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -12,22 +13,30 @@ from app.shared.services.fx_rates import (
     OVERSEAS_FX_RULE_DEFAULT_CODE,
     OVERSEAS_FX_RULE_FALLBACK,
     OVERSEAS_FX_RULE_GROUP,
+    applied_rows,
     avg_krw,
+    currency_coverage,
+    materialize_applied_rates,
+    write_applied_rows,
     compute_applied_rows,
     eom_krw,
     forecast_krw,
     fx_dir,
     overseas_fx_default,
     overseas_fx_default_row,
+    rate_unit,
+    upsert_rate,
 )
 from app.db.session import get_db
-from app.shared.models.fx import FxAppliedRate, FxRate, OverseasFxRuleOverride
+from app.shared.models.fx import FxRate, OverseasFxRuleOverride
 from app.shared.models.system import CommonCode
 from app.shared.schemas.fx import (
     FxActualUpload,
+    FxCurrencyCoverage,
     FxAppliedRecomputeRequest,
     FxAppliedRow,
     FxForecastUpload,
+    FxRateIn,
     FxPlanRow,
     FxPlanUpload,
     FxState,
@@ -38,20 +47,6 @@ from app.shared.schemas.fx import (
 )
 
 router = APIRouter()
-
-def _upsert_fx_input(
-    db: Session, year_month: str, currency: str, kind: str, rate: float, source_file: str, uploaded_at: datetime
-) -> None:
-    stmt = pg_insert(FxRate).values(
-        year_month=year_month, currency_code=currency, kind=kind, rate=rate,
-        source_file=source_file, uploaded_at=uploaded_at,
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["year_month", "currency_code", "kind"],
-        set_={"rate": stmt.excluded.rate, "source_file": stmt.excluded.source_file, "uploaded_at": stmt.excluded.uploaded_at},
-    )
-    db.execute(stmt)
-
 
 @router.get("/fx/state", response_model=FxState)
 def get_fx_state(db: Session = Depends(get_db)) -> FxState:
@@ -103,79 +98,75 @@ def save_fx_state(state: FxState, db: Session = Depends(get_db)) -> dict[str, st
     # upsert하므로 한쪽을 안 보내도 다른 kind 행엔 영향이 없다.
     for ym, upload in state.actual.items():
         for currency, value in upload.avg.items():
-            _upsert_fx_input(db, ym, currency, "actual_avg", value, upload.avg_file, now)
+            upsert_rate(db, ym, currency, "actual_avg", value, upload.avg_file, now)
         for currency, value in upload.eom.items():
-            _upsert_fx_input(db, ym, currency, "actual_eom", value, upload.eom_file, now)
+            upsert_rate(db, ym, currency, "actual_eom", value, upload.eom_file, now)
 
     for ym, upload in state.forecast.items():
         for currency, value in upload.rows.items():
-            _upsert_fx_input(db, ym, currency, "forecast", value, upload.file, now)
+            upsert_rate(db, ym, currency, "forecast", value, upload.file, now)
 
     # 경영: 연 1회 12개월치를 한 번에 올리지만, 저장은 다른 kind와 똑같이 연월 단위 행으로 쪼갠다.
     for year, upload in state.plan.items():
         for row in upload.rows:
             months = row.m[:12] + [0.0] * (12 - len(row.m))
             for i, v in enumerate(months, start=1):
-                _upsert_fx_input(db, f"{year}-{i:02d}", row.c, "plan", v, upload.file, now)
+                upsert_rate(db, f"{year}-{i:02d}", row.c, "plan", v, upload.file, now)
 
-    _refresh_all_applied_rates(db)
+    # 원본이 바뀌었으니 적용 환율 표를 전 조합(연도×기준월×속보실적×룰) 다시 만든다 —
+    # applied_rows는 이 표만 읽으므로(없으면 404), 여기서 전부 만들어 둬야 화면이 멈추지 않는다.
+    materialize_applied_rates(db)
     db.commit()
     return {"status": "ok"}
 
 
-def _write_applied_rows(
-    db: Session, basis_year: int, basis_month: int, basis_kind: str, rule: str, rows: list[FxAppliedRow]
-) -> None:
-    """계산된 적용 환율을 fx_applied_rates에 덮어쓴다(같은 기준의 기존 행은 지우고 새로 넣음). commit은 호출한 쪽이 한다."""
-    db.execute(
-        delete(FxAppliedRate).where(
-            FxAppliedRate.basis_year == basis_year,
-            FxAppliedRate.basis_month == basis_month,
-            FxAppliedRate.basis_kind == basis_kind,
-            FxAppliedRate.rule == rule,
-        )
-    )
-    if not rows:
-        return
-    db.execute(
-        insert(FxAppliedRate),
-        [
-            {
-                "basis_year": basis_year, "basis_month": basis_month, "basis_kind": basis_kind, "rule": rule,
-                "target_month": row.target_month, "currency_code": row.currency_code, "rate": row.rate, "source": row.source,
-            }
-            for row in rows
-        ],
-    )
+@router.get("/fx/currency-coverage", response_model=FxCurrencyCoverage)
+def get_fx_currency_coverage(currency: str, year: int, db: Session = Depends(get_db)) -> FxCurrencyCoverage:
+    """그 해에 그 통화의 환율 원본이 어느 달까지 들어와 있는지. 연구소 통화를 새로 잡거나 바꾸기 전에
+    "환산할 환율이 실제로 있나"를 확인하는 용도다 — 없으면 금액이 멈추는 게 아니라 조용히 환산 없이
+    계산되므로(services/fx_rates.currency_coverage 주석 참고), 확인은 사람이 아니라 서버가 한다."""
+    return currency_coverage(db, currency.strip().upper(), year)
 
 
-def _refresh_all_applied_rates(db: Session) -> None:
-    """fx_applied_rates에 이미 캐시된 모든 (기준연도·기준월·속보실적·룰) 조합을 다시 계산해 덮어쓴다.
-    실적·속보·경영 환율(fx_rates) 중 하나라도 바뀌면 이 함수로 캐시를 최신화한다. commit은 호출한 쪽이 한다."""
-    bases = db.execute(
-        select(
-            FxAppliedRate.basis_year, FxAppliedRate.basis_month, FxAppliedRate.basis_kind, FxAppliedRate.rule
-        ).distinct()
-    ).all()
-    cache_by_year: dict[int, FxRateCache] = {}  # 같은 basis_year끼리는 캐시를 재사용(연도별로 1번만 로드)
-    for basis_year, basis_month, basis_kind, rule in bases:
-        cache = cache_by_year.setdefault(basis_year, FxRateCache(db, basis_year))
-        rows = compute_applied_rows(cache, basis_year, basis_month, basis_kind, rule)
-        _write_applied_rows(db, basis_year, basis_month, basis_kind, rule, rows)
+@router.put("/fx/rate", response_model=FxCurrencyCoverage)
+def save_fx_rate(body: FxRateIn, db: Session = Depends(get_db)) -> FxCurrencyCoverage:
+    """환율 원본 한 칸(연월 × 통화 × 종류)을 직접 넣는다 — 정상 경로는 파일 업로드(PUT /fx/state)고,
+    이건 "연구소를 새로 만들었는데 그 통화 환율이 아직 없다"처럼 빈칸 하나를 메우는 용도다.
+
+    저장 후 적용 환율 표를 다시 만든다(PUT /fx/state와 같은 규칙) — 그래야 집계가 바로 그 통화를
+    환산한다. 응답은 저장 결과가 아니라 "이제 그 통화가 어느 달까지 채워졌는지"다. 한 칸을 넣어도
+    아직 비는 달이 있을 수 있어서, 넣었다는 사실보다 남은 구멍을 보여주는 쪽이 쓸모 있다."""
+    kind = body.kind.strip()
+    if kind not in ("actual_avg", "actual_eom", "forecast", "plan"):
+        raise HTTPException(400, "kind는 actual_avg | actual_eom | forecast | plan만 쓸 수 있다.")
+    currency = body.currency_code.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise HTTPException(400, f"통화 코드는 영문 3자리여야 한다(받은 값: {body.currency_code!r}).")
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", body.year_month):
+        raise HTTPException(400, f'year_month는 "YYYY-MM" 형식이어야 한다(받은 값: {body.year_month!r}).')
+    if body.rate <= 0:
+        # 0을 허용하면 "환율이 없다"와 "환율이 0이다"가 섞인다 — 적용 환율이 0/NULL을 구분하려고
+        # 애쓰는 이유가 그것이다(models/fx.py FxAppliedRate.rate 주석).
+        raise HTTPException(400, f"환율은 0보다 커야 한다(받은 값: {body.rate}). 단위는 {rate_unit(currency)}다.")
+
+    upsert_rate(db, body.year_month, currency, kind, body.rate, body.source_file)
+    materialize_applied_rates(db)
+    db.commit()
+    return currency_coverage(db, currency, int(body.year_month[:4]))
 
 
 @router.post("/fx/applied/recompute", response_model=list[FxAppliedRow])
 def recompute_applied_rates(body: FxAppliedRecomputeRequest, db: Session = Depends(get_db)) -> list[FxAppliedRow]:
     """지정한 기준(연도·월·속보실적·룰)의 적용 환율을 다시 계산해 fx_applied_rates에 채운다.
-    실적·속보·경영 원본이 바뀌었을 때 특정 기준을 처음 만들거나 수동으로 갱신할 때 쓴다. 이미 캐시된
-    기준들은 /fx/state 저장 시 _refresh_all_applied_rates로 자동 갱신된다.
+    전 조합은 /fx/state 저장이 materialize_applied_rates로 자동 생성하므로 평소엔 부를 일이 없고,
+    챗봇의 환산 기준 전환(recompute_applied_fx_rates 도구)이 특정 기준 하나를 다시 쓸 때 쓴다.
     dry_run=True면 계산 결과만 돌려주고 fx_applied_rates는 안 건드린다 — 실제 저장 전에 "이 기준으로
     바꾸면 숫자가 어떻게 되는지" 미리 보여줄 때 쓴다."""
     cache = FxRateCache(db, body.basis_year)
     rows = compute_applied_rows(cache, body.basis_year, body.basis_month, body.basis_kind, body.rule)
     if body.dry_run:
         return rows
-    _write_applied_rows(db, body.basis_year, body.basis_month, body.basis_kind, body.rule, rows)
+    write_applied_rows(db, body.basis_year, body.basis_month, body.basis_kind, body.rule, rows)
     db.commit()
     return rows
 
@@ -184,20 +175,10 @@ def recompute_applied_rates(body: FxAppliedRecomputeRequest, db: Session = Depen
 def get_applied_rates(
     basis_year: int, basis_month: int, basis_kind: str = "forecast", rule: str = "avg", db: Session = Depends(get_db)
 ) -> list[FxAppliedRow]:
-    rows = db.scalars(
-        select(FxAppliedRate)
-        .where(
-            FxAppliedRate.basis_year == basis_year,
-            FxAppliedRate.basis_month == basis_month,
-            FxAppliedRate.basis_kind == basis_kind,
-            FxAppliedRate.rule == rule,
-        )
-        .order_by(FxAppliedRate.target_month, FxAppliedRate.currency_code)
-    )
-    return [
-        FxAppliedRow(target_month=r.target_month, currency_code=r.currency_code, rate=float(r.rate), source=r.source)
-        for r in rows
-    ]
+    # 아직 아무도 안 본 기준이면 행이 없다 — 그때 빈 배열을 주면 "환율이 없다"로 읽혀서 금액이
+    # 0으로 환산된다. applied_rows가 없는 조합을 원본에서 계산해 채운 뒤 돌려주므로 그럴 일이 없고,
+    # 집계가 쓰는 값과 같은 함수를 거치니 화면에 보이는 적용 환율과 금액에 쓰인 환율이 어긋나지 않는다.
+    return applied_rows(db, basis_year, basis_month, basis_kind, rule)
 
 
 @router.get("/fx/overseas-rule", response_model=OverseasFxRuleState)

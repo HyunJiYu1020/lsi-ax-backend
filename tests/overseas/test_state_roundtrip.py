@@ -409,3 +409,69 @@ def test_empty_token_skips_the_check(db, state):
 
     state.state_token = ""  # 옛 클라이언트처럼
     assert save_overseas_state(state=state, db=db)["status"] == "ok"
+
+
+# ---------- 경영계획 차수 (2026-11-17) ----------
+# 전에는 읽기·쓰기가 `PLAN_NO = "P00"` 고정이었다. 이제 읽기는 적용 차수(★ → 확정 최신 → 최신),
+# 쓰기는 "확정되지 않은 차수"만 대상으로 한다.
+def test_state_tells_which_plan_revision_it_is(db, state):
+    """GET이 V["plan"]의 차수를 같이 준다 — 화면이 "P02 기준"이라고 밝힐 수 있어야 한다.
+    차수가 없으면 빈 문자열이고, 그건 "경영계획 0원"이 아니라 "데이터 없음"이다."""
+    from app.accounts.overseas.services.entries import applied_plan_no
+
+    assert state.plan_no == applied_plan_no(db, BASIS_YEAR)
+    if not state.plan_no:
+        assert not state.V["plan"].d
+
+
+def test_save_does_not_overwrite_a_confirmed_plan_revision(db, state):
+    """확정된 차수는 화면 저장이 덮지 않는다 — 덮으면 "확정"이 뜻을 잃고, 이미 보고한 경영계획
+    대비 숫자가 소급해서 바뀐다. 막지 않고 건너뛰되 응답(plan_skipped)에 밝혀야 한다 —
+    조용히 버리면 경영계획이 안 들어간 걸 아무도 모른다."""
+    from app.accounts.overseas.services.entries import plan_version_rows
+    from app.shared.models.plan import ManagementPlanEntryDetail
+
+    rows = plan_version_rows(db, BASIS_YEAR)
+    if not rows:
+        pytest.skip("그 해 경영계획 차수가 없어 확정 상태를 만들 수 없다")
+    for r in rows:
+        r.is_confirmed = True
+    db.flush()
+
+    # 경영계획 값을 하나 넣어 보낸다(화면이 들고 있는 비교용 값과 같은 모양).
+    pk = next(iter(state.V["cur"].d), None)
+    if pk is None:
+        pytest.skip("저장할 연구소 값이 없다")
+    state.V["plan"].d = {pk: {"hc": [9.0] * 12}}
+    before = db.scalar(select(ManagementPlanEntryDetail.amount).where(ManagementPlanEntryDetail.amount == 9.0))
+
+    out = save_overseas_state(state, db=db)
+
+    assert out["status"] == "ok", "경영계획 때문에 저장 전체를 세우지는 않는다"
+    assert "plan_skipped" in out and "확정" in out["plan_skipped"]
+    assert db.scalar(select(ManagementPlanEntryDetail.amount).where(ManagementPlanEntryDetail.amount == 9.0)) == before
+
+
+def test_save_opens_the_first_revision_when_the_year_has_none(db, state):
+    """그 해 차수가 아예 없으면 첫 차수(P00)를 만들어 저장한다 — 종전 동작 그대로다.
+    차수가 하나라도 있으면 그때부터 "확정되지 않은 차수"만 대상이다(위 테스트)."""
+    from app.shared.models.plan import ManagementPlanVersion
+    from app.accounts.overseas.services.entries import FIRST_PLAN_NO
+
+    year = 2097  # 실제 데이터와 안 겹치는 미래 연도
+    assert not db.scalars(select(ManagementPlanVersion).where(ManagementPlanVersion.year == year)).all()
+    pk = next(iter(state.V["cur"].d), None)
+    if pk is None:
+        pytest.skip("저장할 연구소 값이 없다")
+    state.basis_year = year
+    state.V["plan"].d = {pk: {"hc": [3.0] * 12}}
+
+    out = save_overseas_state(state, db=db)
+
+    assert "plan_skipped" not in out
+    opened = db.scalar(
+        select(ManagementPlanVersion).where(
+            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no == FIRST_PLAN_NO
+        )
+    )
+    assert opened is not None and opened.is_confirmed is False

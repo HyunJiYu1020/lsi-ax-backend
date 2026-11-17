@@ -21,11 +21,20 @@ from sqlalchemy.orm import Session
 from app.shared.core.periods import PERIOD_IX, QUARTER_END_IX, yyyymm
 from app.shared.core.values import n
 from app.accounts.overseas.services.fxcalc import rate_arrays
+from app.shared.services.fx_rates import APPLIED_MISSING_PREFIX
 from app.accounts.overseas.services.entries import current_basis_month
 from app.accounts.overseas.services.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
 from app.accounts.overseas.services.extra_rows import read_extra_rows
 from app.accounts.overseas.services.state import build_state
-from app.accounts.overseas.services.variance import compute_reason_check
+from app.accounts.overseas.services.variance import (
+    active_labs,
+    check_kind,
+    compute_reason_check,
+    load_basis,
+    resolve_bases,
+    scope_pks,
+)
+from app.accounts.overseas.services.cp import contract_at
 from app.accounts.overseas.services.aggregate import (
     LabGroup,
     pl_rows,
@@ -39,7 +48,6 @@ from app.accounts.overseas.services.aggregate import (
 from dataclasses import dataclass
 
 from app.db.session import get_db
-from app.accounts.overseas.models import OverseasCpRow
 from app.shared.models.common import CostEntry, CostEntryDetail
 from app.accounts.overseas.schemas import (
     AggregateRow,
@@ -66,45 +74,17 @@ def _check_kind(kind: str) -> str:
 
 # ---------- CP 계약 ----------
 @router.get("/overseas/cp-contract", response_model=CpContractOut)
-def get_cp_contract(year: int, db: Session = Depends(get_db)) -> CpContractOut:
+def get_cp_contract(year: int, as_of: str, db: Session = Depends(get_db)) -> CpContractOut:
     """그 해 CP 계약. POC 헤더값(poc_total · poc_cost_sum)은 직급 행마다 반복 저장돼 있어 POC 단위로
-    접어서 더한다 — 행마다 더하면 직급 수만큼 부풀려진다(_cp_quarter_amounts와 같은 규칙).
+    접어서 더한다 — 행마다 더하면 직급 수만큼 부풀려진다(services/cp.contract_at).
+
+    as_of("YYYY-MM")는 보고 있는 버전의 기준연월이고 생략할 수 없다 — 계약을 고쳐도 지난 버전의
+    분기 정산액이 소급해서 바뀌지 않게, 그 버전 시점의 계약 세트를 읽는다(services/cp.py 참고).
 
     계약이 없으면 404가 아니라 registered=false로 200을 준다. 집계 화면은 "계약이 없다"는 사실을
     알고 CP 정산 칸을 빈칸으로 둬야 하는데, 404로 주면 화면이 "서버 오류"와 구분하지 못해서
     업로드된 CP PL로 그려 버린다(= 계약 없이 숫자가 서는 사고)."""
-    rows = list(db.scalars(select(OverseasCpRow).where(OverseasCpRow.year == f"{year:04d}")))
-    pocs: dict[tuple[str, str], CpContractPoc] = {}
-    source_file, uploaded_at = "", ""
-    for r in rows:
-        key = (r.poc_type, r.poc_proj)
-        if key not in pocs:
-            pocs[key] = CpContractPoc(
-                poc_type=r.poc_type, poc_proj=r.poc_proj, total=float(r.poc_total), cost_sum=float(r.poc_cost_sum)
-            )
-        source_file = source_file or (r.source_file or "")
-        if r.uploaded_at and not uploaded_at:
-            uploaded_at = r.uploaded_at.strftime("%m.%d %H:%M")
-    year_total = sum(p.total for p in pocs.values())
-    year_labor = sum(p.cost_sum for p in pocs.values())
-    registered = bool(pocs)
-    return CpContractOut(
-        year=year,
-        registered=registered,
-        poc_count=len(pocs),
-        year_total=year_total,
-        year_labor=year_labor,
-        quarter_total=year_total / 4,
-        quarter_labor=year_labor / 4,
-        source_file=source_file,
-        uploaded_at=uploaded_at,
-        pocs=list(pocs.values()),
-        note=(
-            f"{year}년 CP 계약 POC {len(pocs)}개. 분기 정산 계약이라 연 금액 ÷ 4를 3 · 6 · 9 · 12월에 넣는다."
-            if registered
-            else f"{year}년 CP 계약이 등록되지 않았다. 집계의 CP 정산 칸은 0이 아니라 빈칸이고 합계에서 빠진다."
-        ),
-    )
+    return contract_at(db, year, as_of)
 
 
 # ---------- 확정 사전점검 ----------
@@ -149,9 +129,16 @@ def check_overseas_confirm(
     warnings: list[str] = []
 
     # ① 환율 — 적용 환율(원/$)이 없는 달이 있으면 그 달은 원화 환산이 안 된다. ix를 비워 넘기면
-    # _rate_arrays가 "없는 달"로 실패하지 않고 12개월 값을 그대로 돌려준다(여기서 직접 판정한다).
-    rates = rate_arrays(db, basis_year, month, version, set(), ())["USD"]
-    fx_missing = [m for m, v in enumerate(rates, start=1) if not v]
+    # rate_arrays가 "없는 달"로 실패하지 않고 12개월 값을 그대로 돌려준다(여기서 직접 판정한다).
+    # 적용 환율 조합 자체가 없으면(그 연도 환율이 업로드된 적 없음) rate_arrays가 404로 멈추는데,
+    # 이 엔드포인트는 "무엇이 없는지 보고하는 게 일"이라 멈추지 않고 12개월 전부 미등록으로 담는다.
+    try:
+        rates = rate_arrays(db, basis_year, month, version, set(), ())["USD"]
+        fx_missing = [m for m, v in enumerate(rates, start=1) if not v]
+    except HTTPException as e:
+        if e.status_code != 404 or not str(e.detail).startswith(APPLIED_MISSING_PREFIX):
+            raise
+        fx_missing = list(range(1, 13))
     if fx_missing:
         blocking.append(
             f"적용 환율(원/$)이 없는 달이 있다({', '.join(f'{m}월' for m in fx_missing)}) — "
@@ -182,7 +169,7 @@ def check_overseas_confirm(
         )
 
     # ③ CP 계약 — 미등록이면 CP 정산 칸이 빈칸인 채로 확정된다.
-    cp = get_cp_contract(year=basis_year, db=db)
+    cp = get_cp_contract(year=basis_year, as_of=f"{basis_year:04d}-{month:02d}", db=db)
     if not cp.registered:
         warnings.append(f"{basis_year}년 CP 계약이 등록되지 않아 CP 정산 칸이 빈칸이다(합계에서 빠진다).")
 
@@ -236,40 +223,40 @@ def get_labor_ratio(
     basis_year: int,
     version: str = "cur",
     period: str = "y",
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
     db: Session = Depends(get_db),
 ) -> OverseasLaborRatio:
     """인건비율(인건비 ÷ 개발비(매출)) — 전체와 연구소별. 집계 화면의 인건비율 팝업과 같은 값이다.
 
     기준은 /overseas/summary와 같다: 원화 환산 + CP는 계약 금액을 분기 말에 넣는다. 분기·연간은
-    기간 합계끼리 나눈다 — 분모가 0이면 비율이 없으므로 0이 아니라 null로 돌려준다(화면 '—')."""
-    if version not in ("cur", "prev", "prior", "plan"):
-        raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
+    기간 합계끼리 나눈다 — 분모가 0이면 비율이 없으므로 0이 아니라 null로 돌려준다(화면 '—').
+
+    basis_month · kind(· plan_no)는 집계표와 같은 "어느 버전인가"다(2026-11-17) — 전에는
+    기준월을 DB 최신 속보로 혼자 정해서 과거 버전의 인건비율을 낼 수 없었다. 재료 읽기는
+    집계표와 **같은 함수**(_table_inputs)를 쓴다: 연구소 추리기·추가 행·환율 규칙이 갈리면
+    같은 화면의 집계표와 인건비율이 다른 분모를 쓴다."""
     ix = PERIOD_IX.get(period)
     if ix is None:
         raise HTTPException(400, "period는 y(연간) | q1~q4 | m1~m12만 쓸 수 있다.")
 
-    state = build_state(db, basis_year)
-    vd = state.V[version]
-    if not vd.d:
-        label = {"cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}[version]
-        raise HTTPException(404, f"{basis_year}년 {label} 데이터가 없다.")
-
-    basis_month = state.basis_month or 1
-    if version == "prior":
-        rate_year, rate_month, rate_kind = basis_year - 1, 12, "actual"
-    else:
-        rate_year, rate_month, rate_kind = basis_year, basis_month, "forecast"
+    inp = _table_inputs(db, basis_year, version, False, basis_month, kind, plan_no)
+    if not inp.d:
+        raise HTTPException(404, f"{inp.label} 데이터가 없다.")
+    basis_month = inp.basis_month
+    # 환율은 조회 기간에 드는 달만 본다 — 전체 12개월을 요구하면 아직 환율이 안 들어온 달 때문에
+    # 지난 분기 비율도 못 내게 된다(_table_inputs는 12개월을 보므로 여기서 따로 읽는다).
+    rate_year, rate_month, rate_kind = (
+        (basis_year - 1, 12, "actual") if version == "prior" else (basis_year, basis_month, inp.api_version)
+    )
     labs = [
         lab
         for lab in lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
         if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
     ]
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
-    api_version = "actual" if version in ("prev", "prior") else "forecast"
-    extras = extra_row_months(
-        read_extra_rows(db, yyyymm=yyyymm(basis_year, basis_month), version=api_version)
-    )
-    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year)
+    cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year, f"{basis_year:04d}-{basis_month:02d}")
 
     by_code: dict[str, dict] = {}
     for lab in labs:
@@ -284,7 +271,7 @@ def get_labor_ratio(
             acc["tot"] += sum(cp_total_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
             acc["lab"] += sum(cp_labor_q * rate[j] * 1000 for j in ix if j in QUARTER_END_IX)
             continue
-        cats, extra = vd.d.get(lab.pk) or {}, extras.get(lab.pk) or {}
+        cats, extra = inp.d.get(lab.pk) or {}, inp.extras.get(lab.pk) or {}
         if not cats and not extra:
             continue
         acc["tot"] += sum(krw_months(cats, extra, TOT_TREE, rate)[j] for j in ix)
@@ -306,6 +293,9 @@ def get_labor_ratio(
         basis_month=basis_month,
         period=period,
         version=version,
+        kind=inp.kind,
+        plan_no=inp.plan_no,
+        version_label=inp.label,
         rows=rows,
         note=(
             "인건비 ÷ 개발비(매출). 원화 · CP 분기 정산(계약 금액) 기준이고, 분기·연간은 기간 합계끼리 "
@@ -327,38 +317,78 @@ class _TableInputs:
     d: dict
     extras: dict
     rate: list[float] | None
+    kind: str  # **읽은** 버전의 종류(forecast|actual|plan) — version=prev면 요청 kind가 아니라 전실행의 종류다
+    plan_no: str
+    label: str  # 이 표가 어느 버전인지("26.08 실적" · "2026년 경영계획 P02") — 캡션에 적는다
 
 
-def _table_inputs(db: Session, basis_year: int, version: str, with_rate: bool) -> _TableInputs:
+def _table_inputs(
+    db: Session,
+    basis_year: int,
+    version: str,
+    with_rate: bool,
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
+) -> _TableInputs:
+    """어느 버전의 표인가를 (basis_year, basis_month, kind[, plan_no])로 **받아서** 읽는다.
+
+    왜 build_state를 더 쓰지 않는가: build_state는 기준월을 "DB에 들어 있는 가장 최근 속보"로
+    혼자 정한다. 그래서 화면이 상단에서 26.08 실적을 골라도 집계표만 최신 속보 숫자를 그렸다 —
+    연도만 전달되고 "어느 버전인가"는 전달되지 않았기 때문이다. basis_month를 안 주면 종전과
+    같이 최신 속보 월로 떨어진다(기존 호출 호환).
+
+    버전 해석(전실행이 무엇인가 · 경영계획 몇 차수인가)은 증감분석이 이미 하던 일이라 그 층을
+    같이 쓴다(resolve_bases · load_basis). 두 화면이 "전실행"을 다르게 풀면 같은 자리에서 다른
+    숫자가 나온다 — Phase 6이 지우려는 바로 그 복제다.
+    """
     if version not in ("cur", "prev", "prior", "plan"):
         raise HTTPException(400, "version은 cur | prev | prior | plan만 쓸 수 있다.")
+    check_kind(kind)
+    month = basis_month or current_basis_month(db) or 1
+    if not 1 <= month <= 12:
+        raise HTTPException(400, "basis_month는 1~12여야 한다.")
 
-    state = build_state(db, basis_year)
-    month = state.basis_month or 1
-    vd = state.V.get(version)
-    if vd is None:
-        raise HTTPException(404, f"그런 버전이 없다: {version!r}")
+    resolved = resolve_bases(db, basis_year, month, kind, plan_no)
+    if version == "cur":
+        # 보고 있는 버전 그대로. kind=plan이면 차수가 "어느 버전인가"를 가른다 — 요청한 차수를
+        # 그대로 쓴다(resolve_bases가 없는 차수면 404로 막아 줬다). default_plan_no를 쓰면
+        # P01을 달라고 해도 최종 차수 표가 나간다.
+        chosen_plan = next(b.plan_no for b in resolved.bases if b.key == "plan")
+        spec = (
+            (basis_year, month, "plan", chosen_plan)
+            if kind == "plan"
+            else (basis_year, month, kind, "")
+        )
+        label = resolved.basis_label
+    else:
+        basis = next(b for b in resolved.bases if b.key == version)
+        if not basis.has_data:
+            raise HTTPException(404, basis.fallback_note or f"{basis.label} 데이터가 없다.")
+        spec = (basis.year, basis.month, basis.kind, basis.plan_no)
+        label = basis.resolved_label
 
-    # 전실행·전년은 실적(actual) 슬롯에, 나머지는 속보(forecast) 슬롯에 저장된다 — 이 모듈의
-    # 다른 엔드포인트와 같은 관례다(위 get_labor_ratio 참조).
-    api_version = "actual" if version in ("prev", "prior") else "forecast"
-    labs = {lab.pk: lab for lab in lab_views(db, yyyymm(basis_year, month))}
-    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 —
-    # 넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다.
-    pks = [
-        pk for pk, lab in labs.items()
-        if lab.is_active and pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
-    ]
+    # 기준정보(통화·파트 구성)는 **보고 있는 버전 시점** 값으로 읽는다 — 지금 값으로 보면 지난달
+    # 보고서를 다시 띄웠을 때 숫자가 소급해서 달라진다(공통 RULE).
+    labs = active_labs(db, basis_year, month)
+    pks = scope_pks(labs, "ALL")
+
+    # 추가 행·환율은 그 버전이 저장된 슬롯에서 읽는다. 경영계획은 속보/실적 슬롯이 없어서 추가
+    # 행도 환율도 보고 있는 버전(속보) 것을 쓴다(services/variance.fx_specs와 같은 제약).
+    spec_year, spec_month, spec_kind, _ = spec
+    api_version = spec_kind if spec_kind in ("forecast", "actual") else "forecast"
+    fx_year, fx_month = (spec_year, spec_month) if spec_kind in ("forecast", "actual") else (basis_year, month)
     extras = extra_row_months(
-        read_extra_rows(db, yyyymm=yyyymm(basis_year, month), version=api_version)
+        read_extra_rows(db, yyyymm=yyyymm(fx_year, fx_month), version=api_version)
     )
+    d = load_basis(db, spec, set(labs))
 
     rate = None
     if with_rate:
         local = {labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"}
-        rate = rate_arrays(db, basis_year, month, api_version, local, tuple(range(12)))["USD"]
+        rate = rate_arrays(db, fx_year, fx_month, api_version, local, tuple(range(12)))["USD"]
 
-    return _TableInputs(month, api_version, labs, pks, vd.d, extras, rate)
+    return _TableInputs(month, api_version, labs, pks, d, extras, rate, spec_kind, spec[3] or "", label)
 
 
 def _lab_groups(labs: dict, pks: list[str]) -> list[LabGroup]:
@@ -390,6 +420,9 @@ def _lab_groups(labs: dict, pks: list[str]) -> list[LabGroup]:
 def get_lab_tables(
     basis_year: int,
     version: str = "cur",
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
     db: Session = Depends(get_db),
 ) -> LabTablesOut:
     """집계 화면 ②③④ 탭(연구소별 표 6장)을 **서버가 계산해서** 내려준다.
@@ -404,9 +437,11 @@ def get_lab_tables(
 
     CP 계약이 없는 해는 ④를 빼고 돌려준다 — 보정할 재료가 없는데 표를 내면 "보정했다"고 읽히는
     빈 표가 나간다. 화면은 받은 표만 서버 값으로 그리고 나머지는 그대로 둔다.
+
+    basis_month · kind · plan_no는 "어느 버전의 표인가"다(①과 같다 — _table_inputs 참고).
     """
-    inp = _table_inputs(db, basis_year, version, with_rate=True)
-    cp_total, cp_labor = cp_quarter_amounts(db, basis_year)
+    inp = _table_inputs(db, basis_year, version, True, basis_month, kind, plan_no)
+    cp_total, cp_labor = cp_quarter_amounts(db, basis_year, f"{basis_year:04d}-{inp.basis_month:02d}")
     tables = lab_tables(
         _lab_groups(inp.labs, inp.pks),
         inp.d,
@@ -418,6 +453,9 @@ def get_lab_tables(
         basis_year=basis_year,
         basis_month=inp.basis_month,
         version=version,
+        kind=inp.kind,
+        plan_no=inp.plan_no,
+        version_label=inp.label,
         tables={k: LabTable(**v) for k, v in tables.items()},
     )
 
@@ -427,6 +465,9 @@ def get_aggregate_table(
     basis_year: int,
     version: str = "cur",
     mode: str = "krw",
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
     db: Session = Depends(get_db),
 ) -> AggregateTable:
     """집계 화면 ① 전체 계정 표(손익계산서형 45행 × 17칸)를 **서버가 계산해서** 내려준다.
@@ -437,11 +478,15 @@ def get_aggregate_table(
 
     mode=krw면 월별 적용 환율로 환산한다(실적 구간은 말일/월평균 규칙을 따른다). usd면 저장
     단위(K$) 그대로다 — 환율을 안 거치므로 환율이 안 들어간 달도 값이 보인다.
+
+    basis_month · kind(속보|실적|경영계획) · plan_no는 "어느 버전의 표인가"다. 안 주면 지금
+    편성 중인 속보로 떨어진다 — 화면이 과거 버전을 띄울 때는 반드시 같이 보내야 한다
+    (안 보내면 어느 버전을 보고 있든 최신 속보 표가 그려진다 · _table_inputs 참고).
     """
     if mode not in ("usd", "krw"):
         raise HTTPException(400, "mode는 usd | krw만 쓸 수 있다.")
 
-    inp = _table_inputs(db, basis_year, version, with_rate=(mode == "krw"))
+    inp = _table_inputs(db, basis_year, version, mode == "krw", basis_month, kind, plan_no)
     month, pks, rate = inp.basis_month, inp.pks, inp.rate
     rows = pl_rows(pks, inp.d, inp.extras, mode, rate)
     unit = "K$" if mode == "usd" else "원"
@@ -449,8 +494,13 @@ def get_aggregate_table(
         basis_year=basis_year,
         basis_month=month,
         version=version,
+        kind=inp.kind,
+        plan_no=inp.plan_no,
+        version_label=inp.label,
         mode=mode,
-        caption=f"① 전체 계정 (연구소 {len(pks)}곳 단순 합산, {unit})",
+        # 캡션에 버전을 적는다 — 과거 버전을 띄웠을 때 화면·엑셀만 보고도 어느 버전 표인지 알아야
+        # 한다(연도만 적혀 있어서 최신 속보와 구분이 안 되던 자리다).
+        caption=f"① 전체 계정 · {inp.label} (연구소 {len(pks)}곳 단순 합산, {unit})",
         note=(
             "업로드한 양식 그대로 연구소를 합친 표다 — CP도 연구소가 보낸 PL(매월 금액) 그대로이고 "
             "분기 정산은 반영하지 않는다. 소계·분기·연간은 서버가 계산한다. "

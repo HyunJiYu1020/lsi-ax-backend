@@ -22,9 +22,15 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.accounts.overseas.schemas import LaborSplitLab, LaborSplitResult
+from app.accounts.overseas.services.entries import current_basis_month
 from app.accounts.overseas.services.fxcalc import rate_arrays
-from app.accounts.overseas.services.labs import lab_views
-from app.accounts.overseas.services.state import build_state
+from app.accounts.overseas.services.versions import (
+    active_labs,
+    check_kind,
+    load_basis,
+    resolve_bases,
+    ym_label,
+)
 from app.shared.core.values import n
 
 # 인건비 리프. GROUP_CALC의 labor와 같아야 한다 — 다르면 화면 인건비 행과 분해 합이 안 맞는다.
@@ -50,28 +56,52 @@ class LaborSplitInputs:
     local_curs: set[str]
 
 
-def prepare(db: Session, basis_year: int, base_version: str, lab_scope: str) -> LaborSplitInputs:
+def prepare(
+    db: Session,
+    basis_year: int,
+    base_version: str,
+    lab_scope: str,
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
+) -> LaborSplitInputs:
+    """기간과 무관한 준비물. basis_month · kind가 "어느 버전을 보고 있는가"다(2026-11-17).
+
+    전에는 build_state를 불러서 기준월을 "DB에 들어 있는 가장 최근 속보"로 삼았다 — 그래서 과거
+    버전을 띄워도 분해만 최신 속보 기준으로 계산됐다. 버전 해석은 집계·증감과 같은 층
+    (services/versions.py)을 쓴다. 안 주면 종전과 같이 최신 속보로 떨어진다(기존 호출 호환).
+    """
     if base_version not in BASE_LABELS:
         raise HTTPException(400, "base_version은 prev(전실행) | prior(전년 실적) | plan(경영계획)만 쓸 수 있다.")
+    check_kind(kind)
+    month = basis_month or current_basis_month(db) or 1
+    if not 1 <= month <= 12:
+        raise HTTPException(400, "basis_month는 1~12여야 한다.")
 
-    state = build_state(db, basis_year)
-    cur_d, base_d = state.V["cur"].d, state.V[base_version].d
-    if not cur_d:
-        raise HTTPException(404, f"{basis_year}년 당월 속보 데이터가 없다.")
-    if not base_d:
-        raise HTTPException(
-            404, f"{BASE_LABELS[base_version]} 데이터가 저장돼 있지 않아 인건비 증감을 나눌 수 없다."
-        )
+    resolved = resolve_bases(db, basis_year, month, kind, plan_no)
+    basis = next(b for b in resolved.bases if b.key == base_version)
 
-    basis_month = state.basis_month or 1
     # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 — 넣으면
     # SARC가 CPU+GPU+TOTAL로 두 번 세어져 인원과 금액이 정확히 두 배가 된다(실제로 그렇게 나왔다).
-    # 기준정보는 "당월 속보 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한 환차 분해가
-    # 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).
-    labs = {
-        lab.pk: lab for lab in lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
-        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
-    }
+    # 기준정보는 "보고 있는 버전 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한
+    # 환차 분해가 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).
+    labs = active_labs(db, basis_year, month)
+    basis_month = month
+    cur_spec_full = (
+        (basis_year, month, "plan", resolved.default_plan_no)
+        if kind == "plan"
+        else (basis_year, month, kind, "")
+    )
+    cur_d = load_basis(db, cur_spec_full, set(labs))
+    base_d = load_basis(db, (basis.year, basis.month, basis.kind, basis.plan_no), set(labs))
+    if not cur_d:
+        raise HTTPException(404, f"{resolved.basis_label} 데이터가 없다.")
+    if not base_d:
+        raise HTTPException(
+            404,
+            basis.fallback_note
+            or f"{BASE_LABELS[base_version]} 데이터가 저장돼 있지 않아 인건비 증감을 나눌 수 없다.",
+        )
     scope = (lab_scope or "ALL").strip()
     if scope.upper() == "ALL":
         pks = [pk for pk in labs if pk in cur_d or pk in base_d]
@@ -81,19 +111,14 @@ def prepare(db: Session, basis_year: int, base_version: str, lab_scope: str) -> 
         if not pks:
             raise HTTPException(404, f"그런 연구소가 없다: {scope!r}")
 
-    cur_spec = (basis_year, basis_month, "forecast")
-    if base_version == "prev":
-        snap = state.actualV.get("cur")
-        if not snap:
-            raise HTTPException(404, "전실행(직전 실적) 스냅샷이 없어 비교할 수 없다.")
-        base_spec = (basis_year, snap.thru_month, "actual")
-    elif base_version == "prior":
-        base_spec = (basis_year - 1, 12, "actual")
-    else:
-        # 경영계획은 속보/실적 환율 기준이 없어 환차·환차外를 나눌 수 없다(화면도 같은 제약).
+    # 환율 기준(연·월·속보실적). 경영계획은 속보/실적 환율 기준이 없어 환차·환차外를 나눌 수
+    # 없다 — 한쪽에라도 끼면 막는다(화면도 같은 제약이고, 증감 표는 그 경우 분해를 싣지 않는다).
+    if kind == "plan" or basis.kind == "plan":
         raise HTTPException(
             400, "경영계획 대비는 환율 기준(속보/실적)이 없어 인원·단가로 나눌 수 없다. 화면 표를 보라."
         )
+    cur_spec = (basis_year, month, kind)
+    base_spec = (basis.year, basis.month, basis.kind)
 
     # 현지통화 → $ 환차를 따로 나누는 통화. core.js의 ovLcOf와 똑같이 "통화가 USD가 아니면 현지통화"로
     # 본다 — CP도 통화가 ILS라 여기 포함된다.
@@ -160,7 +185,9 @@ def split_for(db: Session, inp: LaborSplitInputs, period: str, ix: tuple[int, ..
     hc_effect = (tot["hc_cur"] - tot["hc_base"]) * pB
     rate_effect = tot["hc_cur"] * (pC - pB)
     return LaborSplitResult(
-        basis_year=inp.basis_year, period=period, base_version=inp.base_version, lab_scope=inp.scope,
+        basis_year=inp.basis_year, basis_month=inp.basis_month, kind=inp.cur_spec[2],
+        base_label=ym_label(*inp.base_spec), period=period, base_version=inp.base_version,
+        lab_scope=inp.scope,
         hc_base=tot["hc_base"], hc_cur=tot["hc_cur"], per_head_base=pB, per_head_cur=pC,
         hc_effect=hc_effect, rate_effect=rate_effect, unsplit=tot["unsplit"],
         fx_outside=hc_effect + rate_effect + tot["unsplit"],

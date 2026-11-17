@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 from mcp.server.mcpserver import MCPServer
 
+from app.accounts.overseas.services.aggregate import ANCHORABLE, TOT_TREE
 from app.accounts.overseas.cost_groups import CATEGORY_LABELS, COST_GROUP_DEFS, GROUP_CALC, resolve_leaves
 
 API_BASE = os.environ.get("SLSI_API_BASE", "http://localhost:8000/api/v1")
@@ -37,6 +38,13 @@ ANCHOR_KEYS = (
     "gen(일반운영비, 그룹) · mgr(통제성경비, 그룹) · itx(IT 관련 비용, 그룹) · eda(EDA Tool) · "
     "emu(Emulator) · swl(SW/License구매) · svr(SVR/Storage임대) · itoth(IT 기타) · outs(외주용역비)"
 )
+
+# 추가 행을 붙여도 **개발비 총계에 안 잡히는** 자리. 이 키들은 집계표의 참고 행이라(cost_groups.py의
+# "참고 행 — 합계와 무관하다" 주석) 개발비 총계 트리 밖에 있고, services/aggregate.py의 합산이
+# `key in tree`로 거르기 때문에 여기 붙인 추가 행 금액은 그 참고 행에만 보이고 총계에는 안 더해진다.
+# 목록을 손으로 적지 않고 실제 트리에서 뽑는다 — 분류가 바뀌면 이 경고도 같이 따라가야 한다.
+_REF_ONLY_ANCHORS = tuple(sorted(k for k in ANCHORABLE if k not in TOT_TREE and k != "pct"))
+ANCHOR_REF_ONLY = " · ".join(f"{k}({CATEGORY_LABELS[k]})" for k in _REF_ONLY_ANCHORS)
 
 # 계정 한글명·집계 그룹 정의는 app/core/cost_groups.py가 단일 원본이다(API의 파생 행/열 계산식
 # 평가에서도 같은 정의가 필요해 공용 모듈로 옮겼다). chat.py가 CATEGORY_LABELS를 여기서 import해
@@ -95,7 +103,14 @@ async def list_labs(as_of: str | None = None) -> Any:
         "기준정보 변경은 '변경한 버전부터' 적용되고 지난 버전은 바뀌지 않는다 — effective_from을 "
         "비워 두면 지금 편성 중인 기준월부터 적용되고, 이미 마감한 과거 달은 바뀌기 전 값으로 "
         "그대로 남는다(통화를 바꿔도 지난달 보고 숫자가 소급해서 달라지지 않는다). 사용자가 "
-        "'예전 것도 다 바꿔줘'라고 하면 그때만 effective_from에 더 이른 \"YYYY-MM\"을 넣어라."
+        "'예전 것도 다 바꿔줘'라고 하면 그때만 effective_from에 더 이른 \"YYYY-MM\"을 넣어라.\n"
+        "(통화를 넣거나 바꿀 때는 환율을 같이 챙겨라) 연구소 통화는 환율표와 따로 관리돼서, 환율이 "
+        "없는 통화로 등록해도 아무것도 막히지 않는다 — 집계가 멈추는 게 아니라 조용히 환산을 "
+        "건너뛴다. 그래서 통화를 처음 넣거나 바꾸는 요청이면 먼저 get_fx_currency_coverage로 그 "
+        "통화 환율이 있는지 확인하고, 없으면 연구소 등록안과 함께 '환율도 같이 입력해야 한다'고 "
+        "알려라. 저장 후 응답에 fx_warning이 들어 있으면(서버가 확인한 사실이다) 그 내용을 반드시 "
+        "사용자에게 전하고 환율 입력을 요청해라 — 받은 값은 upsert_fx_rate로 넣는다. 연구소 등록 "
+        "자체는 환율이 없어도 성공하니, 등록에 실패했다고 말하지 마라."
     )
 )
 async def upsert_lab(
@@ -490,10 +505,25 @@ async def list_extra_rows(
         "사용자에게 이 행을 설명할 때 그 값을 근거로 그대로 보여줘라.\n"
         "(헷갈리기 쉬움) 이 도구는 표 안의 '행'을 만드는 것이다 — 사용자가 '연구소'를 추가·수정· "
         "삭제해달라고 한 거면 이 도구가 아니라 upsert_lab/delete_lab이다.\n"
+        "(이미 있는 행을 다른 항목 아래로 옮기기) 같은 row_key로 다시 부르되 **v를 아예 넣지 "
+        "마라** — 그러면 금액은 그대로 두고 이름·위치만 바뀐다. 금액을 다시 넣으면 안 된다: "
+        "화면이 $ 단위로 보고 있으면 서버가 받은 금액을 1000으로 나누기 때문에(해외-6), "
+        "조회해서 받은 값을 그대로 되보내면 금액이 1000배 작아진다. 옮길 행의 row_key는 "
+        "list_extra_rows로 찾아라.\n"
         "row_key는 처음 만들 때는 새 id를 하나 지어서 쓰면 된다. "
         'yyyymm: "현재 화면" 정보의 편성 기준 연월 "YYYYMM"을 그대로 써라. '
-        f"anchor_key: 사용자가 '~계정 아래에'라고 말하면 표에서 그 계정 바로 뒤에 끼워 넣는다 — 유효값: {ANCHOR_KEYS}. "
-        "생략하면(기본값) 표 맨 끝에 붙는다."
+        f"anchor_key(원시 행에 필수): 그 행이 어느 항목 아래에 들어가는지 — 유효값: {ANCHOR_KEYS}. "
+        "사용자가 '~계정 아래에'라고 말하면 그 키를 넣어라. **말하지 않았으면 비워 두지 말고 "
+        "먼저 어디에 넣을지 물어라** — 비워서 호출하면 거부된다. 비어 있는 행은 표에서는 맨 "
+        "끝에 붙지만 집계에서는 기타경비로 합산돼서, 사용자는 자기가 생각한 자리에 들어간 "
+        "줄 알고 있는데 숫자는 다른 항목에 잡힌다. 물을 때는 행 이름에 어울리는 후보를 두셋 "
+        "짚어서 제시해라. 사용자가 '아무 데나'라고 하면 misc(기타경비)로 넣으면 된다.\n"
+        f"(어느 합계에 잡히는지는 자리가 정한다) 추가 행은 자기가 붙은 자리의 합계에 더해진다 — "
+        "전산비 아래면 전산비 → 일반운영비 → 개발비로 타고 올라가고, "
+        f"{ANCHOR_REF_ONLY}(집계표의 참고 행) 아래면 그 줄 합계까지만 간다. 참고 행은 이미 다른 "
+        "분류에 잡힌 금액을 다른 각도로 묶어 보여주는 줄이라 개발비 합계에 안 올라가기 "
+        "때문이다. 개발비 합계에도 잡혀야 하는 금액이면 참고 행이 아니라 실제 비용 분류를 "
+        "골라야 한다 — 후보를 제시할 때 이 차이를 같이 말해라."
     )
 )
 async def upsert_extra_row(
@@ -889,6 +919,114 @@ async def list_fx_rates(year_month: str | None = None, year: str | None = None) 
 
 @mcp.tool(
     description=(
+        "그 해 CP 계약(기준정보 › CP 계약)을 조회한다 — '올해 CP 계약 얼마야?'·'CP 분기 정산 "
+        "얼마 들어가?' 같은 질문에 쓴다. POC(프로젝트)별 계약액과 연 합계, 그리고 분기 하나치"
+        "(연 계약액 ÷ 4 — 3 · 6 · 9 · 12월에 들어간다)가 같이 온다.\n"
+        "as_of(\"YYYY-MM\")는 **현재 화면 정보의 'cp_as_of' 값을 그대로 써라**(네가 계산하지 마라). "
+        "계약은 버전 시점별로 보관되기 때문이다 — 9월에 계약액을 바꿔도 8월 이하 버전은 바뀌기 전 "
+        "금액으로 분기 정산액이 계산된다. 엉뚱한 시점을 넣으면 사용자가 보고 있는 화면과 다른 "
+        "계약을 말하게 된다.\n"
+        "registered=false는 '계약액이 0원'이 아니라 '그 시점에 계약이 등록되지 않았다'는 뜻이다 — "
+        "0원이라고 답하지 말고 '등록되지 않았다(그래서 CP 정산 칸이 빈칸이고 합계에서 빠진다)'고 "
+        "설명해라.\n"
+        "금액은 **$ 단위**다(K$가 아니다) — 5,200,000이면 5.2M$다. 집계 표의 CP 정산 칸은 같은 "
+        "금액을 K$로(÷1000) 보여주므로, 집계 숫자와 비교해 말할 때 단위를 섞지 마라."
+    )
+)
+async def get_cp_contract(year: int, as_of: str) -> Any:
+    return await _get("/overseas/cp-contract", {"year": year, "as_of": as_of})
+
+
+@mcp.tool(
+    description=(
+        "CP 계약의 **금액만** 바꾼다 — 'CP 2026 계약액 5.2M$로 바꿔줘' 같은 요청에 쓴다. 지금 올라와 "
+        "있는 계약을 그대로 두고 금액 항목만 같은 비율로 움직인다(인원·맨먼스는 안 건드린다). "
+        "계약 파일 자체를 새로 올리는 건 이 도구가 아니라 화면의 업로드다.\n"
+        "둘 중 **하나만** 넣어라(둘 다 넣거나 둘 다 빼면 400으로 거부된다):\n"
+        "- year_total: 그 해 연 계약 총액을 이 값으로. POC가 여러 개면 **지금 비중대로 나눠 가진다**.\n"
+        "- poc_proj(+poc_type) + poc_total: POC 하나의 계약액만 이 값으로.\n"
+        "(중요) 사용자가 연 합계만 말했는데 POC가 2개 이상이면, 비중대로 나눈다는 사실을 먼저 "
+        "밝히고 어느 POC를 바꾸려는 건지 확인해라 — 실제로는 특정 POC의 계약이 바뀐 경우가 많고, "
+        "그때 비중대로 나누면 안 바뀐 POC의 계약액까지 같이 움직인다. POC가 1개뿐이면 그냥 진행해도 "
+        "된다. 먼저 get_cp_contract로 POC가 몇 개인지 확인해라.\n"
+        "(금액 단위, 틀리기 쉬움) CP 계약은 **$ 단위 그대로** 저장한다 — K$가 아니다. 5.2M$는 "
+        "5200이 아니라 **5200000**이다. 집계 표가 K$로 보여주는 건 서버가 1000으로 나눠서 "
+        "그런 것이고, 여기 넣는 값은 계약서에 적힌 $ 금액 그대로다. 이 값은 화면 표시 단위"
+        "(해외-6의 usd_unit)와도 무관하다 — 화면이 K$ 모드든 $ 모드든 계약서 금액을 그대로 "
+        "넣어라. 지금 금액이 얼마인지 모르겠으면 get_cp_contract로 먼저 확인해라(그 응답도 "
+        "$ 단위라 자릿수를 맞춰 보면 바로 안다).\n"
+        "effective_from(\"YYYY-MM\")은 생략해라 — 그러면 지금 편성 중인 기준월부터 적용되고, 이미 "
+        "마감한 지난 버전의 분기 정산액은 바뀌지 않는다. 사용자가 '예전 것도 바꿔줘'라고 할 때만 "
+        "더 이른 달을 넣어라.\n"
+        "응답에는 before/after와 note(전후 요약)가 들어 있다. 사용자에게는 note를 그대로 옮기지 말고 "
+        "'얼마에서 얼마로, 분기 정산은 얼마에서 얼마로, 언제 버전부터'를 네 말로 풀어서 전해라."
+    )
+)
+async def update_cp_contract_amount(
+    year: int,
+    year_total: float | None = None,
+    poc_proj: str | None = None,
+    poc_total: float | None = None,
+    poc_type: str | None = None,
+    effective_from: str | None = None,
+) -> Any:
+    body: dict[str, Any] = {"year": year}
+    for key, value in (
+        ("year_total", year_total), ("poc_proj", poc_proj), ("poc_total", poc_total),
+        ("poc_type", poc_type), ("effective_from", effective_from),
+    ):
+        if value is not None:
+            body[key] = value
+    return await _put("/overseas/cp-contract-amount", body)
+
+
+@mcp.tool(
+    description=(
+        "그 해에 그 통화의 환율이 환율표에 들어와 있는지 확인한다 — '인도 연구소 추가, 통화는 INR'·"
+        "'TDC 통화를 TWD로 바꿔줘'처럼 **연구소 통화를 새로 잡거나 바꾸기 전에 반드시 먼저 불러라**.\n"
+        "왜 중요한가: 환율이 없는 통화로 연구소를 잡아도 아무것도 막히지 않는다. 집계가 멈추는 게 "
+        "아니라 조용히 환산을 건너뛰어서, 숫자는 서는데 환산이 빠진 숫자가 된다. 화면에 경고도 안 "
+        "나오니 사람이 알아챌 방법이 없다.\n"
+        "응답: registered(그 해에 실적·속보 중 하나라도 있나) · forecast_months/actual_avg_months"
+        "(환율이 있는 달) · rate_unit(입력해야 하는 값의 단위) · note(그대로 읽어도 되는 요약).\n"
+        "registered가 false면 사용자에게 환율 입력을 요청해라 — 이때 rate_unit을 반드시 같이 "
+        "보여줘라(아래 upsert_fx_rate 설명 참고). 받은 값은 upsert_fx_rate로 넣는다."
+    )
+)
+async def get_fx_currency_coverage(currency: str, year: int) -> Any:
+    return await _get("/fx/currency-coverage", {"currency": currency, "year": year})
+
+
+@mcp.tool(
+    description=(
+        "환율 원본 한 칸(연월 × 통화 × 종류)을 넣거나 덮어쓴다. 정상 경로는 기준정보 › 환율 화면의 "
+        "파일 업로드이고, 이 도구는 '새 연구소 통화 환율이 아직 없다'처럼 빈칸 하나를 메우는 "
+        "용도다 — 올라온 환율을 네 판단으로 고치는 데 쓰지 마라.\n"
+        "(가장 틀리기 쉬운 곳) rate에 넣는 값은 **원/통화가 아니다**. 업로드 엑셀과 같은 형태이고 "
+        "통화마다 방향이 다르다: USD는 원/$(1,350), EUR·GBP·AUD·NZD는 $/통화(1.16), 나머지는 "
+        "통화/$(INR이면 95.3, JPY면 158). 그 통화가 어느 쪽인지는 get_fx_currency_coverage의 "
+        "rate_unit에 적혀 있다. 사용자에게 환율을 물을 때 '{통화} 환율 얼마예요?'라고만 묻지 말고 "
+        "반드시 그 단위를 밝혀서 물어라(예: 'INR/$ 기준으로 얼마인가요? 달러당 루피 값입니다') — "
+        "원/루피(약 14)를 받아서 그대로 넣으면 환산 금액이 7배 가까이 틀어지고, 숫자가 서기 때문에 "
+        "아무도 모른다. 사용자가 단위를 밝히지 않고 숫자만 말했고 그 값이 단위에 비해 터무니없으면 "
+        "저장하지 말고 어느 기준인지 되물어라.\n"
+        "kind: forecast(속보=실행, 기본값) | actual_avg(실적 월평균) | actual_eom(실적 말일) | "
+        "plan(경영). 새 연구소·새 통화를 등록하면서 넣는 건 보통 지금 편성 중인 기준월의 "
+        "forecast다 — 속보는 '그 달 이하의 가장 최근 값'을 이후 달에도 그대로 쓰기 때문에, 기준월 "
+        "한 달만 넣어도 그 달부터 연말까지 환산된다(과거 달은 실적이라 따로 올라와야 한다).\n"
+        "저장하면 적용 환율 표가 다시 만들어져 집계에 바로 반영된다. 응답은 '이제 그 통화가 어느 "
+        "달까지 채워졌는지'(get_fx_currency_coverage와 같은 모양)이니, 아직 비는 달이 있으면 그걸 "
+        "사용자에게 알려라."
+    )
+)
+async def upsert_fx_rate(year_month: str, currency: str, rate: float, kind: str = "forecast") -> Any:
+    return await _put(
+        "/fx/rate", {"year_month": year_month, "currency_code": currency, "kind": kind, "rate": rate}
+    )
+
+
+@mcp.tool(
+    description=(
         "속보·실적 버전의 진행 상태(기준정보 › 경영계획 연간 달력)를 조회한다 — '9월 실적 마감됐어?'·"
         "'올해 어디까지 확정됐어?' 같은 질문에 쓴다. kind: forecast(속보) | actual(실적), "
         "status: drafting(작성중) | done(완료)이고 completed면 confirmed_at(확정일)이 들어 있다.\n"
@@ -1164,15 +1302,50 @@ async def list_vendor_by_project(
         "인건비·인력을 네가 직접 나눠서 답하지 마라(환차가 섞여 화면과 어긋난다). 반드시 이 도구 "
         "결과를 그대로 써라.\n"
         "경영계획 대비(plan)는 환율 기준이 없어 나눌 수 없다. 전년 실적(prior) 데이터가 없는 환경에서는 "
-        "404가 나는데, 그때는 지어내지 말고 '그 비교 기준은 저장된 데이터가 없다'고 답해라."
+        "404가 나는데, 그때는 지어내지 말고 '그 비교 기준은 저장된 데이터가 없다'고 답해라.\n"
+        "basis_month·kind에는 '현재 화면' 정보의 'fx_basis_month'·'fx_basis_kind' 값을 그대로 넣어라 — "
+        "사용자가 과거 버전(예: 26.08 실적)을 보고 있을 때 이걸 빼면 지금 편성 중인 속보의 분해가 "
+        "돌아와서, 화면에 보이는 숫자와 다른 금액을 말하게 된다. 응답의 basis_month·kind·base_label로 "
+        "어느 버전의 분해를 받았는지 확인하고, 화면과 다르면 그 사실을 밝혀라."
     )
 )
 async def get_labor_split(
     basis_year: int, base_version: str = "prev", period: str = "y", lab_scope: str = "ALL",
+    basis_month: int | None = None, kind: str = "forecast",
 ) -> Any:
     return await _get(
         "/overseas/labor-split",
-        {"basis_year": basis_year, "base_version": base_version, "period": period, "lab_scope": lab_scope},
+        {
+            "basis_year": basis_year, "base_version": base_version, "period": period,
+            "lab_scope": lab_scope, "basis_month": basis_month, "kind": kind,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "연구소별 인건비율(인건비 ÷ 개발비(매출))을 조회한다 — '인건비율 얼마야?', 'SARC 인건비율', "
+        "'인건비 비중 높은 연구소'처럼 비율을 물을 때 쓴다. 집계 화면의 인건비율 팝업과 같은 값이다.\n"
+        "version: cur(보고 있는 버전, 기본값) | prev(전실행) | prior(전년 실적) | plan(경영계획). "
+        "period: y(연간, 기본값)|q1~q4|m1~m12. basis_month·kind에는 '현재 화면' 정보의 "
+        "'fx_basis_month'·'fx_basis_kind' 값을 그대로 넣어라(빼면 지금 편성 중인 속보 기준이 온다).\n"
+        "기준은 원화 환산 + CP는 계약 금액을 분기 말(3·6·9·12월)에 넣은 값이고, 분기·연간은 월별 "
+        "비율을 평균 내지 않고 **기간 합계끼리** 나눈 값이다 — list_cost_entries로 받은 금액을 네가 "
+        "직접 나눠서 답하지 마라(환산·CP 정산이 빠져 화면과 어긋난다).\n"
+        "ratio가 null인 줄은 분모(개발비)가 0이거나 아직 안 올라와서 비율을 낼 수 없는 것이다 — "
+        "절대 '0%'라고 말하지 마라. 올라온 연구소만 들어간다(rows의 첫 줄 lab_code='ALL'이 전체)."
+    )
+)
+async def get_labor_ratio(
+    basis_year: int, version: str = "cur", period: str = "y",
+    basis_month: int | None = None, kind: str = "forecast",
+) -> Any:
+    return await _get(
+        "/overseas/labor-ratio",
+        {
+            "basis_year": basis_year, "version": version, "period": period,
+            "basis_month": basis_month, "kind": kind,
+        },
     )
 
 

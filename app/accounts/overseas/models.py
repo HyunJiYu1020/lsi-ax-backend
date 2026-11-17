@@ -137,18 +137,49 @@ class OverseasReasonRow(Base):
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# "처음부터" — CP 계약 이력이 생기기 전부터 쓰던 세트를 가리키는 effective_from.
+# services/labs.py의 LAB_EPOCH와 같은 관례다(그쪽은 연구소 기준정보 이력에 쓴다).
+CP_EPOCH = "0000-01"
+
+
 class OverseasCpRow(Base):
     """CP 계약 업로드 — POC(프로젝트) 헤더 값을 각 직급 행에 반복 저장하는 flat 방식.
-    연 1회 전체를 올리는 파일이라 연도당 POC+직급 조합이 1행."""
+    연 1회 전체를 올리는 파일이라 (연도 × 적용 시점)당 POC+직급 조합이 1행.
+
+    왜 effective_from이 있나: CP 계약액은 저장된 값이 아니라 **조회할 때마다 다시 계산되는** 값의
+    재료다(services/aggregate.cp_quarter_amounts가 연 금액 ÷ 4를 3·6·9·12월에 넣는다). 그래서 이
+    테이블에 "지금 값" 한 세트만 두면, 계약액을 고치는 순간 이미 마감해서 보고한 과거 버전의 분기
+    정산액까지 소급해서 바뀐다. 공통 RULE("기준정보 변경은 변경한 버전부터 적용, 지난 버전 영향
+    없음")을 지키려면 버전이 보는 시점의 세트를 읽어야 한다 — overseas_lab_revisions가 연구소
+    기준정보에 하는 것과 같은 일이다.
+
+    연구소와 다른 점은 "한 줄"이 아니라 "행 집합"이라는 것이다. CP는 연 1회 전체를 올리는 파일이라
+    변경분만 남기는 것보다 그 시점의 세트를 통째로 한 벌 더 넣는 **스냅샷** 방식이 자연스럽다 —
+    읽을 때는 effective_from이 그 버전 시점 이하인 가장 최근 세트 하나를 통째로 쓴다."""
 
     __tablename__ = "overseas_cp_rows"
     __table_args__ = (
-        UniqueConstraint("year", "poc_type", "poc_proj", "title", name="uq_overseas_cp_rows_key"),
-        {"comment": "CP 계약 업로드(연간). POC(프로젝트)×직급 하나당 1행, POC 헤더값은 각 행에 반복 저장."},
+        UniqueConstraint(
+            "year", "effective_from", "poc_type", "poc_proj", "title", name="uq_overseas_cp_rows_key"
+        ),
+        CheckConstraint(
+            r"effective_from ~ '^\d{4}-(0[1-9]|1[0-2])$'", name="ck_overseas_cp_rows_effective_from_format"
+        ),
+        {
+            "comment": "CP 계약 업로드(연간) 시점별 스냅샷. POC(프로젝트)×직급 하나당 1행, POC 헤더값은 "
+            "각 행에 반복 저장. 어떤 버전을 볼 때 effective_from이 그 버전 시점 이하인 가장 최근 "
+            "세트를 통째로 쓴다 — 계약액을 고쳐도 지난 버전의 분기 정산액이 소급해서 바뀌지 않게 한다."
+        },
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     year: Mapped[str] = mapped_column(String(4), comment="CP 계약 연도")
+    effective_from: Mapped[str] = mapped_column(
+        String(7),
+        default=CP_EPOCH,
+        comment='이 세트가 적용되기 시작하는 편성 기준연월 "YYYY-MM". \'0000-01\'은 "처음부터"(이력이 '
+        "생기기 전부터 쓰던 값)를 뜻한다",
+    )
     poc_type: Mapped[str] = mapped_column(String(40), default="", comment="POC 구분(Type)")
     poc_proj: Mapped[str] = mapped_column(String(100), default="", comment="프로젝트명(Projects)")
     poc_desc: Mapped[str] = mapped_column(String(500), default="", comment="POC Description")
