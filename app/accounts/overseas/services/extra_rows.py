@@ -12,11 +12,12 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.accounts.overseas.cost_groups import GROUP_CALC, resolve_leaves, category_label
+from app.accounts.overseas.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, GROUP_CALC, resolve_leaves, category_label
+from app.shared.core import row_match
 from app.shared.core.values import n
 from app.accounts.overseas.models import OverseasLab
 from app.shared.models.common import CostEntry
-from app.accounts.overseas.schemas import ExtraRowOut
+from app.accounts.overseas.schemas import ExtraRowIn, ExtraRowOut
 from app.accounts.overseas.services.entries import entry_months_bulk
 from app.accounts.overseas.services.labs import ACCOUNT_KEY, ALL_SCOPE
 
@@ -145,3 +146,139 @@ def read_extra_rows(
             )
         )
     return out
+
+
+# ---------- 파생 행·열의 계산식 검증과 평가 ----------
+# 행 수식은 계정을 "세로로" 묶는다 — operands가 계정 키 목록이고 월별로(같은 달끼리) 계산한다.
+#   {"op": "div_elementwise", "operands": ["labor", "hc"]}  → 인건비 ÷ 인력 (= 인당인건비)
+# 열 수식은 월을 "가로로" 묶는다 — months가 월 번호 목록이고 각 행마다 그 달들을 계산한다.
+#   {"op": "sum_months", "months": [7, 8, 9]}               → 3분기 합계
+ROW_FORMULA_OPS = ("sum_elementwise", "div_elementwise")
+COL_FORMULA_OPS = ("sum_months", "avg_months")
+
+# 원시 행/열은 취합에서만, 파생 행/열은 집계에서만 지울 수 있다 — 추가한 화면에서만 치우게 해서
+# 다른 단계 담당자가 남의 행을 모르고 지우는 걸 막는다. 단계 이름은 화면 상단 진행 표시의 짧은
+# 이름(취합·집계·증감분석)과 같다. 단계는 브라우저 로컬 상태라 서버가 스스로 알 수 없고 호출부가
+# 보내줘야 하므로, 이건 권한(authorization)이 아니라 실수 방지 장치다 — chat.py의 파생 행 차단과
+# 같은 성격이다.
+STEP_FOR_RAW, STEP_FOR_DERIVED = "취합", "집계"
+
+
+def check_delete_step(step: str | None, is_derived: bool, what: str, confirmed: bool = False) -> None:
+    """다른 단계에서 들어온 행·열을 지우려 하면 **한 번 묻는다**(막지 않는다).
+
+    전에는 400으로 거부했다. 그런데 지우려는 사람은 그 행이 어느 단계에서 들어왔는지 모르고,
+    "지워지지 않는다"만 보였다 — 화면을 옮겨 다시 눌러야 한다는 걸 알아낼 방법이 없었다.
+    그래서 409로 사유를 돌려주고, 화면이 그대로 물어본 뒤 confirmed=true로 다시 부른다.
+    """
+    required = STEP_FOR_DERIVED if is_derived else STEP_FOR_RAW
+    if step == required or confirmed:
+        return
+    kind = "계산으로 만든 파생" if is_derived else "업로드 또는 직접 입력으로 들어온"
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"{kind} {what}입니다('{required}' 단계에서 들어왔습니다). "
+            f"지우면 되돌릴 수 없습니다. 정말 지우시겠습니까?"
+        ),
+    )
+
+
+def check_row_formula(formula: dict | None) -> dict:
+    """파생 행의 계산식을 검증한다. 1차 범위는 '같은 연구소·버전·연월 안의 계정/행 참조'로 한정한다 —
+    다른 연구소나 다른 연월을 섞는 수식은 참조 표현이 훨씬 복잡해져 아직 받지 않는다."""
+    if not isinstance(formula, dict):
+        raise HTTPException(status_code=400, detail="파생 행에는 formula(계산식)가 필요합니다.")
+    op = formula.get("op")
+    if op not in ROW_FORMULA_OPS:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 행 계산식 op: {op!r} ({' | '.join(ROW_FORMULA_OPS)})")
+    operands = formula.get("operands")
+    if not isinstance(operands, list) or not all(isinstance(k, str) and k for k in operands):
+        raise HTTPException(status_code=400, detail="formula.operands는 계정 키 문자열 목록이어야 합니다.")
+    if op == "div_elementwise" and len(operands) != 2:
+        raise HTTPException(status_code=400, detail="div_elementwise는 operands가 정확히 2개([분자, 분모])여야 합니다.")
+    if op == "sum_elementwise" and len(operands) < 2:
+        raise HTTPException(status_code=400, detail="sum_elementwise는 operands가 2개 이상이어야 합니다.")
+    return {"op": op, "operands": operands}
+
+
+def check_col_formula(formula: dict | None) -> dict:
+    if not isinstance(formula, dict):
+        raise HTTPException(status_code=400, detail="파생 열에는 formula(계산식)가 필요합니다.")
+    op = formula.get("op")
+    if op not in COL_FORMULA_OPS:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 열 계산식 op: {op!r} ({' | '.join(COL_FORMULA_OPS)})")
+    months = formula.get("months")
+    if not isinstance(months, list) or not months or not all(isinstance(m, int) and 1 <= m <= 12 for m in months):
+        raise HTTPException(status_code=400, detail="formula.months는 1~12 사이 월 번호 목록이어야 합니다.")
+    return {"op": op, "months": months}
+
+
+def eval_col_formula(formula: dict, row_months: list[float]) -> tuple[float, dict]:
+    """파생 열의 계산식을 한 행의 월별 값에 적용해 (칸 값, 근거)를 돌려준다."""
+    op, months = formula["op"], formula["months"]
+    picked = [(m, round(row_months[m - 1], 4) if m - 1 < len(row_months) else 0.0) for m in months]
+    total = round(sum(v for _, v in picked), 4)
+    value = total if op == "sum_months" else round(total / len(picked), 4)
+    return value, {
+        "text": f"{'+'.join(f'{m}월' for m in months)}{'' if op == 'sum_months' else ' 평균'}",
+        "op": op,
+        "months": [{"month": m, "value": v} for m, v in picked],
+        "result": value,
+    }
+
+
+# 챗봇으로 추가 행을 만들 때, 그 이름이 이미 있는 행과 겹치면 막는다 (TC-016).
+#
+# 왜 필요한가: "인건비 행 추가해줘"는 보통 "인건비 **아래에** 하위 항목을 넣어 달라"는 뜻이지
+# "인건비라는 행을 또 만들어 달라"가 아니다. 그런데 row_key만 다르면 서버는 그대로 만들어 주고,
+# 집계표에는 '인건비'가 두 줄로 나온다. 한 줄만 보고 "이 연구소 인건비는 이만큼"으로 읽으면 틀린다
+# (row_match.py가 애초에 해결하려던 문제와 같은 모양이다 — 같은 이름이 두 줄로 쪼개지는 것).
+#
+# 화면 경로(source="screen")에는 걸지 않는다 — ExtraRowIn.source 주석에 이유를 적어 뒀다.
+def block_duplicate_label(db: Session, body: ExtraRowIn, existing: CostEntry | None) -> None:
+    norm = row_match.normalize(body.label)
+    if not norm:
+        return
+    # ① 고정 계정과 같은 이름인가(한글명·영문명 양쪽으로 본다 — 파일은 영문으로 온다).
+    for key, label in CATEGORY_LABELS.items():
+        if norm in (row_match.normalize(label), row_match.normalize(CATEGORY_LABELS_EN.get(key, ""))):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"도구 실행 실패: '{body.label}'은 이미 계정 목록에 있는 행이다"
+                    f"({label}). 같은 이름의 행을 또 만들면 집계표에 두 줄로 나와서, 한 줄만 보고 "
+                    "읽으면 금액이 틀린다. 재시도하지 말고 사용자에게 무엇을 원하는지 먼저 물어라 — "
+                    f"'{label}' 아래에 하위 항목을 넣으려는 것이면 그 하위 항목의 이름을 받아서 "
+                    f"anchor_key='{key}'로 추가하고, 그 계정 금액을 고치려는 것이면 "
+                    "upsert_cost_entry를 쓴다."
+                ),
+            )
+    # ② 그 연구소·버전·연월에 이미 쓰이는 추가 행과 같은 이름인가(자기 자신은 뺀다).
+    dup = next(
+        (
+            e
+            for e in db.scalars(
+                select(CostEntry).where(
+                    CostEntry.account_code == ACCOUNT_KEY,
+                    CostEntry.scope_code == body.lab_pk,
+                    CostEntry.version == body.version,
+                    CostEntry.yyyymm == body.yyyymm,
+                    CostEntry.label.is_not(None),
+                    CostEntry.category_code != body.row_key,
+                )
+            )
+            if row_match.normalize(e.label or "") == norm
+        ),
+        None,
+    )
+    if dup is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"도구 실행 실패: '{body.label}' 행은 이미 있다(row_key '{dup.category_code}'). "
+                "같은 이름으로 또 만들면 집계표에 두 줄로 나온다. 재시도하지 말고, 그 행의 금액을 "
+                "고치려는 것인지 아니면 다른 이름의 새 행을 원하는지 사용자에게 물어라 — 이미 있는 "
+                f"행을 옮기려는 것이면 같은 row_key('{dup.category_code}')로 v 없이 호출하면 된다."
+            ),
+        )

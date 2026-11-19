@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.accounts.overseas.endpoints import collect as ov
+from app.accounts.overseas.services import translate as translate_service
 from app.shared.core.reason_translate import MAX_TEXTS, _parse, normalize
 from app.accounts.overseas.schemas import ReasonTranslateIn
 
@@ -22,11 +23,11 @@ def fake_llm(monkeypatch):
     """translate_batch를 "영문 → [번역] 영문"으로 바꾸고, 몇 건을 몇 번 물었는지 기록한다."""
     calls: list[list[str]] = []
 
-    async def fake(texts, provider=None):
+    async def fake(texts, provider=None, guidelines=""):
         calls.append(list(texts))
         return [f"[번역] {t}" for t in texts]
 
-    monkeypatch.setattr(ov, "translate_batch", fake)
+    monkeypatch.setattr(translate_service, "translate_batch", fake)
     return calls
 
 
@@ -63,16 +64,16 @@ def test_duplicates_and_whitespace_collapse_to_one_call(db, fake_llm):
 
 def test_refresh_overwrites_stored_translation(db, monkeypatch):
     """refresh=True면 저장된 번역을 무시하고 다시 번역해서 덮어쓴다(모델 교체·오역 수정)."""
-    async def v1(texts, provider=None):
+    async def v1(texts, provider=None, guidelines=""):
         return ["구버전 번역"] * len(texts)
 
-    async def v2(texts, provider=None):
+    async def v2(texts, provider=None, guidelines=""):
         return ["신버전 번역"] * len(texts)
 
-    monkeypatch.setattr(ov, "translate_batch", v1)
+    monkeypatch.setattr(translate_service, "translate_batch", v1)
     assert _run(db, [EN]).items[0].ko == "구버전 번역"
 
-    monkeypatch.setattr(ov, "translate_batch", v2)
+    monkeypatch.setattr(translate_service, "translate_batch", v2)
     assert _run(db, [EN]).items[0].ko == "구버전 번역"  # 기본은 캐시 우선
     assert _run(db, [EN], refresh=True).items[0].ko == "신버전 번역"
     assert _run(db, [EN]).items[0].ko == "신버전 번역"  # 덮어써져서 다음부터도 신버전
@@ -83,10 +84,10 @@ def test_llm_failure_keeps_cached_rows_and_reports_reason(db, monkeypatch, fake_
     원문으로 그린다. 실패 이유(키 없음 등)는 error에 담아 보낸다."""
     _run(db, [EN])  # 한 건은 미리 캐시
 
-    async def boom(texts, provider=None):
+    async def boom(texts, provider=None, guidelines=""):
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY가 설정되지 않았습니다.")
 
-    monkeypatch.setattr(ov, "translate_batch", boom)
+    monkeypatch.setattr(translate_service, "translate_batch", boom)
     r = _run(db, [EN, "brand new reason text"])
 
     by_src = {i.source: i for i in r.items}

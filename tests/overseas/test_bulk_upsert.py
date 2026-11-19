@@ -1,6 +1,7 @@
 from sqlalchemy import select
 
-from app.accounts.overseas.endpoints.collect import ACCOUNT_KEY, _bulk_upsert_notes
+from app.accounts.overseas.endpoints.collect import ACCOUNT_KEY
+from app.accounts.overseas.services.notes import bulk_upsert_notes as _bulk_upsert_notes
 from app.accounts.overseas.services.reason_rows import upsert_reason_rows
 from app.accounts.overseas.models import OverseasReasonRow
 from app.shared.models.common import CostEntry, CostEntryDetail, Note
@@ -8,8 +9,10 @@ from app.shared.models.plan import ManagementPlanEntry, ManagementPlanEntryDetai
 from app.accounts.overseas.services.entries import (
     bulk_upsert_cost_entries,
     bulk_upsert_plan_entries,
+    entry_months_bulk,
     pick_plan_no,
 )
+from app.accounts.overseas.services.extra_rows import months_by_category
 from app.accounts.overseas.schemas import ReasonRow
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연월/연도를 키로 써서 테스트한다.
@@ -174,7 +177,7 @@ def test_bulk_upsert_reason_rows(db):
     reasons = [
         ReasonRow(
             lab_code="SARC",
-            version="cur",
+            version="forecast",
             category_key="c0",
             block="y",
             mon_label="",
@@ -190,7 +193,8 @@ def test_bulk_upsert_reason_rows(db):
             source_file="",
         )
     ]
-    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons})
+    # 기준월은 이제 필수다 — 행에 없으면 호출부가 기본값으로 준다(없으면 400).
+    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, "202609")
     db.flush()
 
     row = db.scalar(
@@ -198,6 +202,19 @@ def test_bulk_upsert_reason_rows(db):
     )
     assert row is not None
     assert float(row.cur_value) == 3.0
+    assert row.yyyymm == "202609"
+
+    # 같은 연구소·항목이라도 달이 다르면 다른 행이다 — 11월 회신이 9월 회신을 덮으면 안 된다.
+    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, "202611")
+    db.flush()
+    yms = set(
+        db.scalars(
+            select(OverseasReasonRow.yyyymm).where(
+                OverseasReasonRow.lab_code == "SARC", OverseasReasonRow.category_key == "c0"
+            )
+        )
+    )
+    assert yms == {"202609", "202611"}
 
 
 # ---------- 적용 차수 고르기 (2026-11-17) ----------
@@ -241,3 +258,33 @@ def test_bulk_upsert_plan_entries_needs_a_revision():
 
     with pytest.raises(ValueError):
         bulk_upsert_plan_entries(None, [("SARC:CPU", "hc", TEST_YEAR, _months(1.0))], "")
+
+
+def test_blank_month_deletes_the_stored_row(db):
+    """None으로 보낸 달은 저장된 상세 행을 지운다 — "미제출로 되돌리기"가 되어야 한다.
+
+    연구소가 칸을 비워 다시 보내는 것은 "그 달은 아직 안 냈다"는 보고다. 건너뛰기만 하면 지난
+    업로드의 숫자가 남아 화면이 거짓으로 채워지고, 0으로 덮으면 "0으로 보고"가 된다. 그래서
+    지우는 것이 유일하게 뜻이 맞는 처리다. 0.0은 지우지 않는다(그건 보고된 값이다)."""
+    pk, ym, cat = "DSRA", "209905", "sal"
+    bulk_upsert_cost_entries(db, [(pk, "forecast", cat, ym, [1.0, 2.0, 0.0] + [None] * 9)])
+    assert months_by_category(db, pk, "forecast", ym)[cat][:3] == [1.0, 2.0, 0.0]
+
+    # 기본 모드에서는 None이 "건드리지 마라"다(부분 갱신) — 지워지지 않는다.
+    bulk_upsert_cost_entries(db, [(pk, "forecast", cat, ym, [1.0, None, 0.0] + [None] * 9)])
+    assert months_by_category(db, pk, "forecast", ym)[cat][1] == 2.0
+
+    # 2월을 비워 다시 올린다(clear_blanks) — 1월·3월은 그대로, 2월만 미등록으로 돌아간다.
+    bulk_upsert_cost_entries(
+        db, [(pk, "forecast", cat, ym, [1.0, None, 0.0] + [None] * 9)], clear_blanks=True
+    )
+    entry = db.scalars(
+        select(CostEntry).where(
+            CostEntry.account_code == "overseas", CostEntry.scope_code == pk,
+            CostEntry.version == "forecast", CostEntry.yyyymm == ym, CostEntry.category_code == cat,
+        )
+    ).one()
+    months = entry_months_bulk(db, [entry])[entry.id]
+    assert months[0] == 1.0
+    assert months[1] is None, "비워 보낸 달이 지워지지 않았다 — 옛 숫자가 그대로 남는다"
+    assert months[2] == 0.0, "0으로 보고한 달이 같이 지워졌다"
