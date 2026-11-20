@@ -38,7 +38,8 @@ Base URL: `http://localhost:8000/api/v1`
 | GET/PUT | `/overseas/memos` | 메모 셀 조회/저장 | 챗봇만 |
 | GET | `/overseas/vendor-rows` | 외주용역 상세 조회 (`overseas_vendor_rows`) | 챗봇만 |
 | PUT | `/overseas/vendor-rows` | 외주용역 상세 저장 — 연구소×버전 단위 전체 교체 | 화면 |
-| PUT | `/overseas/cp-rows` | CP 계약 저장 — 연도 단위 전체 교체 | 화면 |
+| PUT | `/overseas/cp-rows` | CP 계약 저장 — 연도 × **적용 시점** 단위 전체 교체(`effective_from` 생략 시 지금 편성 중인 기준월) | 화면 |
+| PUT | `/overseas/cp-contract-amount` | CP 계약 **금액만** 변경 — 연 합계(`year_total`) 또는 POC 하나(`poc_proj`+`poc_total`). 응답에 전·후 계약과 분기 정산액 변화 | 챗봇만 (`update_cp_contract_amount`) |
 | PUT | `/overseas/reason-rows` | 증감사유 업로드 시트 저장 — 키별 upsert(누적) | 화면 |
 | GET | `/overseas/vendor-by-project` | 외주용역을 과제(Project)별로 묶어 집계 (증감분석 · 챗봇) | 챗봇만 |
 | GET | `/overseas/variance-basis` | 비교 기준 세 칸이 실제로 무엇과 비교하는지 해석 (전실행=직전 버전 · 전년=전년 12월 실적 · 경영계획=선택 차수) + 경영계획 차수 목록 | 화면+챗봇 |
@@ -50,14 +51,18 @@ Base URL: `http://localhost:8000/api/v1`
 | GET/PUT | `/overseas/actual-stage` | 실적 연월의 1차 상태 — 실적결산 1차 완료 여부(1차 탭 활성)·[1차 고정] | 화면 |
 | GET/PUT | `/overseas/actual-first` | 실적 1차 분석(ERP 약식) 연구소 총액·1차 사유 조회/저장. 고정 상태면 409 | 화면 |
 | GET | `/overseas/actual-stage-shift` | 2차 화면 상단의 "1차 → 2차 변동" (연구소별 + 합계) | 화면+챗봇 |
-| GET | `/overseas/cp-contract` | 그 해 CP 계약(기준정보 › CP 계약) 요약 — POC별 금액 + 분기 하나치(연 ÷ 4). `registered=false`는 "0원"이 아니라 **미등록**이고, 집계 ④ CP 보정의 정산 칸을 빈칸으로 두는 근거다 | 화면+챗봇 |
+| GET | `/overseas/cp-contract` | 그 해 CP 계약(기준정보 › CP 계약) 요약 — POC별 금액 + 분기 하나치(연 ÷ 4). **`as_of`("YYYY-MM") 필수** — 그 버전 시점의 계약을 읽는다. `registered=false`는 "0원"이 아니라 **미등록**이고, 집계 ④ CP 보정의 정산 칸을 빈칸으로 두는 근거다 | 화면+챗봇 |
 | GET | `/overseas/confirm-check` | [계정 확정] 직전 점검 — 막는 것(환율 미등록 월)과 알리는 것(미업로드 연구소 · CP 계약 미등록 · 사유 미작성 · 재확인 필요) + 확정 단서 문장("미업로드 2개 포함 확정") | 화면+챗봇 |
 | GET | `/overseas/labor-ratio` | 인건비율(인건비 ÷ 개발비(매출)) 전체·연구소별. 분기·연간은 **합계끼리** 나누고, 분모가 0이면 `ratio=null`(화면 '—') | 화면+챗봇 |
+| GET | `/overseas/aggregate-table` | 집계 ① 전체 계정 표(45행 × 17칸)를 서버가 계산. `mode=usd\|krw`로 달러·원화. **`basis_month`·`kind`(·`plan_no`)로 어느 버전인지 같이 보내야 한다** — 안 보내면 지금 편성 중인 속보로 떨어져서, 화면이 과거 버전을 띄워도 최신 속보 표가 나간다 | 화면+챗봇 |
+| GET | `/overseas/lab-tables` | 집계 ②③④ 탭(연구소별 표 6장)을 한 번에. 버전 파라미터는 ①과 같다. 환율이 없으면 원화 표가, CP 계약이 없으면 ④가 빠진다 | 화면+챗봇 |
 | GET | `/overseas/summary` | 화면 맨 위 히어로 카드(개발비(매출) · 인건비/인건비외 · 업로드 진척 · 단계)를 서버에서 같은 식으로 계산 | 챗봇만 (화면은 아직 자체 계산) |
 | GET/PUT/DELETE | `/overseas/sheet-rows`, DELETE `/sheet-rows/all` | 열 구성 확정 전인 새 시트(JSON) 조회/저장/삭제 | 챗봇만 |
 | GET/PUT | `/fx/state` | 실적·속보·경영 환율(전사 공통 3종) 조회/저장 | 화면 |
 | POST | `/fx/applied/recompute` | 지정한 기준(연도·월·속보실적·룰)의 적용 환율을 다시 계산 (`dry_run=true`면 미리보기) | 챗봇만 (`get_fx_rate_preview` · `recompute_applied_fx_rates`) |
-| GET | `/fx/applied` | 적용 환율 캐시 조회 | 챗봇만 (`get_applied_fx_rates`) |
+| GET | `/fx/applied` | 적용 환율 조회 | 챗봇만 (`get_applied_fx_rates`) |
+| GET | `/fx/currency-coverage` | 그 해에 그 통화 환율이 어느 달까지 들어와 있는지(연구소 통화를 잡기 전 확인용) | 챗봇만 (`get_fx_currency_coverage`) |
+| PUT | `/fx/rate` | 환율 원본 **한 칸**(연월×통화×종류) 직접 입력 — 새 통화의 빈칸 메우기용. 저장 후 적용 환율 표 재생성 | 챗봇만 (`upsert_fx_rate`) |
 | GET/PUT/PUT(`/batch`)/DELETE | `/cost-entries` | 19개 계정이 공유하는 범용 비용 조회/upsert/일괄upsert/삭제 | 화면(해외연구소가 `/overseas/state`와 병행 저장 — 아래 참고) |
 | GET/POST/PUT/DELETE | `/versions` | 연월×속보·실적(forecast/actual) 진행 상태(열림·작성중·완료) 조회/생성/변경/삭제 | 화면 |
 | GET/POST | `/management-plan/versions`, PUT/DELETE `/versions/{year}/{plan_no}` | 경영계획 버전(P00~) 조회/생성/확정/삭제 | 화면 |
@@ -194,7 +199,7 @@ Base URL: `http://localhost:8000/api/v1`
 | API | 저장 단위 | 왜 그 단위인가 |
 |---|---|---|
 | `PUT /overseas/vendor-rows` | 연구소×버전 **전체 교체** | 업로드마다 행 수가 달라서 upsert만 하면 연구소가 뺀 항목이 남는다 |
-| `PUT /overseas/cp-rows` | 연도 **전체 교체** | 연 1회 올리는 파일이라 사라진 POC·직급은 지워야 한다 |
+| `PUT /overseas/cp-rows` | 연도 × 적용 시점 **전체 교체** | 연 1회 올리는 파일이라 사라진 POC·직급은 지워야 한다. 다른 시점 세트(지난 버전이 보는 값)는 건드리지 않는다 |
 | `PUT /overseas/reason-rows` | 키별 **upsert 누적** | 회신을 항목별로 쌓아 가는 자료라, 한 시트를 올렸을 때 다른 항목 사유가 사라지면 안 된다 |
 
 **`PUT /overseas/state`와 이 세 개는 같은 서비스 함수를 부른다**(`services/overseas/{vendor,cp,reason_rows}.py`).
@@ -221,11 +226,27 @@ Base URL: `http://localhost:8000/api/v1`
 전사 공통 환율 3종(실적·속보·경영, 전부 `fx_rates` 테이블에 `kind` 컬럼으로 구분해 저장)을 한 번에
 조회/저장한다. `/overseas/state`와 똑같은 이유로 통째로 주고받는 모양을 택했다.
 
-**저장 부수효과**: `PUT /fx/state`가 성공하면 끝에서 `fx_applied_rates`에 이미 캐시돼 있던 모든
-(기준연도·월·속보실적·룰) 조합을 자동으로 다시 계산해 덮어쓴다(`_refresh_all_applied_rates`). 원본
-3개 테이블 중 뭐가 바뀌든 이 한 엔드포인트를 통해 들어오므로, 캐시가 상한 채로 남는 일은 없다. 다만
-**아직 한 번도 계산된 적 없는 새 기준**은 이걸로 안 생긴다 — `POST /fx/applied/recompute`를 최소 한 번
-호출해서 만들어둬야 한다(어떤 기준을 "기본값"으로 미리 만들어둘지는 서버가 임의로 정할 수 없어서).
+**저장 부수효과**: `PUT /fx/state`가 성공하면 끝에서 `materialize_applied_rates`가 원본이 있는 모든
+연도의 적용 환율 조합을 **전부** 다시 만든다(연도당 기준월 12 × 속보/실적 2 × 평균/말일 2 = 48조합).
+조합이 유한해서 전부 만들어 둘 수 있고, 그러면 읽는 쪽(`applied_rows`)은 "없으면?" 분기가 필요
+없어진다 — 예전처럼 "이미 있던 조합만" 갱신하면 아무도 아직 안 본 조합(비교 버전의 기준 등)이 영원히
+비어 있고, 그걸 0으로 읽어서 금액이 조용히 전부 0이 된다.
+
+## GET /fx/currency-coverage · PUT /fx/rate
+
+연구소 통화와 환율표를 잇는 다리. **왜 필요한가**: 환율이 없는 통화로 연구소를 잡아도 아무것도
+막히지 않는다. 집계가 404로 멈추는 건 원/$가 없을 때뿐이고, 현지통화가 없으면
+`fxcalc.rate_arrays`가 0으로 두고 쓰는 쪽이 환차 분해를 건너뛴다 — 숫자는 서는데 환산이 빠진
+숫자가 되고, 화면에 아무 신호도 안 남는다.
+
+- `GET /fx/currency-coverage?currency=INR&year=2026` → `registered`(그 해 실적·속보 중 하나라도
+  있나) · `forecast_months`/`actual_avg_months` · `rate_unit` · `note`
+- `PUT /fx/rate` → 한 칸(연월×통화×종류) upsert 후 적용 환율 표 재생성. 응답은 저장 결과가 아니라
+  **갱신된 coverage**다(한 칸 넣어도 남는 구멍이 있을 수 있어서)
+- `rate`에 넣는 값은 **원/통화가 아니다** — 업로드 엑셀과 같은 형태로 USD는 원/$, EUR·GBP·AUD·NZD는
+  $/통화, 나머지는 통화/$(INR이면 95.3)다. `rate_unit`이 그 통화의 방향을 알려준다
+- `PUT /overseas/labs/one`(연구소 하나 저장) 응답의 `fx_warning`이 같은 확인을 저장 시점에 자동으로
+  한다 — 따로 조회해야 보이게 두면 호출하는 쪽이 빼먹고, 빼먹은 티도 안 난다
 
 ---
 
@@ -355,22 +376,81 @@ PUT /versions/2026/9/forecast/accounts/overseas
 
 ---
 
+## PUT /overseas/cp-contract-amount
+
+"CP 2026 계약액 5.2M$로 바꿔줘" — 계약 파일을 다시 올리지 않고 **금액만** 고치는 경로.
+업로드(`PUT /overseas/cp-rows`)가 표 전체를 갈아끼우는 것과 달리, 지금 올라와 있는 계약을 그대로
+두고 금액 항목만 같은 배율로 움직인다.
+
+- **금액 단위는 `$`**다(K$가 아니다) — 5.2M$는 `5200000`이다. `overseas_cp_rows`는 계약서 금액을
+  그대로 담고, 집계 표가 K$로 보이는 건 `cp_quarter_amounts`가 1000으로 나누기 때문이다
+  (÷4는 분기 분할, ÷1000이 단위 환산). 응답의 `before`/`after`도 `$`이고, `note`에만 집계 표와
+  맞춰 보라고 K$ 환산을 괄호로 같이 적는다
+- **두 가지 모드 중 하나만** — `year_total`(연 합계를 이 값으로, POC가 여럿이면 지금 비중대로
+  나눠 가진다) 또는 `poc_proj`(+`poc_type`) + `poc_total`(POC 하나만). 둘 다 주거나 둘 다 안 주면
+  400이다 — 어느 쪽인지에 따라 금액이 몇 배씩 달라져서 서버가 짐작하면 안 된다
+- **움직이는 것**: `poc_total` · `poc_direct` · `poc_ovh` · `poc_cost_sum` · 직급 행의 `cost_year`.
+  배율 하나를 전부에 곱하므로 `direct + ovh = total` 같은 관계가 그대로 보존되고, CP 계약 화면의
+  직급 행 합과 POC 헤더값도 계속 맞는다
+- **안 움직이는 것**: 인원(`dedicated` · `common`)과 맨먼스(`man_month` · `poc_mm_sum`) —
+  "계약액이 얼마로 바뀌었다"는 돈 이야기지 인력 구성 이야기가 아니다
+- **적용 시점**: `effective_from` 생략 시 지금 편성 중인 기준월. 9월에 바꾸면 9월 이후 버전만 새
+  금액으로 분기 정산액이 계산되고 8월 이하는 그대로다
+- **응답은 전·후를 같이** 준다(`before` · `after` · `note`). 이 변경의 핵심이 "얼마가 얼마로,
+  분기 정산액은 어떻게"라서, 바뀐 숫자만 주면 사용자가 무엇을 승인했는지 되짚을 수 없다
+- 그 시점에 계약이 등록돼 있지 않으면 400이다 — 조용히 새 계약을 만들면 업로드한 적 없는 금액이
+  집계에 선다
+
+---
+
 ## 집계 화면이 서버에 묻는 것 (`/overseas/cp-contract` · `/overseas/confirm-check` · `/overseas/labor-ratio`)
 
-집계표 숫자는 브라우저가 계산하지만, 아래 셋은 서버가 판정해야 한다 — 여러 사람이 같이 보는 값이거나
+집계표 숫자는 이제 서버가 계산해서 표째로 내려준다(`/overseas/aggregate-table` · `/overseas/lab-tables`
+— PLAN.md Phase 6). 아래 셋은 표와 별개로 서버가 판정해야 하는 값이다 — 여러 사람이 같이 보는 값이거나
 (CP 계약·확정 상태), 화면과 챗봇이 다른 숫자를 말하면 안 되는 값(인건비율)이다.
+
+- **어느 버전의 표인가는 호출하는 쪽이 정한다** (2026-11-17). 두 집계표 엔드포인트는
+  `basis_year` · `basis_month` · `kind`(`forecast`\|`actual`\|`plan`) · `plan_no`를 받고, 버전 해석
+  (전실행이 무엇인가 · 경영계획 몇 차수인가)은 증감분석과 **같은 층**(`services/variance.resolve_bases`
+  · `load_basis`)을 쓴다. `basis_month`를 빼면 서버가 "DB에 들어 있는 가장 최근 속보"로 떨어진다 —
+  그래서 화면이 상단에서 26.08 실적을 골라도 집계표만 최신 속보 숫자를 그리던 버그가 있었다.
+  응답의 `kind` · `plan_no` · `version_label`("26.08 실적")로 어느 버전을 받았는지 확인할 수 있고,
+  ① 캡션에도 그 라벨이 들어간다. 증감분석(`/overseas/variance-table`)도 같은 파라미터를 받는다 —
+  화면이 두 화면에 같은 값(`ovVerQ`)을 보낸다.
+- **경영계획 차수는 "적용 차수"로 푼다** (2026-11-17). 규칙 한 곳: `services/entries.pick_plan_no` —
+  ★(`is_final`, 그 연도의 공식 비교 기준) → **확정된(`is_confirmed`) 차수 중 최신** → 가장 최근 차수.
+  전에는 `PLAN_NO = "P00"` 상수라 P01·P02를 확정해도 화면·챗봇이 계속 P00을 봤다. `GET /overseas/state`
+  는 `plan_no`로 "지금 V\[plan\]이 어느 차수인지"를 같이 준다(빈 문자열 = 그 해 차수 없음 ≠ 0원).
+  `PUT /overseas/state`의 `plan_no`는 **어느 차수에 쓸지**이고, 비우면 확정되지 않은 최신 차수에
+  쓴다. **확정된 차수는 덮지 않는다** — 저장 전체를 세우지는 않고 건너뛰되 응답의 `plan_skipped`로
+  밝힌다(확정을 화면 저장이 덮으면 이미 보고한 경영계획 대비 숫자가 소급해서 바뀐다).
 
 - **CP 계약** — CP 분기 정산은 업로드된 CP PL이 아니라 기준정보 › CP 계약 금액으로 한다(연 계약액
   ÷ 4를 3 · 6 · 9 · 12월에). 그래서 집계는 "계약이 등록됐는지"를 알아야 한다. 미등록일 때
   `registered=false`로 **200**을 주는 게 중요하다 — 404로 주면 화면이 "서버 오류"와 구분하지 못해
   업로드된 CP PL로 그려 버리고, 그러면 계약 없이 숫자가 선다. 미등록이면 그 칸은 0이 아니라 빈칸이고
   합계에서도 빠진다(공통 RULE: CP 계약 미등록이면 CP 정산 칸 빈칸 + 알림).
+
+  **적용 시점(`as_of`)이 필수인 이유**: 분기 정산액은 저장된 값이 아니라 **조회할 때마다 다시
+  계산되는** 값이다. 그래서 시점 없이 "지금 계약"을 읽으면, 계약액을 고치는 순간 이미 마감해서
+  보고한 과거 버전의 분기 정산액까지 새 계약액으로 다시 계산된다. `overseas_cp_rows`는 시점별
+  스냅샷(`effective_from`)으로 저장하고, 읽을 때는 그 버전 시점 이하 가장 최근 세트를 통째로
+  쓴다 — 9월에 바꾸면 9월 이후 버전만 새 계약으로 계산되고 8월 이하는 바뀌기 전 값 그대로다
+  (연구소 기준정보 `lab_views(as_of=...)`와 같은 규칙). `as_of`를 선택 인자로 두지 않은 이유는,
+  빼먹은 호출부 하나가 그 화면만 조용히 소급시키는데 소급은 "숫자가 틀린다"가 아니라 "과거
+  보고서가 달라진다"는 형태라 아무도 못 알아채기 때문이다.
 - **확정 사전점검** — `blocking`(막는 것)과 `warnings`(알리는 것)를 나눠 준다. 지금 막는 건 적용
   환율(원/$)이 없는 달뿐이다(환산이 안 된 총액이 버전에 박힌다). 미업로드 연구소 · CP 계약 미등록 ·
   사유 미작성 · 재확인 필요는 경고만 하고 확정은 할 수 있게 한다. 같이 내려주는 `note`
   ("미업로드 2개 포함 확정")를 그대로 `PUT /versions/.../accounts/overseas`의 note에 넣으면 버전
   화면에 단서가 남는다. 사유 판정은 `/overseas/variance-reason-check`와 **같은 함수**를 쓴다 —
   두 군데서 따로 세면 화면과 경고가 어긋난다.
+- **인건비율 · 인건비 분해도 버전을 받는다** (2026-11-17). `/overseas/labor-ratio`와
+  `/overseas/labor-split`이 집계표와 같은 `basis_month` · `kind`(· `plan_no`)를 받고, 인건비율은
+  재료 읽기까지 집계표와 **같은 함수**(`_table_inputs`)를 쓴다 — 연구소 추리기·추가 행·환율 규칙이
+  갈리면 같은 화면의 집계표와 인건비율이 다른 분모를 쓴다. 응답에 `kind` · `version_label`
+  (분해는 `base_label`)이 실려 어느 버전을 받았는지 드러난다. 챗봇 도구 `get_labor_ratio` ·
+  `get_labor_split`도 같은 두 값을 받는다(화면 컨텍스트의 `fx_basis_month` · `fx_basis_kind`).
 - **인건비율** — 인건비 ÷ 개발비(매출). 분기 · 연간은 월별 비율을 평균 내지 않고 **기간 합계끼리**
   나눈다(달마다 금액이 다르면 월별 비율의 평균은 실제 비율과 다르다). 분모가 0이거나 아직 안 올라온
   줄은 `ratio=null`이다 — 0%가 아니다. 기준은 `/overseas/summary`와 같다(원화 · CP 계약 분기 정산).

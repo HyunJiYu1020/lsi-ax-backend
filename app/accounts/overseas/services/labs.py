@@ -8,14 +8,21 @@ ACCOUNT_KEY도 같이 둔다 — cost_entries 같은 공용 테이블의 계정 
 전부 쓰는 상수다.
 """
 
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.accounts.overseas.models import OverseasLab, OverseasLabRevision
+from app.shared.core.enums import CodeGroup
+from app.shared.core.periods import ym_month, ym_year
 from app.shared.models.account import Account
+from app.shared.models.common import CostEntry
+from app.shared.models.system import CommonCode
 
 # cost_entries 등 공용 테이블은 account_code로 계정을 구분한다. 이 계정은 해외연구소 고정.
 ACCOUNT_KEY = "overseas"
@@ -102,3 +109,82 @@ def lab_views(db: Session, as_of: str | None = None) -> list[LabView]:
             )
         )
     return out
+
+
+# ---------- 기준정보 변경(연구소 편집 화면·단건 API)이 쓰는 헬퍼 ----------
+def current_basis_ym(db: Session) -> str:
+    """지금 편성 중인 기준연월 "YYYY-MM" — 기준정보를 바꿀 때 기본 적용 시점(= "이 버전부터")."""
+    latest = db.scalar(
+        select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
+    )
+    if latest:
+        return f"{ym_year(latest):04d}-{ym_month(latest):02d}"
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def check_effective_from(value: str | None, db: Session) -> str:
+    """기준정보 변경이 적용되기 시작하는 연월. 안 주면 지금 편성 중인 기준월(= "이 버전부터")."""
+    if not value:
+        return current_basis_ym(db)
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        raise HTTPException(400, f'effective_from은 "YYYY-MM" 형식이어야 한다: {value!r}')
+    return value
+
+
+def record_lab_revision(db: Session, lab_code: str, before: dict, after: dict, effective_from: str) -> None:
+    """기준정보가 실제로 바뀔 때만 이력 두 줄을 남긴다.
+
+    1) 바뀌기 전 값을 '0000-01'(처음부터)로 한 번 박아서 지난 버전 전부를 옛 값으로 고정하고,
+    2) 새 값을 effective_from으로 넣는다(같은 달에 또 고치면 그 줄을 덮어쓴다).
+    1)은 이미 있으면 건드리지 않는다 — 처음 고정해 둔 "원래 값"이 두 번째 변경 때 덮이면
+    과거가 다시 흔들린다."""
+    if before == after:
+        return
+    db.execute(
+        pg_insert(OverseasLabRevision)
+        .values(lab_code=lab_code, effective_from=LAB_EPOCH, **before)
+        .on_conflict_do_nothing(index_elements=["lab_code", "effective_from"])
+    )
+    stmt = pg_insert(OverseasLabRevision).values(lab_code=lab_code, effective_from=effective_from, **after)
+    db.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["lab_code", "effective_from"],
+            set_={k: stmt.excluded[k] for k in after},
+        )
+    )
+
+
+def lab_attrs(labs: list[OverseasLab]) -> dict:
+    """이력에 남길 값 묶음. 파트가 여러 개면 이름은 파트마다 다르므로 대표(첫 파트) 이름을 쓴다 —
+    되돌려 읽을 때도 파트가 여럿이면 이름은 안 덮어쓰므로 비교·복원에 영향이 없다."""
+    head = labs[0]
+    return {
+        "name": head.name,
+        "currency": head.currency,
+        "is_active": head.is_active,
+        "sort_order": head.sort_order,
+    }
+
+
+def check_category(db: Session, category_key: str) -> str:
+    """category_code가 고정 항목(common_codes group=OVERSEAS_CATEGORY) 이거나, 이미 등록된 커스텀
+    행(cost_entries.label이 채워진 행)이어야 한다 — 둘 다 아니면 오타·존재하지 않는 코드로 보고 막는다.
+    고정 항목 중에서도 "그룹"(A·hr·labor·asset·direct·gen·mgr·itx처럼 common_codes에서 다른 코드의
+    parent_code로 가리켜지는 집계 전용 행)은 직접 금액을 못 넣는다 — 하위 항목들의 합계로만 존재해야
+    하는 행에 실제 비용을 꽂으면 집계가 깨진다."""
+    is_fixed = db.scalar(
+        select(CommonCode.id).where(CommonCode.group_code == CodeGroup.OVERSEAS_CATEGORY.value, CommonCode.code == category_key)
+    )
+    is_registered_custom = db.scalar(
+        select(CostEntry.id).where(
+            CostEntry.account_code == ACCOUNT_KEY, CostEntry.category_code == category_key, CostEntry.label.is_not(None)
+        )
+    )
+    if not is_fixed and not is_registered_custom:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 비용항목 코드: {category_key}")
+    is_group = db.scalar(
+        select(CommonCode.id).where(CommonCode.group_code == CodeGroup.OVERSEAS_CATEGORY.value, CommonCode.parent_code == category_key)
+    )
+    if is_group:
+        raise HTTPException(status_code=400, detail=f"'{category_key}'는 하위 항목의 합계로만 쓰이는 그룹이라 직접 금액을 넣을 수 없습니다.")
+    return category_key

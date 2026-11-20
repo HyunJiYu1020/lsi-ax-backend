@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.accounts.overseas.endpoints import close as cl
+from app.shared.core.voucher_match import RULE_MIN_HITS
 from app.shared.models.close import CloseAccountStage, CloseMatchRule, CloseVoucher, CloseVoucherMap
 from app.shared.schemas.close import DeptRule, MapEdit, MapEditIn, MatchRuleIn, StageIn, VoucherIngestIn, VoucherLine
 
@@ -70,7 +71,7 @@ def _map_of(result, no):
 
 def _lab_pk(db):
     """이 DB에 실제로 있는 연구소 pk 하나 — 기준정보를 테스트가 새로 만들지 않는다."""
-    labs = cl._lab_list(db, YEAR, MONTH)
+    labs = cl.lab_list(db, YEAR, MONTH)
     if not labs:
         pytest.skip("연구소 기준정보가 없어 스킵합니다.")
     return labs[0]["pk"]
@@ -362,3 +363,121 @@ def test_amounts_are_never_changed_by_mapping(seeded):
     assert seeded.scalar(
         select(CloseVoucher.krw_amount).where(CloseVoucher.voucher_no == "9000110")
     ) == 1_234_567
+
+
+# ---------- 지정(Assignment) 열 + 비교 방법 (TC-081) ----------
+# 전표에는 어느 연구소 몫인지가 안 적혀 있어서 거래처·적요·코스트센터·과제코드로 맞춘다. 그런데
+# 연구소나 CP 구분을 ERP "지정(Assignment)" 칸에만 적어 보내는 전표가 있어서, 그 칸도 단서로 쓴다.
+#
+# 여기서 고정하는 건 둘이다: ① 적재한 지정 값이 조회에도 그대로 내려오는가(응답에서 빠뜨리면 화면은
+# 늘 빈 칸을 본다 — 실제로 그 버그가 있었다) ② 'CP-'로 시작하는 것만 걸리는가(equals면 다음
+# 과제번호에 안 걸리고, contains면 'NON-CP-'까지 걸린다).
+
+
+def test_assignment_is_stored_and_returned(seeded):
+    db = seeded
+    _ingest(db, [_line("9001", assignment="CP-2026-01"), _line("9002")])
+
+    got = {v.voucher_no: v.assignment for v in _mapping(db).vouchers}
+    assert got["9001"] == "CP-2026-01"
+    assert got["9002"] == "", "안 보낸 전표는 빈 문자열이어야 한다"
+
+
+def test_assignment_rule_matches_by_prefix(seeded):
+    db = seeded
+    _ingest(db, [
+        _line("9001", assignment="CP-2026-01"),
+        _line("9002", assignment="CP-2027-07"),   # 다음 과제번호도 걸려야 한다
+        _line("9003", assignment="NON-CP-9"),     # 'CP-'를 품고 있지만 시작이 아니다
+        _line("9004"),                            # 지정이 비어 있다
+    ])
+    cl.create_match_rule(
+        MatchRuleIn(
+            account_key="overseas", match_field="assignment", match_value="CP-",
+            match_op="starts_with", scope_key="CP",
+            apply_basis_year=YEAR, apply_basis_month=MONTH,
+        ),
+        db=db,
+    )
+
+    r = _mapping(db)
+    assert _map_of(r, "9001").scope_key == "CP" and _map_of(r, "9001").decided_by == "rule"
+    assert _map_of(r, "9002").scope_key == "CP", "과제번호가 달라도 걸려야 한다"
+    assert _map_of(r, "9003").scope_key != "CP", "contains로 동작하면 이것까지 걸린다"
+    assert _map_of(r, "9004").scope_key != "CP", "지정이 비어 있으면 안 걸린다"
+
+
+def test_match_rule_response_carries_op_and_rejected(seeded):
+    """등록 응답에 match_op·rejected가 실려야 한다 — 빠뜨리면 저장은 되는데 화면에는 늘 빈 값으로
+    보여서 '설정이 안 먹는다'로 읽힌다(실제로 그 버그가 있었다)."""
+    db = seeded
+    out = cl.create_match_rule(
+        MatchRuleIn(account_key="overseas", match_field="assignment", match_value="CP-",
+                    match_op="starts_with", scope_key="CP"),
+        db=db,
+    )
+    assert out.match_op == "starts_with" and out.rejected is False
+
+    rej = cl.create_match_rule(
+        MatchRuleIn(account_key="overseas", match_field="vendor", match_value="한빛상사", rejected=True),
+        db=db,
+    )
+    assert rej.rejected is True and rej.scope_key == ""
+
+
+# ---------- 거절 기록이 제안을 멈춘다 (TC-085) ----------
+# 화면 [아니오]가 서버에 저장되면 이 경로를 탄다. 저장 안 하면 다음 달에, 그리고 다른 담당자에게
+# 같은 제안이 또 뜬다 — "아니다"도 담당자가 내린 판단이라 남겨야 다시 묻지 않는다.
+
+
+def _corrections(db, vendor, scope, times=RULE_MIN_HITS):
+    """같은 거래처 전표를 같은 연구소로 times번 고친 상태를 만든다."""
+    lines = [_line(f"77{i:02d}", vendor=vendor) for i in range(times)]
+    _ingest(db, lines)
+    cl.put_overseas_mapping(
+        MapEditIn(
+            basis_year=YEAR, basis_month=MONTH,
+            edits=[MapEdit(voucher_no=f"77{i:02d}", line_no=1, scope_key=scope) for i in range(times)],
+        ),
+        db=db,
+    )
+
+
+def test_rejected_rule_stops_the_suggestion(seeded):
+    db = seeded
+    _corrections(db, "거절테스트상사", _lab_pk(db))
+    before = [s.match_value for s in _mapping(db).suggestions]
+    assert "거절테스트상사" in before, "3번 고쳤으면 제안이 떠야 한다"
+
+    cl.create_match_rule(
+        MatchRuleIn(account_key="overseas", match_field="vendor", match_value="거절테스트상사", rejected=True),
+        db=db,
+    )
+
+    after = [s.match_value for s in _mapping(db).suggestions]
+    assert "거절테스트상사" not in after, "거절했는데 같은 제안이 또 뜬다"
+
+
+def test_rejected_rule_does_not_auto_apply(seeded):
+    """거절은 '다시 묻지 마' 표시일 뿐이다 — 그 단서로 전표가 자동으로 붙으면 거절이 승인과 같아진다."""
+    db = seeded
+    cl.create_match_rule(
+        MatchRuleIn(account_key="overseas", match_field="vendor", match_value="거절테스트상사", rejected=True),
+        db=db,
+    )
+    _ingest(db, [_line("7800", vendor="거절테스트상사")])
+    mp = _map_of(_mapping(db), "7800")
+    assert mp.decided_by != "rule"
+
+
+def test_suggestion_counts_everyone(seeded):
+    """제안 횟수는 사람 구분 없이 센다 — 담당자를 적는 칸이 아예 없다(팀 합산).
+
+    화면이 브라우저 수정만 세면 "내가 혼자 3번"이어야 뜨지만, 서버는 누가 했든 합쳐서 센다.
+    3-b로 화면이 이 결과를 쓰게 되면서 팀 합산이 실제로 적용된다."""
+    db = seeded
+    pk = _lab_pk(db)
+    _corrections(db, "합산테스트상사", pk)
+    sg = next(s for s in _mapping(db).suggestions if s.match_value == "합산테스트상사")
+    assert sg.hit_count == RULE_MIN_HITS
+    assert sg.scope_key == pk

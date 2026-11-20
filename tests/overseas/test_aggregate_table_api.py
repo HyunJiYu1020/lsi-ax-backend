@@ -1,9 +1,9 @@
 """집계 ① 전체 계정 표 조회 API — PLAN.md Phase 6(수식 백엔드 단일화).
 
-같은 수식이 core.js · calc.js · 백엔드 세 곳에 복제돼 있어서 한 곳만 고치면 화면 숫자와 챗봇
+같은 수식이 core.js와 백엔드 두 곳에 복제돼 있어서 한 곳만 고치면 화면 숫자와 챗봇
 숫자가 달라졌다. 이 API는 백엔드가 계산해서 표를 그대로 내려주므로 프런트는 표시만 하면 된다.
 
-수식 자체가 목업과 같은지는 test_formula_crosscheck.py가 45행 × 17칸을 전수 대조한다.
+수식 자체가 프런트와 같은지는 test_formula_crosscheck.py가 45행 × 17칸을 전수 대조한다.
 여기서는 **엔드포인트 계약**(행 구성·단위·범위·거부)을 고정한다.
 """
 
@@ -88,4 +88,57 @@ def test_caption_and_note_explain_the_table(db):
 def test_bad_arguments_are_rejected(db, bad):
     with pytest.raises(HTTPException) as e:
         get_aggregate_table(basis_year=BASIS_YEAR, db=db, **bad)
+    assert e.value.status_code == 400
+
+
+# ---------- 어느 버전의 표인가 (2026-11-17) ----------
+# 화면이 상단에서 "26.08 실적"을 골라도 집계표만 최신 속보 숫자를 그렸다 — 연도만 보내고
+# 기준월·종류를 안 보내서, 서버가 기준월을 "DB에 있는 가장 최근 속보"로 혼자 정했기 때문이다.
+# 이제 basis_month · kind로 받는다. 안 보내면 종전과 같이 최신 속보로 떨어진다(기존 호출 호환).
+def test_basis_month_and_kind_pick_the_version(db):
+    """기준월·종류를 주면 그 버전을 읽는다 — 속보와 실적은 다른 슬롯이라 값도 라벨도 달라야 한다."""
+    f = get_aggregate_table(basis_year=BASIS_YEAR, basis_month=9, kind="forecast", mode="usd", db=db)
+    a = get_aggregate_table(basis_year=BASIS_YEAR, basis_month=8, kind="actual", mode="usd", db=db)
+
+    assert (f.basis_month, f.kind) == (9, "forecast")
+    assert (a.basis_month, a.kind) == (8, "actual")
+    assert f.version_label == "26.09 속보" and a.version_label == "26.08 실적"
+    # 버전이 캡션에 적혀 있어야 받는 쪽(화면 · 엑셀)이 어느 버전 표인지 안다.
+    assert a.version_label in a.caption
+    f_tot = next(r for r in f.rows if r.key == "tot").values[16]
+    a_tot = next(r for r in a.rows if r.key == "tot").values[16]
+    assert f_tot != a_tot, "속보와 실적이 같은 값이면 버전이 안 먹은 것이다"
+
+
+def test_default_is_still_the_latest_forecast(db):
+    """기준월을 안 보내는 기존 호출은 종전과 같아야 한다(지금 편성 중인 속보)."""
+    d = get_aggregate_table(basis_year=BASIS_YEAR, mode="usd", db=db)
+    f = get_aggregate_table(
+        basis_year=BASIS_YEAR, basis_month=d.basis_month, kind="forecast", mode="usd", db=db
+    )
+
+    assert d.kind == "forecast"
+    assert [r.values for r in d.rows] == [r.values for r in f.rows]
+
+
+def test_base_versions_resolve_like_the_variance_screen(db):
+    """version=prev는 "전실행"이고, 그게 무엇인지는 증감분석과 같은 층(resolve_bases)이 푼다 —
+    두 화면이 다르게 풀면 같은 자리에서 다른 숫자가 나온다."""
+    prev = get_aggregate_table(basis_year=BASIS_YEAR, version="prev", mode="usd", db=db)
+    same = get_aggregate_table(basis_year=BASIS_YEAR, basis_month=8, kind="actual", mode="usd", db=db)
+
+    # 26.09 속보의 전실행 = 26.08 실적. kind는 "읽은 버전"의 종류라 actual이다.
+    assert prev.kind == "actual" and prev.version_label == same.version_label
+    assert [r.values for r in prev.rows] == [r.values for r in same.rows]
+
+
+def test_rejects_bad_month_and_kind(db):
+    """기준월·종류가 틀리면 조용히 최신 속보로 떨어지지 않고 거부한다 — 떨어지면 사용자는
+    자기가 고른 버전의 표를 보고 있다고 믿는다."""
+    with pytest.raises(HTTPException) as e:
+        get_aggregate_table(basis_year=BASIS_YEAR, basis_month=13, db=db)
+    assert e.value.status_code == 400
+
+    with pytest.raises(HTTPException) as e:
+        get_aggregate_table(basis_year=BASIS_YEAR, kind="sok", db=db)
     assert e.value.status_code == 400

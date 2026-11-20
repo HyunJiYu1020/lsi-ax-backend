@@ -118,6 +118,10 @@ class CpRowsIn(BaseModel):
 
     rows: list[CpRow]
     state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
+    # 이 계약이 적용되기 시작하는 편성 기준연월 "YYYY-MM". 연구소 기준정보(LabIn)와 같은 규칙이다 —
+    # 이 달보다 이전 버전은 바뀌기 전 계약으로 분기 정산액이 계속 계산된다. 안 주면 지금 편성 중인
+    # 기준월(= "이 버전부터"). 과거 계약을 고쳐야 하는 경우에만 직접 준다.
+    effective_from: str | None = None
 
 
 class OverseasState(BaseModel):
@@ -131,6 +135,10 @@ class OverseasState(BaseModel):
     reason: list[ReasonRow] = []  # 증감사유 업로드 (연구소×버전×항목×구간 키로 upsert, cost처럼 누적)
     vendor: list[VendorRow] = []  # 외주용역 상세 (연구소×버전 단위로 전체 교체 — 업로드마다 행 수가 달라짐)
     cp: list[CpRow] = []  # CP 계약 업로드 (연도 단위로 전체 교체 — 연 1회 올리는 파일)
+    # 경영계획 차수. GET에서는 V["plan"]이 **어느 차수인지**(적용 차수 — ★ → 확정 최신 → 최신),
+    # PUT에서는 V["plan"]을 **어느 차수에 쓸지**다. PUT에서 비워 보내면 확정되지 않은 최신 차수에
+    # 쓰고, 확정된 차수는 덮지 않는다(확정을 화면 저장이 덮으면 지난 보고가 소급해서 바뀐다).
+    plan_no: str = ""
     # 동시 편집 보호(PLAN.md P1-2). GET이 "지금 상태의 지문"을 담아 내려주고, PUT은 그걸 그대로
     # 돌려보낸다. 그 사이 다른 세션이 저장했으면 지문이 달라져 있어 409로 막는다.
     # 빈 문자열이면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
@@ -151,6 +159,17 @@ class LabOut(BaseModel):
     sort_order: int
     currency: str
     is_active: bool
+
+
+class LabOneOut(LabOut):
+    """연구소 하나를 저장했을 때의 응답(PUT /overseas/labs/one). 기준정보 값에 더해, 그 통화로
+    환산할 환율이 실제로 있는지 확인한 결과를 같이 준다.
+
+    왜 응답에 끼워 넣나: 환율이 없는 통화로 연구소를 잡아도 집계는 멈추지 않고 조용히 환산을
+    건너뛴다(services/fxcalc.lab_currency_warning 주석). 따로 조회해야 알 수 있게 두면 호출하는
+    쪽(챗봇·스크립트)이 빼먹고, 빼먹은 티도 안 난다 — 저장 응답에 같이 실어 보내면 안 볼 수 없다."""
+
+    fx_warning: str | None = None
 
 
 class LabIn(BaseModel):
@@ -276,7 +295,10 @@ class ExtraRowIn(BaseModel):
     # 원시 행(is_derived=False)의 월별 값. 12개월(기본) 또는 12의 배수(24·36…, 기간을 12개월 너머로
     # 늘려 받을 때). 파생 행은 값을 저장하지 않고 formula로 매번 계산하므로 비워 보내면 된다.
     # None인 달은 미등록(빈칸)이라 저장하지 않는다 — 0으로 올라온 달과 구분된다.
-    v: list[float | None] = []
+    # None은 "금액은 건드리지 마라"는 뜻이다(이미 있는 행의 이름·위치만 고칠 때) — []와 구분한다.
+    # 금액을 되보내게 하면 그 왕복에서 값이 상할 수 있다: 화면이 $ 단위면 서버가 받은 금액을
+    # 1000으로 나누는데(chat.py _to_kdollar), 조회해서 받은 K$ 값을 그대로 되보내면 1000배 작아진다.
+    v: list[float | None] | None = None
     # True면 실제로 수집한 비용이 아니라 다른 계정들을 조합(합산·비율 등)해 계산한 파생 행이라는 뜻.
     # 취합에서 추가한 원시 행과 집계에서 추가한 파생 행을 저장 후에도 구분하기 위해 DB에 남긴다 —
     # 삭제 권한(원시=취합에서만, 파생=집계에서만)과 표시 규칙(원시=양쪽, 파생=집계만), 그리고
@@ -356,6 +378,9 @@ class LaborSplitResult(BaseModel):
     두 효과의 합(+ 인력 없는 연구소 몫)은 fx_outside와 정확히 일치한다."""
 
     basis_year: int
+    basis_month: int = 0  # 어느 버전의 분해인가(0 = 응답을 만든 서버가 최신 속보로 떨어뜨렸다)
+    kind: str = "forecast"  # forecast(속보) | actual(실적) — 집계표·증감 표와 같은 뜻
+    base_label: str = ""  # 비교 대상 라벨("26.08 실적") — 무엇과 비교한 분해인지
     period: str  # y(연간) | q1~q4 | m1~m12
     base_version: str  # prev(전실행) | prior(전년 실적) | plan(경영계획)
     lab_scope: str  # "ALL" 또는 연구소 코드/pk
@@ -425,9 +450,9 @@ class OverseasSummaryLab(BaseModel):
 class OverseasSummary(BaseModel):
     """해외연구소 화면 맨 위 히어로 카드 한 장에 들어가는 값 전부.
 
-    화면(frontend/src/components/OverseasApp.jsx)이 ovAgg/ov17로 브라우저에서 계산하던 숫자를
+    화면(frontend-html/shared/core.js)이 ovAgg/ov17로 브라우저에서 계산하던 숫자를
     서버에서 같은 식으로 낸 것이다 — 챗봇·MCP가 말하는 총액과 사용자가 보는 카드가 어긋나면 안 되므로
-    식을 바꿀 때는 화면 쪽(OverseasApp.jsx, logic/calc.js)도 같이 고칠 것."""
+    식을 바꿀 때는 화면 쪽(core.js)도 같이 고칠 것."""
 
     basis_year: int
     basis_month: int
@@ -482,6 +507,33 @@ class ReasonTranslateResult(BaseModel):
     translated: int = 0  # 이번에 LLM을 불러 새로 번역한 건수
     cached: int = 0  # 저장된 번역을 그대로 쓴 건수
     failed: int = 0  # 번역하지 못한 건수(ko=null)
+    error: str = ""
+
+
+class ReasonSummaryItem(BaseModel):
+    """요약에 넣을 회신 한 줄. label은 그 사유가 달린 계정 이름(인건비 등)이다 — 원문만 모아 보내면
+    모델이 "무엇이 늘었는지"를 본문에서 추측하게 되고, 계정 이름이 원문에 없으면 지어낸다."""
+
+    label: str
+    text: str
+
+
+class ReasonSummaryIn(BaseModel):
+    """지금 화면에 보이는 회신 묶음을 요약해 달라는 요청. 무엇을 보내느냐는 화면이 정한다 —
+    연구소·기간·비교 기준으로 이미 걸러 놓은 그 목록이 담당자가 읽으려던 범위다."""
+
+    items: list[ReasonSummaryItem]
+    scope_label: str = ""  # "SARC · 전실행 대비 · 연간" — 요약문이 무엇을 본 것인지 모델에게 알려준다
+    provider: str | None = None
+
+
+class ReasonSummaryResult(BaseModel):
+    """요약 결과. 번역과 같은 약속으로 실패해도 200에 error를 담는다 — 요약이 안 된다고 표가
+    사라지면 안 되고, 원문·번역은 표에 그대로 남아 있다."""
+
+    lines: list[str] = []
+    count: int = 0  # 요약에 들어간 회신 건수(화면이 "15건을 요약했습니다"로 밝힌다)
+    engine: str = ""
     error: str = ""
 
 
@@ -628,6 +680,7 @@ class VarianceRow(BaseModel):
     label_en: str = ""
     level: int = 0  # 손익계산서형 들여쓰기 단계
     unit: str = "krw"  # krw(금액) | hc(명) | pct(%)
+    memo: bool = False  # 참고 행(IT 관련 비용·외주용역비) — 개발비 합계에 들어가지 않는다
     base: float = 0  # 비교 기준 금액
     cur: float = 0  # 지금 보고 있는 버전 금액
     diff: float = 0  # cur - base
@@ -640,7 +693,7 @@ class VarianceRow(BaseModel):
 
 class VarianceResult(BaseModel):
     """증감분석 표 한 장 전체. 챗봇이 "SARC 인건비 왜 늘었어?"에 답할 때 근거로 쓰는 데이터이기도
-    해서, 화면이 보여주는 것과 같은 값을 같은 식으로 낸다(식을 바꿀 때는 logic/calc.js도 같이 고칠 것)."""
+    해서, 화면이 보여주는 것과 같은 값을 같은 식으로 낸다(식을 바꿀 때는 core.js도 같이 고칠 것)."""
 
     basis_year: int
     basis_month: int
@@ -652,6 +705,50 @@ class VarianceResult(BaseModel):
     lab_scope: str
     plan_no: str = ""
     rows: list[VarianceRow]
+    fallback_note: str = ""
+    note: str = ""
+
+
+class LaborSplitTotals(BaseModel):
+    """인건비 분해의 합계만. 증감분석 표에 실어 보내는 모양이다.
+
+    왜 연구소별 상세(LaborSplitResult.labs)를 빼는가: 화면은 합계 줄만 그리는데, 17기간 × 연구소
+    20여 곳이면 한 응답에 안 쓰는 줄 340개가 실린다(260KB → 60KB). 엑셀 다운로드는 연구소마다
+    따로 받으니 그 차이가 수 MB가 된다. 연구소별 상세가 필요하면 `/overseas/labor-split`을 쓴다.
+    """
+
+    hc_base: float = 0
+    hc_cur: float = 0
+    per_head_base: float = 0  # 원/명
+    per_head_cur: float = 0
+    hc_effect: float = 0  # 인원이 늘어서 생긴 몫
+    rate_effect: float = 0  # 1인당 인건비가 올라서 생긴 몫
+    unsplit: float = 0  # 인력을 안 낸 연구소 몫(나눌 수 없어 따로 뺀다)
+    fx_outside: float = 0  # = hc_effect + rate_effect + unsplit
+
+
+class VarianceTable(BaseModel):
+    """증감분석 화면 표 한 장 전체 — 17기간 × 계정. periods의 키는 조회 파라미터와 같은 기간 코드
+    (y · q1~q4 · m1~m12)이고, 값은 그 기간의 계정 행 목록이다.
+
+    기간별 행을 따로 주는 이유: 월 금액을 더해 분기를 만들 수 없는 행이 있다 — 인력은 평균이고
+    비율은 분자·분모를 각각 더한 뒤 나눠야 한다. 화면이 월 값을 접어 분기를 만들면 그 두 행이
+    틀어진다(집계표에서 실제로 그랬다, to_17 참조).
+    """
+
+    basis_year: int
+    basis_month: int
+    kind: str
+    stage: str = ""
+    base_version: str
+    base_label: str
+    lab_scope: str
+    plan_no: str = ""
+    periods: dict[str, list[VarianceRow]]
+    # 기간별 인건비 분해(인원 효과 · 단가 효과). 화면이 인건비 행의 ▸를 누르면 보여주는 줄들이다.
+    # 같은 응답에 담는 이유: 기간마다 따로 부르면 17번, 연구소까지 더하면 수십 번이 된다.
+    # 경영계획 대비는 환율 기준이 없어 분해할 수 없으므로 빈 dict가 온다(화면도 같은 제약).
+    labor_split: dict[str, LaborSplitTotals] = {}
     fallback_note: str = ""
     note: str = ""
 
@@ -915,10 +1012,58 @@ class AggregateTable(BaseModel):
     basis_year: int
     basis_month: int
     version: str
+    # 어느 버전의 표인가 — 요청한 기준연월·종류를 되돌려준다. 화면이 과거 버전을 띄울 때
+    # "지금 받은 게 그 버전 맞나"를 확인할 자리가 필요하다(연도만으로는 구분이 안 된다).
+    kind: str = "forecast"  # forecast(속보) | actual(실적) | plan(경영계획)
+    plan_no: str = ""  # kind=plan 또는 version=plan일 때의 차수("P02")
+    version_label: str = ""  # "26.08 실적" · "2026년 경영계획 P02"
     mode: str  # usd | krw
     caption: str
     note: str
     rows: list[AggregateRow]
+
+
+class LabTableRow(BaseModel):
+    """집계 ②③④ 탭의 한 줄 × 17칸. ①(AggregateRow)과 달리 계정이 아니라 **연구소** 줄이라
+    category key가 없고, 대신 표시 규칙(합계줄·굵게·참고줄)을 서버가 같이 내려준다 — 행 구성이
+    표마다 다르기 때문이다(③ 달러 표만 "CP·SRCX 제외" 줄이 없고, ②·④만 SARC 하위 줄이 있다).
+
+    values의 None은 미등록(빈칸), 0.0은 "0으로 올라왔다"다(공통 RULE: 빈칸 처리).
+    """
+
+    label: str
+    level: int = 0  # 들여쓰기 단계(0 = 합계·소계, 1 = 연구소, 2 = 연구소 하위 파트)
+    format: str = "krw"  # krw(억원) | usd(K$) | rate(원/$)
+    total: bool = False  # 표 맨 위 합계줄
+    bold: bool = False  # 소계줄(예: 개발비(A,CP제외))
+    muted: bool = False  # 참고줄(하위 파트 · 적용 환율)
+    values: list[float | None]
+
+
+class LabTable(BaseModel):
+    """집계 ②③④ 탭 한 장."""
+
+    caption: str
+    note: str
+    rows: list[LabTableRow]
+
+
+class LabTablesOut(BaseModel):
+    """집계 ②③④ 탭을 한 번에. 탭을 누를 때마다 따로 받지 않는 이유: 비싼 건 표 조립이 아니라
+    화면 상태를 읽는 일이고 그건 여섯 표가 같이 쓴다 — 여섯 번 부르면 같은 읽기를 여섯 번 한다.
+
+    tables의 키는 화면 탭 키와 같다: t2u · t2k(② 개발비 달러·원화), t3 · t4(③ 인건비 달러·원화),
+    t5 · t6(④ CP 보정 인건비·인건비외). 환율이 없으면 원화 표가, CP 계약이 없으면 ④가 빠진다 —
+    재료 없이 만든 0원 표를 내려보내지 않으려는 것이다.
+    """
+
+    basis_year: int
+    basis_month: int
+    version: str
+    kind: str = "forecast"  # ①(AggregateTable)과 같은 뜻 — 어느 버전의 표인가
+    plan_no: str = ""
+    version_label: str = ""
+    tables: dict[str, LabTable]
 
 
 class CpContractPoc(BaseModel):
@@ -950,6 +1095,48 @@ class CpContractOut(BaseModel):
     uploaded_at: str = ""
     pocs: list[CpContractPoc] = []
     note: str = ""
+
+
+class CpContractAmountIn(BaseModel):
+    """CP 계약 "금액만" 바꾸는 요청(PUT /overseas/cp-contract-amount).
+
+    업로드(PUT /overseas/cp-rows)는 파일 하나로 표 전체를 갈아끼우는 경로고, 이건 "2026 계약액을
+    5.2M$로 바꿔줘"처럼 **금액 하나만** 고치는 경로다. 직급 행·인원·맨먼스는 그대로 두고 금액
+    항목만 같은 비율로 움직인다(services/cp.rescale_rows).
+
+    금액 단위는 저장값과 같은 **$**다(K$가 아니다) — 5.2M$는 5200000이다. 집계 표가 K$로 보여주는
+    건 그쪽이 1000으로 나누기 때문이고, 여기 들어오는 값은 계약서 금액 그대로다.
+
+    두 가지 중 하나만 쓴다:
+    - year_total: 그 해 연 계약 총액을 이 값으로($). POC가 여러 개면 **지금 비중대로** 나눠 가진다.
+    - poc_proj(+poc_type) + poc_total: POC 하나의 계약액만 이 값으로. 나머지 POC는 그대로.
+
+    둘 다 주거나 둘 다 안 주면 거부한다 — "연 합계를 바꾸려던 건지 POC 하나를 바꾸려던 건지"는
+    금액이 몇 배씩 달라지는 차이라, 서버가 짐작하면 안 된다.
+    """
+
+    year: int
+    year_total: float | None = None
+    poc_type: str | None = None
+    poc_proj: str | None = None
+    poc_total: float | None = None
+    # 연구소 기준정보·CP 업로드와 같은 규칙 — 안 주면 지금 편성 중인 기준월부터 적용되고,
+    # 그 달보다 이전 버전은 바뀌기 전 계약으로 분기 정산액이 계속 계산된다.
+    effective_from: str | None = None
+    state_token: str = ""
+
+
+class CpContractChangeOut(BaseModel):
+    """계약액 변경 결과 — 전·후를 같이 돌려준다.
+
+    왜 after만 주지 않나: 이 변경의 핵심은 "얼마가 얼마로 바뀌고, 분기 정산액이 어떻게 되는가"다.
+    after만 주면 부르는 쪽(챗봇·화면)이 before를 따로 조회해 둬야 하고, 그걸 빼먹으면 사용자는
+    바뀐 숫자만 보게 된다."""
+
+    before: CpContractOut
+    after: CpContractOut
+    effective_from: str  # 이 버전부터 새 계약이 적용된다
+    note: str  # 사람이 그대로 읽어도 되는 전후 요약
 
 
 class OverseasConfirmCheck(BaseModel):
@@ -1002,6 +1189,9 @@ class OverseasLaborRatio(BaseModel):
     basis_month: int
     period: str  # y(연간) | q1~q4 | m1~m12
     version: str
+    kind: str = "forecast"  # 집계표(AggregateTable)와 같은 뜻 — 읽은 버전의 종류
+    plan_no: str = ""
+    version_label: str = ""  # "26.08 실적"
     rows: list[OverseasLaborRatioRow]
     note: str = ""
 

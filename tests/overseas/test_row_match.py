@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.accounts.overseas.endpoints import collect as ov
+from app.accounts.overseas.services.row_alias import match_candidates
 from app.shared.core import row_match
 from app.accounts.overseas.schemas import RowAliasIn, RowMatchIn
 
@@ -111,9 +112,9 @@ def test_duplicate_and_blank_labels_collapse(db):
 def test_existing_extra_rows_become_candidates(db):
     """다른 연구소가 이미 쓰는 추가 행도 후보가 되고, 어느 연구소가 쓰는지 같이 준다
     (그걸 알면 같은 행인지 판단하기 쉽다)."""
-    labs = [c["labs"] for c in ov._match_candidates(db, YYYYMM, "forecast") if c["kind"] == "extra_row"]
+    labs = [c["labs"] for c in match_candidates(db, YYYYMM, "forecast") if c["kind"] == "extra_row"]
     assert all(isinstance(x, list) for x in labs)
     # 고정 계정 후보에는 집계로 계산되는 그룹 행(개발비 A, 인건비 등)이 들어가면 안 된다 —
     # 거기에는 업로드 값을 꽂을 수 없다.
-    keys = {c["key"] for c in ov._match_candidates(db, YYYYMM, "forecast") if c["kind"] == "category"}
+    keys = {c["key"] for c in match_candidates(db, YYYYMM, "forecast") if c["kind"] == "category"}
     assert "travel" in keys and not ({"A", "tot", "labor", "hr"} & keys)

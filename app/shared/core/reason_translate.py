@@ -1,9 +1,9 @@
 """해외연구소 증감사유(연구소가 영문으로 써 보낸 회신) → 보고용 한국어.
 
-원래 이 번역은 프런트(core.js의 OV_KO 사전 + ovTrK 정규식)에만 있었다 — 목업이라 회신 문구를
+원래 이 번역은 프런트(core.js의 OV_KO 사전 + ovTrK 정규식)에만 있었다 — 초기에는 회신 문구를
 사전에 미리 박아놨고, 사전에 없는 문장은 "(원문 · 번역 필요)"를 붙여 그대로 내보냈다. 연구소가
 매달 새로 쓰는 문장을 사전으로 따라잡을 수는 없어서, 그 사전이 정해놨던 "번역 모양"만 규칙으로
-옮겨 LLM에게 맡긴다 — 즉 이 파일의 프롬프트는 목업 사전의 명세서다:
+옮겨 LLM에게 맡긴다 — 즉 이 파일의 프롬프트는 그 사전의 명세서다:
 
 - 보고용 명사형 간결체("신규 채용에 따른 기본급 증가"), 서술형 문장("~했습니다")으로 풀지 않는다
 - 금액·비율·인원은 원문 표기 그대로($449K는 $449K로, 환산하거나 단위를 바꾸지 않는다)
@@ -20,7 +20,8 @@ import json
 import re
 from typing import Any
 
-import anthropic
+# Anthropic 주석 처리로 안 쓴다 — 되살릴 때 같이 푼다.
+# import anthropic
 import httpx
 from fastapi import HTTPException
 from google import genai
@@ -35,7 +36,7 @@ MAX_TEXTS = 40
 MAX_LEN = 500
 
 # 용어 고정. 번역 자체는 모델이 하고, 이 표는 "같은 뜻을 매달 같은 단어로 쓰게" 하는 데만 쓴다 —
-# 사전처럼 전체 문장을 다 담지 않는다(그 방식이 목업의 한계였다). 보고서에 그대로 실리는 말이라
+# 사전처럼 전체 문장을 다 담지 않는다(그 방식이 사전 번역의 한계였다). 보고서에 그대로 실리는 말이라
 # 담당자가 쓰는 표현으로 적는다.
 GLOSSARY: list[tuple[str, str]] = [
     ("basic salary", "기본급"),
@@ -134,38 +135,40 @@ def _parse(raw: str, count: int) -> list[str | None]:
 
 def resolve_provider(provider: str | None) -> str:
     p = provider or settings.chat_provider
-    if p not in ("anthropic", "ollama", "gemini"):
-        raise HTTPException(status_code=400, detail=f"알 수 없는 provider: {p!r} (anthropic | ollama | gemini만 가능)")
+    if p != "gemini":
+        raise HTTPException(status_code=400, detail=f"알 수 없는 provider: {p!r} (지금은 gemini만 가능)")
     return p
 
 
 def engine_label(provider: str) -> str:
     """어느 모델이 번역했는지 행마다 남긴다 — 모델을 바꾼 뒤 '예전 번역이 왜 이 말투인지'를
     되짚을 때, 그리고 특정 모델이 낸 번역만 골라 다시 돌릴 때 필요하다."""
+    # 2026-11-16: Gemini 하나만 쓴다(PLAN.md 질문 6). 되살릴 때 주석을 같이 푼다.
     model = {
-        "anthropic": settings.anthropic_model,
+        # "anthropic": settings.anthropic_model,
         "gemini": settings.gemini_model,
-        "ollama": settings.ollama_model,
+        # "ollama": settings.ollama_model,
     }[provider]
     return f"{provider}:{model}"[:40]
 
 
-async def _call_anthropic(prompt: str) -> str:
-    if not settings.anthropic_api_key:
-        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    try:
-        resp = await client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIStatusError as e:
-        msg = (e.body or {}).get("error", {}).get("message") if isinstance(e.body, dict) else str(e)
-        raise HTTPException(status_code=502, detail=f"Anthropic API 오류: {msg or e}") from e
-    return "".join(b.text for b in resp.content if b.type == "text")
-
-
+# Anthropic 호출 — 2026-11-16 주석 처리(공급자를 Gemini 하나로, PLAN.md 질문 6).
+# async def _call_anthropic(prompt: str) -> str:
+#     if not settings.anthropic_api_key:
+#         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
+#     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+#     try:
+#         resp = await client.messages.create(
+#             model=settings.anthropic_model,
+#             max_tokens=4096,
+#             messages=[{"role": "user", "content": prompt}],
+#         )
+#     except anthropic.APIStatusError as e:
+#         msg = (e.body or {}).get("error", {}).get("message") if isinstance(e.body, dict) else str(e)
+#         raise HTTPException(status_code=502, detail=f"Anthropic API 오류: {msg or e}") from e
+#     return "".join(b.text for b in resp.content if b.type == "text")
+#
+#
 async def _call_gemini(prompt: str) -> str:
     if not settings.gemini_api_key:
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
@@ -188,28 +191,29 @@ async def _call_gemini(prompt: str) -> str:
     return "".join(p.text for p in parts if p.text and not p.thought)
 
 
-async def _call_ollama(prompt: str) -> str:
-    try:
-        async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=180.0) as client:
-            resp = await client.post(
-                "/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "stream": False,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-    except httpx.ConnectError as e:
-        raise HTTPException(
-            status_code=502, detail="Ollama 서버에 연결할 수 없습니다. `ollama serve`가 떠 있는지 확인하세요."
-        ) from e
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Ollama 오류: {e.response.text}") from e
-    return (data.get("message") or {}).get("content") or ""
-
-
+# Ollama 호출 — 2026-11-16 주석 처리(공급자를 Gemini 하나로, PLAN.md 질문 6).
+# async def _call_ollama(prompt: str) -> str:
+#     try:
+#         async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=180.0) as client:
+#             resp = await client.post(
+#                 "/api/chat",
+#                 json={
+#                     "model": settings.ollama_model,
+#                     "stream": False,
+#                     "messages": [{"role": "user", "content": prompt}],
+#                 },
+#             )
+#             resp.raise_for_status()
+#             data: dict[str, Any] = resp.json()
+#     except httpx.ConnectError as e:
+#         raise HTTPException(
+#             status_code=502, detail="Ollama 서버에 연결할 수 없습니다. `ollama serve`가 떠 있는지 확인하세요."
+#         ) from e
+#     except httpx.HTTPStatusError as e:
+#         raise HTTPException(status_code=502, detail=f"Ollama 오류: {e.response.text}") from e
+#     return (data.get("message") or {}).get("content") or ""
+#
+#
 async def translate_batch(texts: list[str], provider: str | None = None) -> list[str | None]:
     """정규화된 원문 리스트 → 같은 순서의 번역문 리스트(번역 못 한 건은 None).
 
@@ -220,7 +224,7 @@ async def translate_batch(texts: list[str], provider: str | None = None) -> list
         return []
     p = resolve_provider(provider)
     prompt = _prompt(texts)
-    raw = await (_call_anthropic(prompt) if p == "anthropic" else _call_gemini(prompt) if p == "gemini" else _call_ollama(prompt))
+    raw = await _call_gemini(prompt)
     return _parse(raw, len(texts))
 
 
@@ -304,5 +308,71 @@ async def draft_reason(
         return None
     p = resolve_provider(provider)
     prompt = _draft_prompt(source_ko, source_text, diff, diff_pct)
-    raw = await (_call_anthropic(prompt) if p == "anthropic" else _call_gemini(prompt) if p == "gemini" else _call_ollama(prompt))
+    raw = await _call_gemini(prompt)
     return _parse_draft(raw)
+
+
+# ---------- 회신 사유 묶음 요약 ----------
+# 번역·초안과 하는 일이 또 다르다. 번역은 한 문장을 한국어로 옮기고, 초안(draft_reason)은 한 칸짜리
+# 보고 문장을 만든다. 요약은 **여러 칸을 가로질러** 읽는다 — 연구소 하나가 보낸 회신은 계정 20여 개에
+# 흩어져 있어서, 담당자는 표를 위아래로 훑으며 "그래서 이 연구소는 왜 늘었나"를 머릿속에서 모은다.
+# 그 모으는 일을 대신한다(AI-07: 사유 해석 시간 단축).
+#
+# 요약은 캐시하지 않는다 — 캐시 키가 될 "원문 묶음"이 업로드·필터(기간·연구소)에 따라 매번 달라지고,
+# 번역 캐시(원문 1건 = 번역 1개)에 섞으면 회신이 한 줄뿐인 연구소에서 같은 해시가 잡혀 번역 칸에
+# 요약이 보이게 된다. 원문과 번역은 그대로 표에 남으니(공통 RULE: 원문 보관) 요약이 틀려도 되짚을 수 있다.
+_SUMMARY_RULES = (
+    "너는 반도체 해외연구소가 본사로 보낸 비용 증감사유(계정별 회신)를 담당자가 먼저 읽을 요약으로 정리한다.\n"
+    "규칙:\n"
+    "1. 3~5줄로 끝낸다. 각 줄은 '계정명: 원인(금액)' 꼴의 명사형 간결체로 쓰고, 문장 끝에 마침표를 붙이지 마라.\n"
+    "2. 금액이 큰 계정, 또는 여러 계정에 걸쳐 같은 원인이 반복되는 것부터 앞에 놓는다.\n"
+    "3. 같은 원인이 여러 계정에 걸쳐 있으면 한 줄로 묶어라 — 예: '인건비·복리후생: 신규 채용 3명 반영'.\n"
+    "4. 금액·비율·인원은 원문 표기를 그대로 쓴다($449K는 $449K). 단위를 환산하거나 합산하지 마라 — "
+    "여러 계정의 금액을 네가 더하면 환율이 섞여 화면 숫자와 어긋난다.\n"
+    "5. 원문에 없는 원인·금액·추측을 덧붙이지 마라. 줄일 때는 빼는 쪽으로 줄여라.\n"
+    "6. 증가/감소 방향은 반드시 보존한다.\n"
+    "7. 고유명사(IRS, 401K, MBO, Tape-out, GPU 등)와 과제명·장비명은 원문 그대로 둔다.\n"
+    "용어는 아래 표를 따른다:\n" + "\n".join(f"- {en} → {ko}" for en, ko in GLOSSARY)
+)
+
+_SUMMARY_OUTPUT_RULE = (
+    '응답은 JSON 객체 하나만 출력한다 — 설명·머리말·코드펜스 없이 {"lines": ["...", "..."]} 형식. '
+    "lines는 요약 줄의 배열(3~5개)이고, 요약할 내용이 없으면 빈 배열이다."
+)
+
+
+def _summary_prompt(items: list[tuple[str, str]], scope_label: str) -> str:
+    listed = "\n".join(f"- {label}: {text}" for label, text in items)
+    where = f"\n대상: {scope_label}" if scope_label else ""
+    return f"{_SUMMARY_RULES}\n\n{_SUMMARY_OUTPUT_RULE}\n{where}\n회신 원문 {len(items)}건:\n{listed}"
+
+
+def _parse_summary(raw: str) -> list[str]:
+    """요약은 줄 배열 하나라 객체로 받는다(_parse_draft와 같은 이유로 바깥 중괄호 구간만 떼어 읽는다)."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end < start:
+        return []
+    try:
+        item = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    lines = item.get("lines") if isinstance(item, dict) else None
+    if not isinstance(lines, list):
+        return []
+    return [normalize(x) for x in lines if isinstance(x, str) and x.strip()]
+
+
+async def summarize_reasons(
+    items: list[tuple[str, str]], scope_label: str = "", provider: str | None = None
+) -> list[str]:
+    """(계정명, 회신 원문) 묶음 → 담당자가 먼저 읽을 요약 3~5줄(만들 수 없으면 빈 배열).
+
+    원문을 그대로 넘긴다(번역문이 아니라) — 번역도 같은 모델이 하고, 중간에 한 번 더 옮기면
+    그만큼 원문에서 멀어진다. 용어는 GLOSSARY로 번역과 같은 단어를 쓰게 맞춰 둔다."""
+    items = [(normalize(label), normalize(text)) for label, text in items if normalize(text)]
+    if not items:
+        return []
+    p = resolve_provider(provider)
+    prompt = _summary_prompt(items, scope_label)
+    raw = await _call_gemini(prompt)
+    return _parse_summary(raw)

@@ -13,7 +13,8 @@ import base64
 import json
 from typing import Any
 
-import anthropic
+# Anthropic 주석 처리로 안 쓴다 — 되살릴 때 같이 푼다.
+# import anthropic
 import httpx
 from fastapi import APIRouter, HTTPException
 from google import genai
@@ -22,7 +23,7 @@ from pydantic import BaseModel
 
 from app.shared.core.chat_prompts import build_system_prompt
 from app.shared.core.config import settings
-from app.mcp_server import CATEGORY_LABELS, mcp
+from app.mcp_server import ANCHOR_KEYS, ANCHOR_REF_ONLY, CATEGORY_LABELS, mcp
 
 router = APIRouter()
 
@@ -89,8 +90,8 @@ class ConfirmRequest(BaseModel):
 
 class ProviderInfo(BaseModel):
     default: str
-    anthropic_available: bool
-    ollama_available: bool
+    # anthropic_available: bool
+    # ollama_available: bool
     gemini_available: bool
 
 
@@ -135,7 +136,7 @@ def _parse_concat_json(text: str) -> list[Any]:
 
 async def _lab_mismatch_hint(args: dict[str, Any], context: dict[str, Any]) -> str | None:
     """lab_pk로 조회했는데 결과가 비었고, 그 lab_pk가 화면에 떠 있는 연구소(lab_code)와 완전히 다른
-    실제 연구소를 가리킬 때(SIRC vs SARC처럼 이름이 비슷해 착각하기 쉬운 경우) 참고 문구를 만든다.
+    연구소를 가리킬 때 참고 문구를 만든다.
     이 판정은 LLM의 추측이 아니라 list_labs로 확인한 사실이라, 프롬프트 설명 대신 코드로 고정한다."""
     lab_pk = args.get("lab_pk")
     ctx_lab_pk = context.get("lab_pk")
@@ -184,6 +185,46 @@ def _derived_row_block_hint(name: str, args: dict[str, Any], context: dict[str, 
         f"계산해 만든 파생 {what}은 '집계' 탭을 보고 있을 때만 추가할 수 있다. 재시도하지 "
         "말고, '집계' 탭으로 이동한 뒤 다시 요청해달라고 사용자에게 설명해라."
     )
+
+
+def _anchor_missing_hint(name: str, args: dict[str, Any]) -> str | None:
+    """원시 추가 행을 "어느 항목 아래"인지 정하지 않고 만들려 할 때 막는다.
+
+    왜 막나: anchor_key를 비우면 표에서는 맨 끝에 붙지만 **집계에서는 기타경비로 합산된다**
+    (services/aggregate.py의 ANCHORABLE 판정 — core.js ovCustExtra와 같은 규칙). 두 화면이 서로
+    다르게 보이는데 그 사실은 어디에도 안 나타나서, 'IT 비용 아래'에 두려던 행이 조용히 기타경비에
+    섞인다. 금액이 틀리는 게 아니라 **자리가 틀리는** 형태라 숫자만 봐서는 못 알아챈다.
+
+    화면의 '+행 추가' 버튼은 그대로 둔다 — 사람이 표를 보면서 누르는 거라 행이 어디 붙었는지 눈에
+    보이고, 거기서 위치를 고르게 하면 버튼 한 번이 두 번이 된다. 말로 시켜서 행이 어디로 갔는지
+    볼 수 없는 이 경로에서만 위치를 먼저 받는다.
+
+    파생 행(is_derived=True)은 '개발비(A)' 합계에 더해지지 않아서 이 문제가 없다 — 빼고 본다."""
+    if name != "upsert_extra_row" or args.get("is_derived"):
+        return None
+    if str(args.get("anchor_key") or "").strip():
+        return None
+    return (
+        "도구 실행 실패: 추가 행을 어느 항목 아래에 넣을지(anchor_key) 정하지 않았다. 비워 두면 표 "
+        "맨 끝에 붙지만 집계에서는 기타경비로 합산되는데, 사용자는 그걸 모른 채 자기가 말한 자리에 "
+        "들어간 줄 안다. 재시도하지 말고 사용자에게 어디에 넣을지 먼저 물어라 — 행 이름으로 보아 "
+        f"어울리는 후보를 두셋 짚어서 함께 제시해라. 유효값: {ANCHOR_KEYS}.\n"
+        f"{ANCHOR_REF_ONLY}는 집계표의 참고 행이다 — 이미 다른 분류에 잡힌 금액을 다른 각도로 묶어 "
+        "보여주는 줄이라 개발비 합계에 안 올라간다. 그래서 여기에 붙인 행은 그 줄 합계에는 잡히지만 "
+        "개발비 합계에는 안 들어간다. 이 자리를 후보로 제시할 때 그 사실을 같이 말해라 — 개발비 "
+        "합계에도 잡혀야 하는 금액이면 실제 비용 분류(전산비 등)를 골라야 한다.\n"
+        "사용자가 '아무 데나'·'맨 끝에'라고 답하면 그때 anchor_key='misc'(기타경비)로 넣고, "
+        "집계에서 기타경비로 잡힌다는 점을 같이 알려라. 어느 중분류에도 넣지 않고 개발비 바로 "
+        "아래에 두길 원하면 anchor_key='A'(개발비)다 — 그러면 총계에는 들어가고 중분류에는 안 든다."
+    )
+
+
+def _write_block_hint(name: str, args: dict[str, Any], context: dict[str, Any]) -> str | None:
+    """쓰기 도구를 실행하기 전에 서버가 막아야 하는 것 전부. 하나라도 걸리면 그 사유를 돌려준다.
+
+    공급자별 턴 루프가 각자 이 검사를 호출하므로 입구를 하나로 모은다 — 검사를 하나 더 만들 때
+    루프마다 끼워 넣게 두면, 한 공급자만 고치고 다른 쪽을 빼먹는다."""
+    return _derived_row_block_hint(name, args, context) or _anchor_missing_hint(name, args)
 
 
 # 집계의 파생 행/열이 붙는 범위 — 연구소 하나가 아니라 "전체 연구소 합산"이다
@@ -359,180 +400,192 @@ def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
 
 
 def _tool_result_message(provider: str, tool_use_id: str, text: str, is_error: bool) -> dict[str, Any]:
-    if provider == "ollama":
-        return {"role": "tool", "tool_call_id": tool_use_id, "content": text}
-    if provider == "gemini":
-        # 이 API는 role="tool"을 안 받는다(400 INVALID_ARGUMENT — 유효한 role에 tool이 없음).
-        # Anthropic과 같은 방식으로 user role에 function_response part를 담아 보낸다.
-        return {
-            "role": "user",
-            "content": [{"function_response": {"name": tool_use_id, "response": {"result": text, "is_error": is_error}}}],
-        }
+    # 2026-11-16: Gemini 하나만 쓴다(PLAN.md 질문 6). provider 인자는 남겨 뒀다 —
+    # 호출부가 전부 넘기고 있고, 공급자를 다시 늘릴 때 분기 자리가 그대로 필요하다.
+    # if provider == "ollama":
+    #     return {"role": "tool", "tool_call_id": tool_use_id, "content": text}
+    #
+    # Anthropic(주석 처리):
+    # return {
+    #     "role": "user",
+    #     "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text, "is_error": is_error}],
+    # }
+    #
+    # 이 API는 role="tool"을 안 받는다(400 INVALID_ARGUMENT — 유효한 role에 tool이 없음).
+    # user role에 function_response part를 담아 보낸다.
     return {
         "role": "user",
-        "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text, "is_error": is_error}],
+        "content": [{"function_response": {"name": tool_use_id, "response": {"result": text, "is_error": is_error}}}],
     }
 
 
 def _resolve_provider(provider: str | None) -> str:
     p = provider or settings.chat_provider
-    if p not in ("anthropic", "ollama", "gemini"):
-        raise HTTPException(status_code=400, detail=f"알 수 없는 provider: {p!r} (anthropic | ollama | gemini만 가능)")
+    if p != "gemini":
+        raise HTTPException(status_code=400, detail=f"알 수 없는 provider: {p!r} (지금은 gemini만 가능)")
     return p
 
 
 async def _run_turn(
     messages: list[dict[str, Any]], context: dict[str, Any], provider: str | None = None, depth: int = 0
 ) -> ChatResponse:
-    resolved = _resolve_provider(provider)
-    if resolved == "ollama":
-        return await _run_turn_ollama(messages, context, depth)
-    if resolved == "gemini":
-        return await _run_turn_gemini(messages, context, depth)
-    return await _run_turn_anthropic(messages, context, depth)
+    _resolve_provider(provider)   # gemini만 통과한다
+    # if resolved == "ollama":
+    #     return await _run_turn_ollama(messages, context, depth)
+    # return await _run_turn_anthropic(messages, context, depth)
+    return await _run_turn_gemini(messages, context, depth)
 
 
-# ---------- Anthropic (Claude API) ----------
-
-
-def _anthropic_client() -> anthropic.AsyncAnthropic:
-    if not settings.anthropic_api_key:
-        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
-
-async def _anthropic_tools() -> list[dict[str, Any]]:
-    tools = await _mcp_tools()
-    return [{"name": t.name, "description": t.description or "", "input_schema": t.input_schema} for t in tools]
-
-
-async def _run_turn_anthropic(messages: list[dict[str, Any]], context: dict[str, Any], depth: int = 0) -> ChatResponse:
-    client = _anthropic_client()
-    try:
-        resp = await client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=1024,
-            system=build_system_prompt(context),
-            messages=messages,
-            tools=await _anthropic_tools(),
-        )
-    except anthropic.APIStatusError as e:
-        # Anthropic이 돌려준 에러(크레딧 부족, 키 무효, 레이트리밋 등)를 502로 그대로 노출 —
-        # 전역 예외 핸들러가 "Internal Server Error"로 뭉개버리면 사용자가 원인을 알 수 없다.
-        msg = (e.body or {}).get("error", {}).get("message") if isinstance(e.body, dict) else str(e)
-        raise HTTPException(status_code=502, detail=f"Anthropic API 오류: {msg or e}") from e
-    messages = messages + [{"role": "assistant", "content": [b.model_dump() for b in resp.content]}]
-
-    tool_use = next((b for b in resp.content if b.type == "tool_use"), None)
-    if tool_use is None:
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=text)
-
-    if _is_write_tool(tool_use.name):
-        block_hint = _derived_row_block_hint(tool_use.name, tool_use.input, context)
-        if block_hint is not None:
-            if depth >= MAX_TURNS:
-                return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
-            messages = messages + [_tool_result_message("anthropic", tool_use.id, block_hint, True)]
-            return await _run_turn_anthropic(messages, context, depth + 1)
-        note = "".join(b.text for b in resp.content if b.type == "text")
-        return ChatResponse(
-            messages=[ChatMessage(**m) for m in messages],
-            reply=note or _default_write_note(tool_use.name, tool_use.input),
-            pending=PendingTool(
-                tool_use_id=tool_use.id, name=tool_use.name, input=tool_use.input,
-                destructive=_is_destructive_tool(tool_use.name),
-            ),
-        )
-
-    if depth >= MAX_TURNS:
-        text, _ = await _tool_result_text(tool_use.name, tool_use.input, context)
-        return ChatResponse(
-            messages=[ChatMessage(**m) for m in messages],
-            reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
-        )
-
-    # 읽기 도구는 사람 확인 없이 바로 실행하고, 결과를 다시 모델에 넣어 다음 턴을 이어간다.
-    result_text, is_error = await _tool_result_text(tool_use.name, tool_use.input, context)
-    messages = messages + [_tool_result_message("anthropic", tool_use.id, result_text, is_error)]
-    return await _run_turn_anthropic(messages, context, depth + 1)
-
-
-# ---------- Ollama (로컬 모델) ----------
-
-
-async def _ollama_tools() -> list[dict[str, Any]]:
-    tools = await _mcp_tools()
-    return [
-        {"type": "function", "function": {"name": t.name, "description": t.description or "", "parameters": t.input_schema}}
-        for t in tools
-    ]
-
-
-async def _run_turn_ollama(messages: list[dict[str, Any]], context: dict[str, Any], depth: int = 0) -> ChatResponse:
-    try:
-        async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=180.0) as client:
-            resp = await client.post(
-                "/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "stream": False,
-                    "messages": [{"role": "system", "content": build_system_prompt(context)}] + messages,
-                    "tools": await _ollama_tools(),
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.ConnectError as e:
-        raise HTTPException(
-            status_code=502, detail="Ollama 서버에 연결할 수 없습니다. `ollama serve`가 떠 있는지 확인하세요."
-        ) from e
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Ollama 오류: {e.response.text}") from e
-
-    msg = data.get("message", {})
-    tool_calls = msg.get("tool_calls") or []
-    assistant_entry: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
-    if tool_calls:
-        assistant_entry["tool_calls"] = tool_calls
-    messages = messages + [assistant_entry]
-
-    if not tool_calls:
-        return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=msg.get("content") or "")
-
-    # Anthropic 경로와 동일하게, 한 턴엔 첫 번째 도구 호출만 처리한다.
-    call = tool_calls[0]
-    name = call["function"]["name"]
-    args = call["function"]["arguments"]
-    call_id = call.get("id") or name
-
-    if _is_write_tool(name):
-        block_hint = _derived_row_block_hint(name, args, context)
-        if block_hint is not None:
-            if depth >= MAX_TURNS:
-                return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
-            messages = messages + [_tool_result_message("ollama", call_id, block_hint, True)]
-            return await _run_turn_ollama(messages, context, depth + 1)
-        return ChatResponse(
-            messages=[ChatMessage(**m) for m in messages],
-            reply=msg.get("content") or _default_write_note(name, args),
-            pending=PendingTool(
-                tool_use_id=call_id, name=name, input=args, destructive=_is_destructive_tool(name)
-            ),
-        )
-
-    if depth >= MAX_TURNS:
-        text, _ = await _tool_result_text(name, args, context)
-        return ChatResponse(
-            messages=[ChatMessage(**m) for m in messages],
-            reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
-        )
-
-    result_text, is_error = await _tool_result_text(name, args, context)
-    messages = messages + [_tool_result_message("ollama", call_id, result_text, is_error)]
-    return await _run_turn_ollama(messages, context, depth + 1)
-
-
+# ---------- Anthropic · Ollama — 2026-11-16 주석 처리 ----------
+# 챗봇 공급자를 Gemini 하나로 줄였다(PLAN.md 질문 6). 모델과 왕복하는 턴 루프가 공급자마다
+# 한 벌씩 있어서, 도구를 하나 추가하면 세 곳을 고쳐야 했다 — 그게 이 파일이 길어진 이유다.
+#
+# 지우지 않고 남겨 두는 이유: Anthropic은 도구 호출이 가장 안정적이고 Ollama는 키 없이 로컬에서
+# 돌 수 있어서, 둘 다 되돌릴 값이 있다. 되살릴 때 같이 풀 곳 — config.py의 anthropic_* · ollama_*,
+# _tool_result_message의 분기, _resolve_provider의 허용 목록, _run_turn의 분기,
+# ProviderInfo의 anthropic_available · ollama_available, /chat/providers의 ollama 확인,
+# reason_translate.py의 _call_anthropic · _call_ollama, 프런트 공급자 목록(core.js agProvider).
+# # ---------- Anthropic (Claude API) ----------
+#
+#
+# def _anthropic_client() -> anthropic.AsyncAnthropic:
+#     if not settings.anthropic_api_key:
+#         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
+#     return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+#
+#
+# async def _anthropic_tools() -> list[dict[str, Any]]:
+#     tools = await _mcp_tools()
+#     return [{"name": t.name, "description": t.description or "", "input_schema": t.input_schema} for t in tools]
+#
+#
+# async def _run_turn_anthropic(messages: list[dict[str, Any]], context: dict[str, Any], depth: int = 0) -> ChatResponse:
+#     client = _anthropic_client()
+#     try:
+#         resp = await client.messages.create(
+#             model=settings.anthropic_model,
+#             max_tokens=1024,
+#             system=build_system_prompt(context),
+#             messages=messages,
+#             tools=await _anthropic_tools(),
+#         )
+#     except anthropic.APIStatusError as e:
+#         # Anthropic이 돌려준 에러(크레딧 부족, 키 무효, 레이트리밋 등)를 502로 그대로 노출 —
+#         # 전역 예외 핸들러가 "Internal Server Error"로 뭉개버리면 사용자가 원인을 알 수 없다.
+#         msg = (e.body or {}).get("error", {}).get("message") if isinstance(e.body, dict) else str(e)
+#         raise HTTPException(status_code=502, detail=f"Anthropic API 오류: {msg or e}") from e
+#     messages = messages + [{"role": "assistant", "content": [b.model_dump() for b in resp.content]}]
+#
+#     tool_use = next((b for b in resp.content if b.type == "tool_use"), None)
+#     if tool_use is None:
+#         text = "".join(b.text for b in resp.content if b.type == "text")
+#         return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=text)
+#
+#     if _is_write_tool(tool_use.name):
+#         block_hint = _write_block_hint(tool_use.name, tool_use.input, context)
+#         if block_hint is not None:
+#             if depth >= MAX_TURNS:
+#                 return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
+#             messages = messages + [_tool_result_message("anthropic", tool_use.id, block_hint, True)]
+#             return await _run_turn_anthropic(messages, context, depth + 1)
+#         note = "".join(b.text for b in resp.content if b.type == "text")
+#         return ChatResponse(
+#             messages=[ChatMessage(**m) for m in messages],
+#             reply=note or _default_write_note(tool_use.name, tool_use.input),
+#             pending=PendingTool(
+#                 tool_use_id=tool_use.id, name=tool_use.name, input=tool_use.input,
+#                 destructive=_is_destructive_tool(tool_use.name),
+#             ),
+#         )
+#
+#     if depth >= MAX_TURNS:
+#         text, _ = await _tool_result_text(tool_use.name, tool_use.input, context)
+#         return ChatResponse(
+#             messages=[ChatMessage(**m) for m in messages],
+#             reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
+#         )
+#
+#     # 읽기 도구는 사람 확인 없이 바로 실행하고, 결과를 다시 모델에 넣어 다음 턴을 이어간다.
+#     result_text, is_error = await _tool_result_text(tool_use.name, tool_use.input, context)
+#     messages = messages + [_tool_result_message("anthropic", tool_use.id, result_text, is_error)]
+#     return await _run_turn_anthropic(messages, context, depth + 1)
+#
+#
+# # ---------- Ollama (로컬 모델) ----------
+#
+#
+# async def _ollama_tools() -> list[dict[str, Any]]:
+#     tools = await _mcp_tools()
+#     return [
+#         {"type": "function", "function": {"name": t.name, "description": t.description or "", "parameters": t.input_schema}}
+#         for t in tools
+#     ]
+#
+#
+# async def _run_turn_ollama(messages: list[dict[str, Any]], context: dict[str, Any], depth: int = 0) -> ChatResponse:
+#     try:
+#         async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=180.0) as client:
+#             resp = await client.post(
+#                 "/api/chat",
+#                 json={
+#                     "model": settings.ollama_model,
+#                     "stream": False,
+#                     "messages": [{"role": "system", "content": build_system_prompt(context)}] + messages,
+#                     "tools": await _ollama_tools(),
+#                 },
+#             )
+#             resp.raise_for_status()
+#             data = resp.json()
+#     except httpx.ConnectError as e:
+#         raise HTTPException(
+#             status_code=502, detail="Ollama 서버에 연결할 수 없습니다. `ollama serve`가 떠 있는지 확인하세요."
+#         ) from e
+#     except httpx.HTTPStatusError as e:
+#         raise HTTPException(status_code=502, detail=f"Ollama 오류: {e.response.text}") from e
+#
+#     msg = data.get("message", {})
+#     tool_calls = msg.get("tool_calls") or []
+#     assistant_entry: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
+#     if tool_calls:
+#         assistant_entry["tool_calls"] = tool_calls
+#     messages = messages + [assistant_entry]
+#
+#     if not tool_calls:
+#         return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=msg.get("content") or "")
+#
+#     # Anthropic 경로와 동일하게, 한 턴엔 첫 번째 도구 호출만 처리한다.
+#     call = tool_calls[0]
+#     name = call["function"]["name"]
+#     args = call["function"]["arguments"]
+#     call_id = call.get("id") or name
+#
+#     if _is_write_tool(name):
+#         block_hint = _write_block_hint(name, args, context)
+#         if block_hint is not None:
+#             if depth >= MAX_TURNS:
+#                 return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
+#             messages = messages + [_tool_result_message("ollama", call_id, block_hint, True)]
+#             return await _run_turn_ollama(messages, context, depth + 1)
+#         return ChatResponse(
+#             messages=[ChatMessage(**m) for m in messages],
+#             reply=msg.get("content") or _default_write_note(name, args),
+#             pending=PendingTool(
+#                 tool_use_id=call_id, name=name, input=args, destructive=_is_destructive_tool(name)
+#             ),
+#         )
+#
+#     if depth >= MAX_TURNS:
+#         text, _ = await _tool_result_text(name, args, context)
+#         return ChatResponse(
+#             messages=[ChatMessage(**m) for m in messages],
+#             reply="도구 호출이 너무 길어져서 중단했습니다. 마지막 조회 결과: " + text[:500],
+#         )
+#
+#     result_text, is_error = await _tool_result_text(name, args, context)
+#     messages = messages + [_tool_result_message("ollama", call_id, result_text, is_error)]
+#     return await _run_turn_ollama(messages, context, depth + 1)
+#
+#
 # ---------- Gemini (Google) ----------
 # messages에는 Gemini SDK 객체를 그대로 못 넣으므로(JSON 직렬화 대상) part를 작은 dict로 펼쳐서 담고,
 # 호출 직전에만 Content/Part로 다시 조립한다. function_response는 role="tool"로 돌려준다(SDK 예시 그대로).
@@ -625,7 +678,7 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
 
     name, args = fn_call.name, dict(fn_call.args or {})
     if _is_write_tool(name):
-        block_hint = _derived_row_block_hint(name, args, context)
+        block_hint = _write_block_hint(name, args, context)
         if block_hint is not None:
             if depth >= MAX_TURNS:
                 return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
@@ -657,16 +710,12 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
 
 @router.get("/chat/providers", response_model=ProviderInfo)
 async def chat_providers() -> ProviderInfo:
-    ollama_available = False
-    try:
-        async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=2.0) as client:
-            ollama_available = (await client.get("/api/tags")).status_code == 200
-    except httpx.HTTPError:
-        ollama_available = False
+    # Ollama가 떠 있는지 확인하던 왕복(GET /api/tags)은 걷어냈다 — 쓰지 않는 공급자를 확인하려고
+    # 화면을 열 때마다 2초 타임아웃을 걸 이유가 없다. 되살릴 때 주석과 함께 푼다.
     return ProviderInfo(
         default=settings.chat_provider,
-        anthropic_available=bool(settings.anthropic_api_key),
-        ollama_available=ollama_available,
+        # anthropic_available=bool(settings.anthropic_api_key),
+        # ollama_available=ollama_available,
         gemini_available=bool(settings.gemini_api_key),
     )
 

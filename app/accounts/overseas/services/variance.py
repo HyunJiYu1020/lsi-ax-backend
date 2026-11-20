@@ -21,16 +21,55 @@ check_variance_reasons를 함수로 직접 호출하고, 결산 엔드포인트�
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from dataclasses import dataclass
+
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.accounts.overseas.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
+from app.accounts.overseas.cost_groups import (
+    AGGREGATE_ROWS,
+    CATEGORY_LABELS,
+    CATEGORY_LABELS_EN,
+    VARIANCE_ROWS,
+    resolve_leaves,
+)
 from app.shared.core.periods import PERIOD_IX, month_value, yyyymm
 from app.shared.core.values import n, source_hash
-from app.accounts.overseas.services.entries import current_basis_month, entry_months_bulk, plan_entry_months_bulk
+from app.accounts.overseas.services.entries import (
+    current_basis_month,
+    entry_months_bulk,
+    pick_plan_no,
+    plan_entry_months_bulk,
+)
 from app.accounts.overseas.services.fxcalc import rate_arrays
+from app.accounts.overseas.services.labor_split import (
+    prepare as labor_split_prepare,
+    split_for as labor_split_for,
+)
 from app.accounts.overseas.services.labs import ACCOUNT_KEY, LabView, all_labs, lab_views
+# 버전·비교 기준 해석은 services/versions.py에 있다 — 집계표·인건비율·인건비 분해가 같은 해석을
+# 쓰는데, 여기 두면 그쪽이 증감분석을 import해야 하고 labor_split과 순환이 된다.
+from app.accounts.overseas.services.versions import (
+    BASE_LABELS,
+    KIND_LABELS,
+    active_labs,
+    check_kind,
+    default_plan_no,
+    fx_specs,
+    has_cost_data,
+    latest_cost_yyyymm,
+    load_basis,
+    load_cost_version,
+    load_plan_version,
+    plan_revisions,
+    plan_creation_prev,
+    prev_spec,
+    prior_spec,
+    resolve_bases,
+    scope_pks,
+    ym_label,
+)
 from app.shared.core.reason_translate import (
     MAX_LEN,
     draft_reason,
@@ -68,28 +107,16 @@ from app.accounts.overseas.schemas import (
     VarianceReasonIn,
     VarianceReasonOut,
     VarianceResult,
+    LaborSplitTotals,
+    VarianceTable,
     VarianceRow,
 )
 
-BASE_LABELS = {"prev": "전실행", "prior": "전년", "plan": "경영계획"}
-KIND_LABELS = {"forecast": "속보", "actual": "실적", "plan": "경영계획"}
-# 증감률이 이만큼을 넘으면 사유를 쓰라고 확정 직전에 경고한다. 업무 규칙상 바뀔 수 있는 값이라
 # 쿼리 파라미터로 받고 기본값만 여기 둔다(화면도 이 값을 받아서 표의 경고 표시 기준으로 쓴다).
 DEFAULT_REASON_THRESHOLD_PCT = 10.0
 # 합계·집계 행은 하위 계정의 합이라 사유를 따로 쓰지 않는다 — 경고 목록에서 뺀다
 # (개발비(매출)에 사유를 쓰라고 하면 담당자는 같은 말을 두 번 쓰게 된다).
 GROUP_KEYS = {key for key, _, _ in VARIANCE_ROWS if len(resolve_leaves(key)) > 1}
-
-
-def ym_label(year: int, month: int, kind: str) -> str:
-    """"26.09 속보" — 화면·엑셀·챗봇이 같은 문장을 쓰게 하려고 라벨을 한 군데서 만든다."""
-    return f"{year % 100:02d}.{month:02d} {KIND_LABELS.get(kind, kind)}"
-
-
-def check_kind(kind: str) -> str:
-    if kind not in ("forecast", "actual", "plan"):
-        raise HTTPException(400, "kind는 forecast(속보) | actual(실적) | plan(경영계획)만 쓸 수 있다.")
-    return kind
 
 
 def check_period(period: str) -> tuple[int, ...]:
@@ -109,301 +136,7 @@ def check_stage(stage: str, kind: str) -> str:
     return stage
 
 
-# ---------- 비교 기준 해석 ----------
-def has_cost_data(db: Session, version: str, yyyymm: str) -> bool:
-    return bool(
-        db.scalar(
-            select(CostEntry.id)
-            .where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == version, CostEntry.yyyymm == yyyymm)
-            .limit(1)
-        )
-    )
-
-
-def latest_cost_yyyymm(db: Session, version: str, before: str | None = None) -> str | None:
-    """그 버전 종류에서 데이터가 실제로 들어있는 가장 최근 편성 연월. before를 주면 그보다 앞선 것만.
-    yyyymm이 "YYYYMM" 고정폭이라 문자열 최댓값이 곧 날짜순 최댓값이다."""
-    stmt = select(func.max(CostEntry.yyyymm)).where(
-        CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == version
-    )
-    if before is not None:
-        stmt = stmt.where(CostEntry.yyyymm < before)
-    return db.scalar(stmt)
-
-
-def plan_revisions(db: Session, year: int) -> list[PlanRevisionOut]:
-    rows = list(
-        db.scalars(
-            select(ManagementPlanVersion)
-            .where(ManagementPlanVersion.year == year)
-            .order_by(ManagementPlanVersion.plan_no)
-        )
-    )
-    return [
-        PlanRevisionOut(
-            plan_no=r.plan_no,
-            label=f"{r.plan_no} ★" if r.is_final else r.plan_no,
-            is_final=r.is_final,
-            is_confirmed=r.is_confirmed,
-            finalized_at=r.finalized_at.isoformat() if r.finalized_at else "",
-        )
-        for r in rows
-    ]
-
-
-def default_plan_no(revisions: list[PlanRevisionOut]) -> str:
-    """기본 차수는 ★(그 연도의 공식 비교 기준). ★가 없으면 가장 최근 차수를 쓴다 — 경영계획 대비
-    칸을 빈 화면으로 두지 않으려는 것이다(어느 차수를 보고 있는지는 라벨로 밝힌다)."""
-    for r in revisions:
-        if r.is_final:
-            return r.plan_no
-    return revisions[-1].plan_no if revisions else ""
-
-
-def prev_spec(db: Session, year: int, month: int, kind: str) -> tuple[int, int, str, str]:
-    """전실행 = 직전 버전. (연, 월, kind, 폴백 안내) 를 돌려준다.
-
-    버전은 "그 달 속보 → 그 달 실적 → 다음 달 속보 → …" 순서로 흐른다. 그래서
-    - 속보의 직전 버전은 지난달 실적이고, 1월 속보는 전년 12월 실적이다(연도를 넘어간다).
-    - 실적의 직전 버전은 같은 달 속보다 — 실적은 그 달 속보를 실행한 결과라서 그것과 맞대보는 게
-      "전실행"의 뜻이다.
-    그 자리에 데이터가 없으면 더 앞선 실적 → 더 앞선 속보로 물러난다. 아무 것도 없으면 그대로
-    돌려주고 has_data=False로 밝힌다(숫자를 지어내지 않는다)."""
-    if kind == "actual":
-        target = (year, month, "forecast")
-    elif month == 1:
-        target = (year - 1, 12, "actual")
-    else:
-        target = (year, month - 1, "actual")
-
-    ty, tm, tkind = target
-    if has_cost_data(db, tkind, yyyymm(ty, tm)):
-        return ty, tm, tkind, ""
-
-    cur_yyyymm = yyyymm(year, month)
-    for fb_kind in ("actual", "forecast"):
-        latest = latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
-        if latest:
-            fy, fm = int(latest[:4]), int(latest[4:6])
-            return (
-                fy,
-                fm,
-                fb_kind,
-                f"{ym_label(ty, tm, tkind)} 데이터가 없어 {ym_label(fy, fm, fb_kind)} 기준으로 비교합니다.",
-            )
-    return ty, tm, tkind, f"{ym_label(ty, tm, tkind)} 데이터가 없어 전실행 대비 증감을 낼 수 없습니다."
-
-
-def prior_spec(db: Session, year: int, month: int) -> tuple[int, int, str, str]:
-    """전년 = 전년 12월 실적. 없으면 최근 실적 → 최근 속보로 물러나고 그 사실을 문장으로 밝힌다
-    ("전년 12월 실적이 없어 26.11 속보 기준으로 비교합니다.")."""
-    ty, tm, tkind = year - 1, 12, "actual"
-    if has_cost_data(db, tkind, yyyymm(ty, tm)):
-        return ty, tm, tkind, ""
-
-    cur_yyyymm = yyyymm(year, month)
-    for fb_kind in ("actual", "forecast"):
-        latest = latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
-        if latest:
-            fy, fm = int(latest[:4]), int(latest[4:6])
-            return (
-                fy,
-                fm,
-                fb_kind,
-                f"전년 12월 실적이 없어 {ym_label(fy, fm, fb_kind)} 기준으로 비교합니다.",
-            )
-    return ty, tm, tkind, "전년 12월 실적이 없어 전년 대비 증감을 낼 수 없습니다."
-
-
-def plan_creation_prev(db: Session, year: int, plan_no: str) -> tuple[int, int, str, str]:
-    """경영계획 버전을 편성할 때의 전실행 = "생성 시점 최근 버전".
-
-    경영계획은 특정 달에 매여 있지 않아서 "지난달 실적"이라는 말이 성립하지 않는다. 대신 그 차수를
-    만든 시점에 가장 최근이던 버전과 비교한다 — 그게 그때 담당자가 실행 중이던 계획이다. 차수를
-    만든 시각 이후에 열린 버전은 보지 않는다(나중에 열린 버전으로 비교 기준이 소급해서 바뀌면,
-    이미 보고한 경영계획 대비 증감이 달라진다)."""
-    plan = db.scalar(
-        select(ManagementPlanVersion).where(
-            ManagementPlanVersion.year == year, ManagementPlanVersion.plan_no == plan_no
-        )
-    )
-    created = plan.created_at if plan else None
-    stmt = select(Version).order_by(Version.year.desc(), Version.month.desc(), Version.kind.desc())
-    if created is not None:
-        stmt = stmt.where(Version.created_at <= created)
-    row = db.scalars(stmt.limit(1)).first()
-    if row is None:
-        return 0, 0, "", "경영계획 생성 시점에 열린 버전이 없어 전실행 대비 증감을 낼 수 없습니다."
-    note = ""
-    if not has_cost_data(db, row.kind, yyyymm(row.year, row.month)):
-        note = f"{ym_label(row.year, row.month, row.kind)}에 저장된 데이터가 없어 전실행 대비 증감을 낼 수 없습니다."
-    return row.year, row.month, row.kind, note
-
-
-def resolve_bases(
-    db: Session, basis_year: int, basis_month: int, kind: str, plan_no: str | None = None
-) -> VarianceBasisResult:
-    revisions = plan_revisions(db, basis_year)
-    default_plan = default_plan_no(revisions)
-    chosen_plan = plan_no or default_plan
-    if plan_no and all(r.plan_no != plan_no for r in revisions):
-        raise HTTPException(404, f"{basis_year}년에 그런 경영계획 차수가 없다: {plan_no!r}")
-
-    if kind == "plan":
-        py, pm, pkind, pnote = plan_creation_prev(db, basis_year, chosen_plan)
-    else:
-        py, pm, pkind, pnote = prev_spec(db, basis_year, basis_month, kind)
-    ry, rm, rkind, rnote = prior_spec(db, basis_year, basis_month)
-
-    plan_has_data = bool(
-        chosen_plan
-        and db.scalar(
-            select(ManagementPlanEntry.id)
-            .where(
-                ManagementPlanEntry.account_code == ACCOUNT_KEY,
-                ManagementPlanEntry.year == basis_year,
-                ManagementPlanEntry.plan_no == chosen_plan,
-            )
-            .limit(1)
-        )
-    )
-    plan_label = next((r.label for r in revisions if r.plan_no == chosen_plan), chosen_plan)
-
-    bases = [
-        VarianceBasisOut(
-            key="prev",
-            label=BASE_LABELS["prev"],
-            resolved_label=ym_label(py, pm, pkind) if pkind else "—",
-            year=py,
-            month=pm,
-            kind=pkind,
-            has_data=not pnote.endswith("낼 수 없습니다."),
-            fallback_note=pnote,
-        ),
-        VarianceBasisOut(
-            key="prior",
-            label=BASE_LABELS["prior"],
-            resolved_label=ym_label(ry, rm, rkind),
-            year=ry,
-            month=rm,
-            kind=rkind,
-            has_data=not rnote.endswith("낼 수 없습니다."),
-            fallback_note=rnote,
-        ),
-        VarianceBasisOut(
-            key="plan",
-            label=BASE_LABELS["plan"],
-            resolved_label=f"{basis_year}년 {plan_label}" if chosen_plan else "—",
-            year=basis_year,
-            kind="plan",
-            plan_no=chosen_plan,
-            has_data=plan_has_data,
-            fallback_note=(
-                ""
-                if plan_has_data
-                else f"{basis_year}년 경영계획 데이터가 없어 경영계획 대비 증감을 낼 수 없습니다."
-            ),
-        ),
-    ]
-    return VarianceBasisResult(
-        basis_year=basis_year,
-        basis_month=basis_month,
-        kind=kind,
-        basis_label=f"{basis_year}년 {plan_label}" if kind == "plan" else ym_label(basis_year, basis_month, kind),
-        bases=bases,
-        plan_revisions=revisions,
-        default_plan_no=default_plan,
-    )
-
-
-# ---------- 버전 데이터 읽기 ----------
-def load_cost_version(db: Session, version: str, yyyymm: str, lab_pks: set[str]) -> dict[str, dict[str, list]]:
-    """cost_entries 한 버전(편성 연월 1건)을 pk → 계정 → 12개월 배열로 읽는다.
-
-    연구소가 직접 추가한 행(label이 채워진 행)은 뺀다 — 고정 계정 합계에 섞이면 같은 금액이 두 번
-    세어진다(extra-rows 엔드포인트가 따로 내려주는 값이다)."""
-    entries = [
-        e
-        for e in db.scalars(
-            select(CostEntry).where(
-                CostEntry.account_code == ACCOUNT_KEY,
-                CostEntry.version == version,
-                CostEntry.yyyymm == yyyymm,
-                CostEntry.label.is_(None),
-            )
-        )
-        if e.scope_code in lab_pks
-    ]
-    months = entry_months_bulk(db, entries)
-    out: dict[str, dict[str, list]] = {}
-    for e in entries:
-        out.setdefault(e.scope_code, {})[e.category_code] = months[e.id]
-    return out
-
-
-def load_plan_version(db: Session, year: int, plan_no: str, lab_pks: set[str]) -> dict[str, dict[str, list]]:
-    entries = [
-        e
-        for e in db.scalars(
-            select(ManagementPlanEntry).where(
-                ManagementPlanEntry.account_code == ACCOUNT_KEY,
-                ManagementPlanEntry.year == year,
-                ManagementPlanEntry.plan_no == plan_no,
-            )
-        )
-        if e.scope_code in lab_pks
-    ]
-    months = plan_entry_months_bulk(db, [e.id for e in entries])
-    out: dict[str, dict[str, list]] = {}
-    for e in entries:
-        out.setdefault(e.scope_code, {})[e.category_code] = months[e.id]
-    return out
-
-
-def load_basis(db: Session, spec, lab_pks: set[str]) -> dict[str, dict[str, list]]:
-    """비교 기준(또는 현재 버전) 한 쪽의 데이터. plan은 management_plan_entries, 나머지는 cost_entries."""
-    year, month, kind, plan_no = spec
-    if kind == "plan":
-        return load_plan_version(db, year, plan_no, lab_pks)
-    if not kind:
-        return {}
-    return load_cost_version(db, kind, yyyymm(year, month), lab_pks)
-
-
-def active_labs(db: Session, basis_year: int, basis_month: int) -> dict[str, LabView]:
-    """계산에 넣을 연구소 pk → 기준정보. 기준정보는 "그 버전 시점" 값으로 읽는다 — 통화를 지금
-    값으로 보면 지난달에 보고한 환차 분해가 소급해서 달라진다(공통 RULE).
-
-    합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 뺀다 — 넣으면
-    SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다."""
-    return {
-        lab.pk: lab
-        for lab in lab_views(db, f"{basis_year:04d}-{basis_month:02d}")
-        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
-    }
-
-
-def scope_pks(labs: dict[str, LabView], lab_scope: str) -> list[str]:
-    scope = (lab_scope or "ALL").strip()
-    if scope.upper() == "ALL":
-        return sorted(labs)
-    pks = sorted(pk for pk, lab in labs.items() if pk == scope or lab.lab_code == scope)
-    if not pks:
-        raise HTTPException(404, f"그런 연구소가 없다: {scope!r}")
-    return pks
-
-
 # ---------- 증감 표 ----------
-def fx_specs(cur_spec, base_spec) -> tuple[tuple[int, int, str], tuple[int, int, str]]:
-    """환율 기준(연·월·forecast|actual) 두 쌍. 경영계획은 속보/실적 환율 기준이 없어서, 그쪽을
-    비교할 때는 "지금 버전의 환율"을 양쪽에 똑같이 써서 환차를 0으로 둔다 — 경영계획 금액은 애초에
-    그때의 환율 가정으로 만든 값이라 환차를 가를 근거가 없다. 화면도 같은 제약을 둔다."""
-    cy, cm, ckind, _ = cur_spec
-    by, bm, bkind, _ = base_spec
-    cur_fx = (cy, cm, ckind if ckind in ("forecast", "actual") else "forecast")
-    base_fx = (by, bm, bkind) if bkind in ("forecast", "actual") else cur_fx
-    return cur_fx, base_fx
-
 
 def variance_cells(
     db: Session,
@@ -416,7 +149,7 @@ def variance_cells(
     base_fx: tuple[int, int, str],
     split_fx: bool,
 ) -> dict[str, dict[str, float]]:
-    """계정 키 → {cur, base, fx_local, fx_usd, fx_outside} (원). 화면 logic/calc.js의 ovAnaEl과 같은 식.
+    """계정 키 → {cur, base, fx_local, fx_usd, fx_outside} (원). 화면 core.js의 ovAnaEl과 같은 식.
 
     환차 분해(현지통화 연구소):
       현지금액 L = K$ × (현지/$)
@@ -432,7 +165,10 @@ def variance_cells(
     rate_cur = rate_arrays(db, *cur_fx, local_curs, ix)
     rate_base = rate_arrays(db, *base_fx, local_curs, ix) if split_fx else rate_cur
 
-    leaves = {key: resolve_leaves(key) for key, _, _ in VARIANCE_ROWS if key != "pct"}
+    # 화면이 그리는 행 전부를 계산한다 — 참고 행(IT 관련 비용 · 외주용역비 7개)까지.
+    # VARIANCE_ROWS(38행)만 돌면 그 7개가 빠지고, 증감분석 화면은 집계표와 같은 45행을 그리므로
+    # 화면이 서버 값을 쓸 때 그 줄이 빈칸으로 남는다. 두 표가 같은 행 목록을 쓰는 게 맞다.
+    leaves = {key: resolve_leaves(key) for key, _, _, _ in AGGREGATE_ROWS if key != "pct"}
     out = {key: {"cur": 0.0, "base": 0.0, "fx_local": 0.0, "fx_usd": 0.0, "fx_outside": 0.0} for key in leaves}
 
     for pk in pks:
@@ -482,18 +218,27 @@ def pct_of(cur: float, base: float) -> float | None:
 
 
 def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
+    """계정 행 목록. 집계표와 같은 45행을 쓴다(AGGREGATE_ROWS) — 두 화면이 같은 계정 트리를
+    그리므로 행 목록이 갈리면 한쪽에만 있는 줄이 생긴다. memo(참고 행)는 개발비 합계에 들어가지
+    않는다는 표시이고, 증감분석에서도 같은 뜻이다."""
     rows: list[VarianceRow] = []
-    for key, level, unit in VARIANCE_ROWS:
+    for key, level, unit, memo in AGGREGATE_ROWS:
         if unit == "pct":
-            # (%) 행은 금액이 아니라 MARK UP 비율(B ÷ A)이다. 두 버전의 비율을 각각 내고 그 차이를
-            # %p로 보여주므로, 환차를 가를 대상이 아니다.
-            a, b = cells["A"], cells["B"]
-            cur = (b["cur"] / a["cur"] * 100) if a["cur"] else 0.0
-            base = (b["base"] / a["base"] * 100) if a["base"] else 0.0
+            # (%) 행은 금액이 아니라 MARK UP 비율이다. 두 버전의 비율을 각각 내고 그 차이를 %p로
+            # 보여주므로 환차를 가를 대상이 아니다.
+            #
+            # 분모는 **개발비(매출)=tot**이다(개발비 A가 아니다). 근거는 화면이 사용자에게 적어
+            # 주는 문장이다 — "합계 화면은 MARK UP ÷ 개발비(매출) 계산값"(core.js 집계표 안내).
+            # 집계표(aggregate.pl_rows)도 tot을 쓴다. 2026-11-16까지 여기만 A를 써서, MARK UP이
+            # 0이 아닌 데이터에서는 챗봇이 화면과 다른 %를 말하게 되어 있었다(개발 데이터는 B가
+            # 0이라 두 값이 같아서 드러나지 않았다).
+            d, b = cells["tot"], cells["B"]
+            cur = (b["cur"] / d["cur"] * 100) if d["cur"] else 0.0
+            base = (b["base"] / d["base"] * 100) if d["base"] else 0.0
             rows.append(
                 VarianceRow(
-                    category_key=key, label="(%)", label_en="(%)", level=level, unit="pct",
-                    base=base, cur=cur, diff=cur - base,
+                    category_key=key, label=CATEGORY_LABELS[key], label_en=CATEGORY_LABELS_EN[key], level=level, unit="pct",
+                    memo=memo, base=base, cur=cur, diff=cur - base,
                 )
             )
             continue
@@ -504,6 +249,7 @@ def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
                 category_key=key,
                 label=CATEGORY_LABELS.get(key, key),
                 label_en=CATEGORY_LABELS_EN.get(key, ""),
+                memo=memo,
                 level=level,
                 unit=unit,
                 base=c["base"],
@@ -519,20 +265,29 @@ def variance_rows(cells: dict[str, dict[str, float]]) -> list[VarianceRow]:
     return rows
 
 
-def compute_variance(
-    db: Session,
-    basis_year: int,
-    basis_month: int,
-    kind: str,
-    base_version: str,
-    period: str,
-    lab_scope: str,
-    plan_no: str | None,
-    stage: str = "",
-) -> VarianceResult:
+@dataclass(frozen=True)
+class _VarianceSetup:
+    """기간과 무관한 준비물. 17기간 표(compute_variance_table)는 이걸 한 번만 만들고 기간만
+    바꿔 가며 계산한다 — 기간마다 다시 만들면 같은 DB 읽기를 17번 한다."""
+
+    labs: dict
+    pks: list[str]
+    cur_d: dict
+    base_d: dict
+    cur_fx: tuple
+    base_fx: tuple
+    split_fx: bool
+    basis: object
+    plan_no: str
+    note: str
+
+
+def _variance_setup(
+    db: Session, basis_year: int, basis_month: int, kind: str, base_version: str,
+    lab_scope: str, plan_no: str | None,
+) -> _VarianceSetup:
     if base_version not in BASE_LABELS:
         raise HTTPException(400, "base_version은 prev(전실행) | prior(전년) | plan(경영계획)만 쓸 수 있다.")
-    ix = check_period(period)
     resolved = resolve_bases(db, basis_year, basis_month, kind, plan_no)
     basis = next(b for b in resolved.bases if b.key == base_version)
     if not basis.has_data:
@@ -557,7 +312,6 @@ def compute_variance(
     # 두고 증감 전부를 환차外로 본다. 0을 "환차가 없었다"로 읽지 않도록 note에 적어 내려보낸다.
     split_fx = "plan" not in (cur_spec[2], base_spec[2])
     cur_fx, base_fx = fx_specs(cur_spec, base_spec)
-    cells = variance_cells(db, labs, pks, cur_d, base_d, ix, cur_fx, base_fx, split_fx)
     note = (
         "환차 = 환율이 움직여서 변한 몫, 환차外 = 금액 자체의 증감이다. USD가 아닌 통화를 쓰는 "
         "연구소는 환차를 현지→$(fx_local)와 $→원(fx_usd)으로 가른다 — USD 연구소는 fx_local이 0이다. "
@@ -565,20 +319,42 @@ def compute_variance(
     )
     if not split_fx:
         note += " 경영계획은 속보/실적 환율 기준이 없어 환차를 가를 수 없다 — 환차 칸은 0이고 증감 전부가 환차外로 들어가 있다."
+    return _VarianceSetup(
+        labs, pks, cur_d, base_d, cur_fx, base_fx, split_fx, basis, basis.plan_no, note
+    )
+
+
+def compute_variance(
+    db: Session,
+    basis_year: int,
+    basis_month: int,
+    kind: str,
+    base_version: str,
+    period: str,
+    lab_scope: str,
+    plan_no: str | None,
+    stage: str = "",
+) -> VarianceResult:
+    ix = check_period(period)
+    st = _variance_setup(db, basis_year, basis_month, kind, base_version, lab_scope, plan_no)
+    cells = variance_cells(
+        db, st.labs, st.pks, st.cur_d, st.base_d, ix, st.cur_fx, st.base_fx, st.split_fx
+    )
     return VarianceResult(
         basis_year=basis_year,
         basis_month=basis_month,
         kind=kind,
         stage=stage,
         base_version=base_version,
-        base_label=basis.resolved_label,
+        base_label=st.basis.resolved_label,
         period=period,
         lab_scope=(lab_scope or "ALL"),
-        plan_no=basis.plan_no,
+        plan_no=st.plan_no,
         rows=variance_rows(cells),
-        fallback_note=basis.fallback_note,
-        note=note,
+        fallback_note=st.basis.fallback_note,
+        note=st.note,
     )
+
 
 
 # ---------- 증감사유 ----------
@@ -907,3 +683,67 @@ def compute_reason_check(
         else f"증감률 {threshold_pct:g}% 이상인 항목은 모두 사유가 적혀 있다."
     )
     return VarianceReasonCheck(threshold_pct=threshold_pct, missing=missing, stale=stale, note=note)
+
+
+def compute_variance_table(
+    db: Session,
+    basis_year: int,
+    basis_month: int,
+    kind: str,
+    base_version: str,
+    lab_scope: str,
+    plan_no: str | None,
+    stage: str = "",
+) -> VarianceTable:
+    """증감분석 화면이 그리는 표 전체 — 17기간(월 12 + 분기 4 + 연간) × 계정 전부.
+
+    기간을 하나씩 받는 `compute_variance`와 같은 계산이지만, 준비물(기준 해석 · 연구소 목록 ·
+    두 버전 데이터 로드)을 **한 번만** 만들고 기간만 바꿔 돈다 — 화면이 17번 부르면 같은 DB
+    읽기를 17번 하고, 그게 이 화면이 브라우저에서 계산되고 있던 이유다.
+
+    왜 기간별 응답을 합치지 않고 따로 주는가: 월 금액을 더해 분기를 만들 수 없는 행이 있다
+    (인력은 평균, 비율은 분자·분모를 각각 더한 뒤 나눠야 한다). 서버가 기간마다 제대로 계산해서
+    주고 화면은 고르기만 한다.
+    """
+    st = _variance_setup(db, basis_year, basis_month, kind, base_version, lab_scope, plan_no)
+    periods = {
+        period: variance_rows(
+            variance_cells(
+                db, st.labs, st.pks, st.cur_d, st.base_d, ix, st.cur_fx, st.base_fx, st.split_fx
+            )
+        )
+        for period, ix in PERIOD_IX.items()
+    }
+
+    # 인건비 분해도 같이 담는다 — 화면이 인건비 행을 펼칠 때 쓰는 줄들이고, 따로 부르면 기간마다
+    # 한 번씩(17번) 왕복한다. 계산은 엔드포인트와 **같은 함수**를 쓴다(services/labor_split.py).
+    # 경영계획 대비는 환율 기준이 없어 분해할 수 없다 — 그때는 빈 dict로 두고 화면이 그 줄을
+    # 안 그리게 한다(없는 걸 0으로 주면 "분해했는데 0"으로 읽힌다).
+    split: dict[str, LaborSplitTotals] = {}
+    try:
+        inp = labor_split_prepare(db, basis_year, base_version, lab_scope, basis_month, kind, plan_no)
+        split = {
+            period: LaborSplitTotals(
+                **{
+                    f: getattr(labor_split_for(db, inp, period, ix), f)
+                    for f in LaborSplitTotals.model_fields
+                }
+            )
+            for period, ix in PERIOD_IX.items()
+        }
+    except HTTPException:
+        split = {}
+    return VarianceTable(
+        basis_year=basis_year,
+        basis_month=basis_month,
+        kind=kind,
+        stage=stage,
+        base_version=base_version,
+        base_label=st.basis.resolved_label,
+        lab_scope=(lab_scope or "ALL"),
+        plan_no=st.plan_no,
+        periods=periods,
+        labor_split=split,
+        fallback_note=st.basis.fallback_note,
+        note=st.note,
+    )

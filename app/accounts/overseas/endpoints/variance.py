@@ -54,9 +54,11 @@ from app.accounts.overseas.schemas import (
     VarianceReasonIn,
     VarianceReasonOut,
     VarianceResult,
+    VarianceTable,
     VarianceRow,
 )
 from app.accounts.overseas.services.variance import (
+    compute_variance_table,
     compute_reason_check,
     BASE_LABELS,
     DEFAULT_REASON_THRESHOLD_PCT,
@@ -150,6 +152,33 @@ def get_variance(
     check_stage(stage, kind)
     return compute_variance(
         db, basis_year, month, kind, base_version, period, lab_scope, plan_no, stage
+    )
+
+
+@router.get("/overseas/variance-table", response_model=VarianceTable)
+def get_variance_table(
+    basis_year: int,
+    base_version: str = "prev",
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    lab_scope: str = "ALL",
+    plan_no: str | None = None,
+    stage: str = "",
+    db: Session = Depends(get_db),
+) -> VarianceTable:
+    """증감분석 화면 표 전체 — 17기간(월 12 + 분기 4 + 연간) × 계정 전부를 한 번에.
+
+    PLAN.md Phase 6(수식 백엔드 단일화). 화면은 이 표를 그리기만 한다.
+    기간을 하나씩 받는 `/overseas/variance`는 그대로 둔다 — 챗봇이 "SARC 인건비 왜 늘었어?"에
+    답할 때는 기간 하나만 필요하고, 17기간을 다 계산해 보낼 이유가 없다.
+
+    둘은 같은 함수(`variance_cells`)를 쓴다 — 쓰기 규칙이 두 벌이 되면 화면과 챗봇이 다른 숫자를
+    말하게 된다(P1-3에서 겪은 그 문제다)."""
+    check_kind(kind)
+    month = basis_month or current_basis_month(db) or 1
+    check_stage(stage, kind)
+    return compute_variance_table(
+        db, basis_year, month, kind, base_version, lab_scope, plan_no, stage
     )
 
 
