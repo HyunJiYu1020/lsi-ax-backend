@@ -7,29 +7,44 @@
 
 from sqlalchemy.orm import Session
 
-from app.core.enums import AccountStatus, CodeGroup, OverseasSheetType
+from app.shared.core.enums import AccountStatus, CodeGroup, OverseasSheetType, VersionStatus
 from app.db.session import SessionLocal
-from app.models import Account, AccountProgress, AccountStep, CommonCode, CommonCodeGroup, OverseasLab, OverseasLabSheet
+from app.accounts.overseas.models import OverseasLab, OverseasLabSheet
+from app.shared.models.account import Account, AccountProgress, AccountStep
+from app.shared.models.system import CommonCode, CommonCodeGroup
 
-# 13개 해외연구소 파트 (pk, lab_code, part_code, name, country, sort_order) — 프론트 OV_LABS와 동일.
+# 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order, currency)
+# — 프론트 OV_LABS와 동일.
 # sort_order는 lab_code 단위 표시 순서(같은 lab_code의 파트들은 같은 값) — 탭·집계표가 이 순서로 나온다.
-OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int]] = [
-    ("SARC:CPU", "SARC", "CPU", "SARC+ACL · CPU", "미국", 10),
-    ("SARC:GPU", "SARC", "GPU", "SARC+ACL · GPU (ACL)", "미국", 10),
-    ("DSRA", "DSRA", None, "DSRA", "미국", 20),
-    ("SIRC", "SIRC", None, "SIRC", "이스라엘", 30),
-    ("SSIR", "SSIR", None, "SSIR", "인도", 40),
-    ("SCSC", "SCSC", None, "SCSC", "영국", 50),
-    ("SSCR", "SSCR", None, "SSCR", "중국", 60),
-    ("TDC", "TDC", None, "TDC", "대만", 70),
-    ("DSRJ", "DSRJ", None, "DSRJ", "일본", 80),
-    ("SRPOL", "SRPOL", None, "SRPOL", "폴란드", 90),
-    ("SRR", "SRR", None, "SRR", "러시아", 100),
-    ("CP", "CP", None, "CP", "이스라엘", 110),
-    ("SRCX", "SRCX", None, "SRCX", "중국", 120),
+#
+# currency(현지통화)를 여기 적어 두는 이유: 예전에는 시드가 통화를 아예 안 넣어서 컬럼 기본값 USD로
+# 깔리고, 통화는 마이그레이션(b3f4c91a7d2e)이 국가별 매핑으로 한 번 백필하는 것에만 의존했다.
+# 그러면 "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 USD가 되어 현지통화 연구소의
+# 환차 분해(현지→$ 단계)가 통째로 사라진다. 통화는 환산의 입력이라 시드가 직접 책임져야 한다.
+#
+# 대만(TDC)만 국가 기본값(TWD)이 아니라 USD다 — TDC는 $로 결산하는 연구소라 목업에서도 국가별
+# 기본값을 덮어쓴다(core.js ovLabsSeed의 `r.c==="TDC"?"USD":...`). 국가로 유추하지 말 것.
+OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int, str]] = [
+    ("SARC:CPU", "SARC", "CPU", "SARC+ACL · CPU", "미국", 10, "USD"),
+    ("SARC:GPU", "SARC", "GPU", "SARC+ACL · GPU (ACL)", "미국", 10, "USD"),
+    # CPU+GPU 합산과 별개로 연구소에서 받는 공식 총계 원본값. part_code="TOTAL"은 프론트
+    # ovLabsFromApi가 L.parts 그룹핑에서 제외하므로 OV_ALLPK(전체 집계)에는 안 섞인다 —
+    # "총계" 탭 전용 조회(ovCostView의 totPk)로만 쓰인다.
+    ("SARC:TOTAL", "SARC", "TOTAL", "SARC+ACL · 총계", "미국", 10, "USD"),
+    ("DSRA", "DSRA", None, "DSRA", "미국", 20, "USD"),
+    ("SIRC", "SIRC", None, "SIRC", "이스라엘", 30, "ILS"),
+    ("SSIR", "SSIR", None, "SSIR", "인도", 40, "INR"),
+    ("SCSC", "SCSC", None, "SCSC", "영국", 50, "GBP"),
+    ("SSCR", "SSCR", None, "SSCR", "중국", 60, "CNY"),
+    ("TDC", "TDC", None, "TDC", "대만", 70, "USD"),  # 대만이지만 $ 결산 — 위 주석 참고
+    ("DSRJ", "DSRJ", None, "DSRJ", "일본", 80, "JPY"),
+    ("SRPOL", "SRPOL", None, "SRPOL", "폴란드", 90, "PLN"),
+    ("SRR", "SRR", None, "SRR", "러시아", 100, "RUB"),
+    ("CP", "CP", None, "CP", "이스라엘", 110, "ILS"),
+    ("SRCX", "SRCX", None, "SRCX", "중국", 120, "CNY"),
     # 실제 연구소가 아니라 "원화 기타"처럼 특정 연구소에 속하지 않는 계정 전체 단위 값을
-    # 담기 위한 가상 행. overseas_cost_entries 스키마를 그대로 재사용하기 위함.
-    ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999),
+    # 담기 위한 가상 행. cost_entries 등 공용 테이블의 scope_code를 그대로 재사용하기 위함.
+    ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999, "USD"),
 ]
 
 # 연구소(lab_code)별 워크북 시트 구성. SARC+ACL만 비용 시트 하나고, 나머지는 비용·증감분석·
@@ -67,13 +82,17 @@ ACCOUNTS: list[tuple[str, str, str, str]] = [
 ]
 
 # common_codes.group_code가 참조하는 그룹 레지스트리. (group_code, name, description)
-# VERSION · FX_RATE_TYPE은 이 스크립트가 아니라 다른 경로(/common-codes API 등)로
-# 이미 데이터가 들어가 있던 그룹이라, 그 FK가 깨지지 않도록 그룹 레지스트리에도 같이 등록해둔다.
 CODE_GROUPS: list[tuple[str, str, str]] = [
     (CodeGroup.ACCOUNT_STATUS.value, "계정 진행 상태", "accounts.status에 저장되는 편성 진행 상태 코드"),
     (CodeGroup.OVERSEAS_SHEET_TYPE.value, "해외연구소 시트 종류", "overseas_lab_sheets.sheet_key에 저장되는 워크북 시트 종류"),
-    ("VERSION", "버전", "cost_entries 등의 version 컬럼: cur(당월 속보)·prev(전실행)·prior(전년 실적)·plan(경영계획)"),
-    ("FX_RATE_TYPE", "환율 종류", "fx_rates.rate_type: end(월말환율)·act(실적환율)·cp(CP환율)"),
+    (CodeGroup.OVERSEAS_CATEGORY.value, "해외연구소 비용항목", "cost_entries.category_code(account_code=overseas)에 저장되는 고정 비용항목 코드. 사용자 추가(커스텀) 행은 이 목록 밖의 값을 쓸 수 있다"),
+    (CodeGroup.VERSION_STATUS.value, "버전 진행 상태", "versions.status에 저장되는 속보·실적 버전 진행 상태 코드"),
+    (
+        CodeGroup.OVERSEAS_FX_RULE.value, "해외연구소 환산 환율 기준",
+        "해외연구소 화면이 실적 구간(마감된 달) 환산에 말일(last)·월평균(avg) 중 뭘 쓸지. code='default' "
+        "행의 name이 예외가 없는 모든 달에 적용되는 기본값이고, 특정 달만 다르게 쓸 때는 "
+        "overseas_fx_rule_overrides에 그 연월 행을 넣는다.",
+    ),
 ]
 
 # common_codes(group_code=OVERSEAS_SHEET_TYPE)의 code 값. (code, name, sort_order)
@@ -81,6 +100,66 @@ OVERSEAS_SHEET_TYPE_CODES: list[tuple[OverseasSheetType, str, int]] = [
     (OverseasSheetType.COST, "비용", 10),
     (OverseasSheetType.VARIANCE, "증감분석", 20),
     (OverseasSheetType.VENDOR, "외주용역업체", 30),
+]
+
+# common_codes(group_code=OVERSEAS_CATEGORY)의 code 값. (code, name(한글), description(영문),
+# parent_code, sort_order). 프론트 core.js의 OV_EL과 1:1로 맞춰야 한다 — 늘어나면 여기도 같이 고칠 것
+# (app/mcp_server.py의 COST_CATEGORY_KEYS 하드코딩도 같이 맞춰둔다).
+# A·hr·labor·asset·direct·gen·mgr·itx는 실제 비용이 안 꽂히는 집계 전용 "그룹" 행이다(leaf가 아니라
+# 자식이 있는 행) — cost_entries.category_code로는 못 쓰게 _check_category가 따로 막는다
+# (하위 행이 하나라도 있으면 그룹으로 취급). tot·B·pct는 화면 계산 전용이라(A+B 합계, 비율) 아예
+# 코드를 안 둔다 — parent_code로 계층을 표현할 대상이 없다.
+OVERSEAS_CATEGORY_CODES: list[tuple[str, str, str, str | None, int]] = [
+    ("hc", "인력", "Headcount", None, 10),
+    ("A", "개발비", "Development Expense (A)", None, 20),
+    ("hr", "인원성경비", "HR related", "A", 30),
+    ("labor", "인건비", "Labor Cost", "hr", 40),
+    ("sal", "급여", "Salaries & Wages", "labor", 50),
+    ("bonus", "상여", "Bonus (MBO etc)", "labor", 60),
+    ("welf", "복리후생", "Welfare, Health Insurance", "labor", 70),
+    ("edu", "교육훈련비", "Education & Training Exp", "hr", 80),
+    ("travel", "출장비", "Travel Exp", "hr", 90),
+    ("asset", "자산성경비", "Asset related Exp", "A", 100),
+    ("dep", "감가상각비", "Depreciation Exp", "asset", 110),
+    ("amort", "무형자산상각", "Amortization Exp", "asset", 120),
+    ("rent", "임차료", "Rent Exp", "asset", 130),
+    ("repair", "수선비", "Repair & Maintenance Exp", "asset", 140),
+    ("ins", "보험료", "Insurance Exp", "asset", 150),
+    ("direct", "직접개발비", "Direct R&D Exp", "A", 160),
+    ("supp", "개발소모품비", "Product Supplies Exp", "direct", 170),
+    ("test", "인증테스트비", "Test Exp", "direct", 180),
+    ("ord", "경상연구비", "Ordinary R&D Exp", "direct", 190),
+    ("gen", "일반운영비", "General Operation Exp", "A", 200),
+    ("comm", "지급수수료", "Commission & Service Exp", "gen", 210),
+    ("it", "전산비", "IT Expense", "gen", 220),
+    ("cons", "일반소모품", "Consumable Supplies Expense", "gen", 230),
+    ("util", "수도광열비", "Light&Fuel Exp", "gen", 240),
+    ("car", "차량유지비", "Car R&M Exp", "gen", 250),
+    ("tel", "통신비", "Telecom Exp", "gen", 260),
+    ("pub", "도서인쇄비", "Publishing Exp", "gen", 270),
+    ("oth", "잡비", "others", "gen", 280),
+    ("mgr", "통제성경비", "Managerial Exp", "A", 290),
+    ("conv", "회의비", "Convention Exp", "mgr", 300),
+    ("event", "행사비", "Event Exp", "mgr", 310),
+    ("social", "교제비", "Social Exp", "mgr", 320),
+    ("misc", "기타경비", "Misc.", "A", 330),
+    ("tax", "조세공과", "Taxes and Duties", "A", 340),
+    ("nonop", "영업외수지", "Non-operational", "A", 350),
+    ("itx", "IT 관련 비용", "IT Expenses", None, 360),
+    ("eda", "EDA Tool", "EDA Tool", "itx", 370),
+    ("emu", "Emulator", "Emulator", "itx", 380),
+    ("swl", "SW/License구매", "SW/License Purchase", "itx", 390),
+    ("svr", "SVR/Storage임대", "Rent for SVR/Storage", "itx", 400),
+    ("itoth", "기타(IT)", "Other IT Expenses", "itx", 410),
+    ("outs", "외주용역비", "Outsourcing Expense(Only for R&D)", None, 420),
+]
+
+# versions.status가 가리키는 공통코드. (code, name, sort_order) — not_started(예정)는 실제로는
+# 저장되지 않는 값이지만(행이 없으면 예정), 화면 라벨·셀렉트 옵션으로 쓰려고 같이 둔다.
+VERSION_STATUS_CODES: list[tuple[VersionStatus, str, int]] = [
+    (VersionStatus.NOT_STARTED, "예정", 1),
+    (VersionStatus.DRAFTING, "작성중", 2),
+    (VersionStatus.DONE, "완료", 3),
 ]
 
 # accounts.status가 가리키는 공통코드. (code, name, sort_order) — 프론트 ALL_ST와 동일 순서.
@@ -152,12 +231,13 @@ def seed(db: Session) -> None:
             db.add(AccountProgress(account_id=acct.id, current_step_order=1))
 
     existing_labs = {lab.pk for lab in db.query(OverseasLab).all()}
-    for pk, lab_code, part_code, name, country, sort_order in OVERSEAS_LABS:
+    for pk, lab_code, part_code, name, country, sort_order, currency in OVERSEAS_LABS:
         if pk in existing_labs:
             continue
         db.add(
             OverseasLab(
-                pk=pk, lab_code=lab_code, part_code=part_code, name=name, country=country, sort_order=sort_order
+                pk=pk, lab_code=lab_code, part_code=part_code, name=name, country=country,
+                sort_order=sort_order, currency=currency,
             )
         )
 
@@ -174,12 +254,19 @@ def seed(db: Session) -> None:
         db.add(CommonCodeGroup(group_code=group_code, name=name, description=description))
     db.flush()  # common_codes가 FK로 참조하기 전에 그룹부터 반영
 
-    existing_codes = {
-        (c.group_code, c.code)
+    existing_code_rows = {
+        (c.group_code, c.code): c
         for c in db.query(CommonCode).filter(
-            CommonCode.group_code.in_([CodeGroup.ACCOUNT_STATUS.value, CodeGroup.OVERSEAS_SHEET_TYPE.value])
+            CommonCode.group_code.in_(
+                [
+                    CodeGroup.ACCOUNT_STATUS.value, CodeGroup.OVERSEAS_SHEET_TYPE.value,
+                    CodeGroup.OVERSEAS_CATEGORY.value, CodeGroup.VERSION_STATUS.value,
+                    CodeGroup.OVERSEAS_FX_RULE.value,
+                ]
+            )
         ).all()
     }
+    existing_codes = set(existing_code_rows)
     for code, name, sort_order in ACCOUNT_STATUS_CODES:
         if (CodeGroup.ACCOUNT_STATUS.value, code.value) in existing_codes:
             continue
@@ -192,6 +279,29 @@ def seed(db: Session) -> None:
         db.add(
             CommonCode(group_code=CodeGroup.OVERSEAS_SHEET_TYPE.value, code=code.value, name=name, sort_order=sort_order)
         )
+    for code, name, description, parent_code, sort_order in OVERSEAS_CATEGORY_CODES:
+        existing_row = existing_code_rows.get((CodeGroup.OVERSEAS_CATEGORY.value, code))
+        if existing_row is not None:
+            existing_row.parent_code = parent_code
+            existing_row.sort_order = sort_order
+            continue
+        db.add(
+            CommonCode(
+                group_code=CodeGroup.OVERSEAS_CATEGORY.value, code=code, name=name,
+                description=description, parent_code=parent_code, sort_order=sort_order,
+            )
+        )
+    for code, name, sort_order in VERSION_STATUS_CODES:
+        if (CodeGroup.VERSION_STATUS.value, code.value) in existing_codes:
+            continue
+        db.add(
+            CommonCode(group_code=CodeGroup.VERSION_STATUS.value, code=code.value, name=name, sort_order=sort_order)
+        )
+
+    # 해외연구소 환산 환율 기준의 기본값 — 월 단위 예외(overseas_fx_rule_overrides)가 없는 모든 달이
+    # 이 값을 쓴다. 이 행이 있어야 "지금 기준이 뭐냐"의 답이 코드가 아니라 DB에 남는다.
+    if (CodeGroup.OVERSEAS_FX_RULE.value, "default") not in existing_codes:
+        db.add(CommonCode(group_code=CodeGroup.OVERSEAS_FX_RULE.value, code="default", name="last", sort_order=10))
 
     db.commit()
 

@@ -5,9 +5,9 @@ from sqlalchemy import pool
 
 from alembic import context
 
-from app.core.config import settings
+from app.shared.core.config import settings
 from app.db.session import Base
-from app import models  # noqa: F401  (모델을 여기서 import해야 autogenerate가 테이블을 인식함)
+from app.db import models_registry  # noqa: F401  (모델을 여기서 import해야 autogenerate가 테이블을 인식함)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

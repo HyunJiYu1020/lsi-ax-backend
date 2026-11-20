@@ -35,6 +35,25 @@ uv run alembic upgrade head
 uv run python -m app.db.seed
 ```
 
+해외연구소 편성의 "증감사유 · 외주용역" 시트는 화면 확인용 예시 데이터를 따로 만든다 — 비용 시트
+(`cost_entries`)의 금액에서 사유 문장과 외주용역 상세(업체·과제별 월 금액)를 만들어 채우므로,
+비용 데이터가 먼저 들어 있어야 한다. 재실행하면 같은 값으로 다시 채운다(결정적).
+
+```bash
+uv run python -m app.db.seed_overseas_sheets
+```
+
+## 버전 값 체계 (주의)
+
+같은 "버전"인데 테이블마다 값이 다르다 — 섞어 쓰면 조회가 비게 된다.
+
+- `cost_entries` · `extra_cols`: `forecast`(속보) | `actual`(실적) + `yyyymm`(편성 기준 연월)
+- `overseas_reason_rows` · `overseas_vendor_rows` · `uploads` · `memo_cols` · `memos` · `notes` ·
+  `sheet_rows`: `cur`(당월 속보) | `prev`(전실행) | `prior`(전년 실적) | `plan`(경영계획)
+
+프론트는 화면 상태로 `cur/prev/prior/plan`을 쓰고, 비용 API를 부를 때만 `ovVerApi`/`ovYyyymmApi`로
+`forecast|actual` + `yyyymm`으로 바꿔 보낸다. 챗봇도 같은 규칙을 프롬프트로 지시받는다.
+
 ## Docker로 전체(API + Postgres) 띄우기
 
 프로젝트 루트에서:
@@ -45,18 +64,49 @@ docker compose up --build
 
 ## 구성
 
-- `app/main.py` — FastAPI 앱 생성, CORS, 전역 예외 핸들러(500은 `error_logs`에 기록), 라우터 등록
-- `app/core/config.py` — 환경변수 설정 (pydantic-settings)
-- `app/db/session.py` — SQLAlchemy engine/세션, `Base`
-- `app/db/seed.py` — 초기 데이터 시드 스크립트
-- `app/api/v1/` — API 라우터: `overseas`(해외연구소), `fx`(전사 공통 환율), `plan`(경영계획 버전),
-  `system`(공통코드·에러로그), `chat`(AI 플로팅 채팅), `health`
-- `app/mcp_server.py` — MCP 도구 세트. 외부 MCP 클라이언트와 `chat.py` 양쪽에서 재사용 (CONNECTIONS.md 4절)
-- `app/models/` — SQLAlchemy 모델: `account`(19개 계정), `common`(19개 계정 공유 범용 테이블:
-  `cost_entries`/`cost_entry_months`/`custom_rows`/`memo_cols`/`memos`/`notes`/`sheet_rows`/`uploads`),
-  `overseas`(해외연구소 전용), `fx`(전사 공통 환율 3종 + 적용환율 캐시), `plan`(경영계획 버전),
-  `system`(공통코드·에러로그), `user`
-- `alembic/` — DB 마이그레이션
+경로가 **공통인가 한 계정 전용인가**를 말해 준다. 계정이 10개 이상 추가될 예정이라, 파일을 열어
+보지 않고 그걸 알 수 있어야 해서 이렇게 갈랐다. 의존 방향은 한쪽이다 — `accounts` → `shared`.
+
+```
+app/
+├── shared/                     전 계정 공용
+│   ├── core/                   순수 로직 — DB도 HTTP도 모른다
+│   │   periods values config enums storage
+│   │   anomaly(이상 감지) row_match(행 이름 매칭)
+│   │   voucher_match(전표 매핑) reason_translate(번역) chat_prompts
+│   ├── models/                 common(19계정 공유 비용·메모·업로드) generic(범용 7개:
+│   │                           row_aliases·carry_defs·anomaly_rules·variance_* 등)
+│   │                           close(실적결산) fx account plan version user system
+│   ├── schemas/                close cost fx account plan version system
+│   ├── services/               fx_rates(적용 환율 계산)
+│   └── endpoints/              cost fx account plan version system health chat
+│
+├── accounts/
+│   └── overseas/               해외연구소 전용
+│       ├── endpoints/          collect(취합·기준정보·행/열) variance(증감분석)
+│       │                       aggregate(집계·확정 사전점검) close(실적결산)
+│       ├── services/           labs entries(+분기·연간 재계산) fxcalc aggregate
+│       │                       extra_rows state variance vendor cp reason_rows
+│       ├── models.py  schemas.py
+│       └── cost_groups.py      이 계정의 비용 계정 트리(집계 그룹 정의)
+│
+├── api/v1/router.py            라우터 등록 (공통 + 계정별)
+├── db/                         session(engine·Base) seed seed_overseas_sheets
+│                               models_registry(alembic autogenerate용 모델 일괄 import)
+├── main.py                     FastAPI 앱, CORS, 전역 예외 핸들러(500 → error_logs)
+└── mcp_server.py               MCP 도구 세트 — 외부 MCP 클라이언트와 chat.py 양쪽에서 재사용
+```
+
+레이어 규칙: `endpoints`는 HTTP 입출력만(파라미터 검증 → services 호출 → 응답 변환),
+`services`는 DB를 알지만 HTTP를 모르고, `core`는 둘 다 모르는 순수 함수다. 엔드포인트끼리는
+서로 import하지 않는다 — 공유가 필요하면 services로 올린다.
+
+계정을 추가할 때: `app/accounts/<계정>/`과 `tests/<계정>/` 두 폴더를 만들고,
+`app/db/models_registry.py`에 그 계정 models를 한 줄 추가한다(빠뜨리면 alembic이 그 테이블을
+"삭제됨"으로 보고 drop 마이그레이션을 만든다).
+
+- `alembic/` — DB 마이그레이션. `alembic check`로 모델과 DB가 어긋났는지 본다(지금은 깨끗)
+- `tests/` — `shared/`와 `overseas/`로 같이 갈려 있다. `tests/README.md` 참고
 
 ## 참고
 
