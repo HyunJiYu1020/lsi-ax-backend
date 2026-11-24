@@ -1,7 +1,7 @@
-"""집계 ① 전체 계정 표 조회 API — PLAN.md Phase 6(수식 백엔드 단일화).
+"""집계 ① 전체 계정 표 조회 API.
 
-같은 수식이 core.js와 백엔드 두 곳에 복제돼 있어서 한 곳만 고치면 화면 숫자와 챗봇
-숫자가 달라졌다. 이 API는 백엔드가 계산해서 표를 그대로 내려주므로 프런트는 표시만 하면 된다.
+같은 수식이 core.js와 백엔드 두 곳에 있으면 한 곳만 고쳤을 때 화면 숫자와 챗봇 숫자가
+달라진다. 이 API는 백엔드가 계산해서 표를 그대로 내려주므로 프런트는 표시만 하면 된다.
 
 수식 자체가 프런트와 같은지는 test_formula_crosscheck.py가 45행 × 17칸을 전수 대조한다.
 여기서는 **엔드포인트 계약**(행 구성·단위·범위·거부)을 고정한다.
@@ -124,7 +124,11 @@ def test_default_is_still_the_latest_forecast(db):
 def test_base_versions_resolve_like_the_variance_screen(db):
     """version=prev는 "전실행"이고, 그게 무엇인지는 증감분석과 같은 층(resolve_bases)이 푼다 —
     두 화면이 다르게 풀면 같은 자리에서 다른 숫자가 나온다."""
-    prev = get_aggregate_table(basis_year=BASIS_YEAR, version="prev", mode="usd", db=db)
+    # 기준월을 적어 준다 — 안 적으면 "DB의 최신 속보월"로 떨어져서, 속보가 하나 더 들어오는
+    # 것만으로 이 테스트가 다른 버전을 비교하게 된다(26.10 속보가 생겼을 때 실제로 그랬다).
+    prev = get_aggregate_table(
+        basis_year=BASIS_YEAR, basis_month=9, kind="forecast", version="prev", mode="usd", db=db
+    )
     same = get_aggregate_table(basis_year=BASIS_YEAR, basis_month=8, kind="actual", mode="usd", db=db)
 
     # 26.09 속보의 전실행 = 26.08 실적. kind는 "읽은 버전"의 종류라 actual이다.

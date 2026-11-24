@@ -127,11 +127,12 @@ def test_labor_ratio_default_is_the_latest_forecast(db):
 
 
 def test_labor_ratio_uses_the_same_materials_as_the_aggregate_table(db):
-    """인건비율과 집계표가 같은 재료(_table_inputs)를 쓴다 — 연구소 추리기·추가 행·환율 규칙이
+    """인건비율과 집계표가 같은 재료(table_inputs)를 쓴다 — 연구소 추리기·추가 행·환율 규칙이
     갈리면 같은 화면의 두 숫자가 다른 분모를 쓴다."""
-    from app.accounts.overseas.endpoints.aggregate import _table_inputs, get_labor_ratio
+    from app.accounts.overseas.endpoints.aggregate import get_labor_ratio
+    from app.accounts.overseas.services.versions import table_inputs
 
-    inp = _table_inputs(db, BASIS_YEAR, "cur", False, 9, "forecast")
+    inp = table_inputs(db, BASIS_YEAR, "cur", False, 9, "forecast")
     r = get_labor_ratio(basis_year=BASIS_YEAR, basis_month=9, kind="forecast", db=db)
 
     # 비율이 나온 연구소는 모두 집계표가 세는 연구소 안에 있어야 한다.

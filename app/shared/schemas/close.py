@@ -25,6 +25,7 @@ class VoucherLine(BaseModel):
     fc_amount: float = 0
     krw_amount: float = 0
     ref_no: str = ""
+    assignment: str = ""  # ERP 지정(Assignment). 안 주면 빈 문자열
 
 
 class VoucherOut(VoucherLine):
@@ -86,10 +87,12 @@ class MatchRuleOut(BaseModel):
     account_key: str
     match_field: str
     match_value: str
+    match_op: str = ""  # "" = 필드별 기본(text는 contains, 나머지 equals)
     scope_key: str = ""
     excluded: bool = False
     hit_count: int = 0
     note: str = ""
+    rejected: bool = False
     created_at: str = ""
 
 
@@ -97,12 +100,16 @@ class MatchRuleIn(BaseModel):
     """규칙 등록 = "앞으로 이렇게" 승인. 승인 없이 서버가 규칙을 만들지 않는다."""
 
     account_key: str = "overseas"
-    match_field: str  # vendor | text | cost_center | project
+    match_field: str  # vendor | text | cost_center | project | assignment
     match_value: str
+    match_op: str = ""  # "" | equals | contains | starts_with
     scope_key: str = ""
     excluded: bool = False
     hit_count: int = 0
     note: str = ""
+    # True면 "[닫기] — 이 제안은 규칙으로 만들지 않는다"를 저장한다. 규칙으로 쓰이지 않고, 같은
+    # 제안이 다음 조회에 다시 뜨지 않게만 한다(TC-085).
+    rejected: bool = False
     # True면 등록과 동시에 이 연월의 미매핑·AI 추천 전표에 규칙을 적용한다(담당자 수정은 건드리지 않는다).
     apply_basis_year: int | None = None
     apply_basis_month: int | None = None

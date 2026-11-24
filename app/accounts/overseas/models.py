@@ -114,13 +114,20 @@ class OverseasReasonRow(Base):
 
     __tablename__ = "overseas_reason_rows"
     __table_args__ = (
-        UniqueConstraint("lab_code", "version", "category_key", "block", name="uq_overseas_reason_rows_key"),
-        {"comment": "해외연구소 증감사유 업로드(연구소×버전×비용항목×구간). PLAN·전기·당기 비교값과 사유 텍스트."},
+        UniqueConstraint("lab_code", "yyyymm", "category_key", "block", name="uq_overseas_reason_rows_key"),
+        CheckConstraint(r"yyyymm ~ '^\d{6}$'", name="ck_overseas_reason_rows_yyyymm_format"),
+        {"comment": "해외연구소 증감사유 업로드(연구소×버전×기준월×비용항목×구간). PLAN·전기·당기 비교값과 사유 텍스트."},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     lab_code: Mapped[str] = mapped_column(String(10), comment="연구소 코드(overseas_labs.lab_code, 파트 없이 — SARC는 CPU+GPU 합계)")
-    version: Mapped[str] = mapped_column(String(10), comment="cur(당월 속보) | prev(전실행) | prior(전년 실적) | plan(경영계획)")
+    version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
+    # 어느 달 회신인지. version(역할값)만으로는 월을 알 수 없어 읽는 쪽이 "DB의 가장 최근 속보월
+    # 것"이라고 짐작하게 되고, 그러면 9월에 올린 증감사유가 10월 자료로 잡혀 9월 업로드 현황이
+    # '미'로 남는다. 비용(cost_entries.yyyymm)과 같은 기준을 쓴다.
+    yyyymm: Mapped[str] = mapped_column(
+        String(6), default="", comment='이 회신이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    )
     category_key: Mapped[str] = mapped_column(String(40), comment="비용항목 키")
     block: Mapped[str] = mapped_column(String(1), comment="y(연간 블록) | m(월별 블록)")
     mon_label: Mapped[str] = mapped_column(String(10), default="", comment="월별 블록일 때의 월 라벨(파일 머리글 원문)")
@@ -208,13 +215,18 @@ class OverseasVendorRow(Base):
 
     __tablename__ = "overseas_vendor_rows"
     __table_args__ = (
-        UniqueConstraint("lab_code", "version", "row_no", name="uq_overseas_vendor_rows_key"),
-        {"comment": "해외연구소 외주용역 업로드(연구소×버전×행). 월별 금액은 overseas_vendor_row_details 참조."},
+        UniqueConstraint("lab_code", "yyyymm", "row_no", name="uq_overseas_vendor_rows_key"),
+        CheckConstraint(r"yyyymm ~ '^\d{6}$'", name="ck_overseas_vendor_rows_yyyymm_format"),
+        {"comment": "해외연구소 외주용역 업로드(연구소×버전×기준월×행). 월별 금액은 overseas_vendor_row_details 참조."},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     lab_code: Mapped[str] = mapped_column(String(10), comment="연구소 코드(overseas_labs.lab_code, 파트 없이 — SARC는 CPU+GPU 합계)")
-    version: Mapped[str] = mapped_column(String(10), comment="cur(당월 속보) | prev(전실행) | prior(전년 실적) | plan(경영계획)")
+    version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
+    # 증감사유와 같은 이유로 둔 컬럼이다(OverseasReasonRow.yyyymm 주석 참고).
+    yyyymm: Mapped[str] = mapped_column(
+        String(6), default="", comment='이 회신이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    )
     row_no: Mapped[int] = mapped_column(SmallInteger, comment="업로드한 시트 안에서의 행 순서(1부터)")
     category: Mapped[str] = mapped_column(String(50), default="", comment="Category(외주용역 구분)")
     project: Mapped[str] = mapped_column(String(100), default="", comment="Project name(과제명)")
@@ -291,3 +303,52 @@ class OverseasActualFirstRow(Base):
     )
 
 
+
+
+class OverseasCostHeader(Base):
+    """연구소가 보낸 비용 시트의 **기간 열 머리글 원문**(1월…12월 · 1Q~4Q · 연간).
+
+    왜 저장하나: 취합 › 비용 표는 연구소 파일 하나를 그대로 비춰 보는 자리인데, 열 이름은 화면
+    코드가 만든 글자("1월")였다. 연구소가 "'26.1월 실적" · "M2601A" · "202601"처럼 적어 보내면
+    담당자가 보는 표와 연구소 보고서의 머리글이 달라져서, 어느 열이 파일의 어느 열인지 눈으로
+    맞춰야 했다. 증감사유(overseas_reason_rows)가 prev_label · cur_label · mon_label로 "파일
+    머리글 원문"을 이미 저장하는 것과 같은 이유다.
+
+    집계·증감분석 표에는 쓰지 않는다 — 18개 연구소를 합친 표라 파일마다 머리글이 다르면 어느
+    것을 대표로 쓸지 정할 수 없고, 한 연구소가 머리글을 바꿔 보내면 합친 표의 머리글이 그 달에만
+    바뀐다. 그 표들은 지금처럼 버전이 정하는 머리글을 쓴다(프론트 ovActualThru).
+
+    lab_pk는 파트까지 포함한 연구소 키("SARC:CPU")다 — 증감사유·외주용역과 달리 비용 시트는
+    파트 단위로 올라오고, 취합 화면도 파트별로 표를 그린다.
+
+    업로드 한 번이 그 시트의 머리글 전체를 **교체**한다(외주용역 행과 같은 방식) — 파일마다 열
+    구성 자체가 달라질 수 있어서 열별 upsert로는 지난 업로드의 열이 남는다.
+    """
+
+    __tablename__ = "overseas_cost_headers"
+    __table_args__ = (
+        UniqueConstraint("lab_pk", "version", "yyyymm", "col_key", name="uq_overseas_cost_headers_key"),
+        CheckConstraint("version IN ('forecast', 'actual')", name="ck_overseas_cost_headers_version"),
+        CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_overseas_cost_headers_yyyymm_format"),
+        CheckConstraint(r"col_key ~ '^(m[1-9][0-9]?|q[1-4]|y)$'", name="ck_overseas_cost_headers_col_key"),
+        {
+            "comment": "연구소 비용 시트의 기간 열 머리글 원문(연구소×버전×기준월×열). 취합 비용 표가 "
+            "코드가 만든 '1월' 대신 이 글자를 그대로 보여준다. 집계·증감분석 표는 쓰지 않는다."
+        },
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    lab_pk: Mapped[str] = mapped_column(
+        String(20), comment="연구소 식별 키(overseas_labs.pk — 파트까지, 예 \"SARC:CPU\")"
+    )
+    version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
+    yyyymm: Mapped[str] = mapped_column(
+        String(6), comment='이 파일이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    )
+    col_key: Mapped[str] = mapped_column(
+        String(10),
+        comment='열 자리. "m1".."m12"는 월(기간을 12개월 너머로 받으면 "m13"…), "q1".."q4"는 분기, "y"는 연간',
+    )
+    label: Mapped[str] = mapped_column(String(100), comment="파일 머리글 글자 그대로(예 \"'26.1월 실적\")")
+    source_file: Mapped[str] = mapped_column(String(255), default="", comment="이 머리글을 읽어 온 원본 파일명")
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -39,11 +39,22 @@ def test_other_tools_are_untouched():
     assert _anchor_missing_hint("upsert_extra_col", {"col_key": "q1"}) is None
 
 
-def test_write_block_hint_is_the_single_entry_point():
-    """공급자별 턴 루프가 검사를 따로 호출하면 한쪽만 고치고 다른 쪽을 빼먹는다 — 입구는 하나다."""
+def test_write_block_hint_is_the_single_entry_point(db):
+    """공급자별 턴 루프가 검사를 따로 호출하면 한쪽만 고치고 다른 쪽을 빼먹는다 — 입구는 하나다.
+
+    db를 받는 이유: 검사 중 하나(지침 중복 확인)가 저장된 지침을 봐야 한다. 세션을 안 받는
+    기본값으로 두면 그 검사만 조용히 건너뛰는 일이 생겨서, 입구에서 아예 요구한다."""
     # 자리 미지정(이 검사)
-    assert _write_block_hint("upsert_extra_row", ROW, {"step": "취합"}) is not None
+    assert _write_block_hint("upsert_extra_row", ROW, {"step": "취합"}, db) is not None
     # 파생 행을 '집계'가 아닌 탭에서 만들려는 경우(기존 검사)도 같은 입구로 걸린다
     derived = {**ROW, "is_derived": True, "anchor_key": "itx"}
-    assert _write_block_hint("upsert_extra_row", derived, {"step": "취합"}) is not None
-    assert _write_block_hint("upsert_extra_row", derived, {"step": "집계"}) is None
+    assert _write_block_hint("upsert_extra_row", derived, {"step": "취합"}, db) is not None
+    assert _write_block_hint("upsert_extra_row", derived, {"step": "집계"}, db) is None
+    # 지침 중복 확인도 같은 입구로 걸린다 — 검사가 늘어도 턴 루프는 한 줄만 부른다
+    from app.shared.endpoints.guideline import upsert_guideline
+    from app.shared.schemas.guideline import GuidelineIn
+
+    upsert_guideline(GuidelineIn(topic="금액 단위", text="금액은 억원으로 쓴다"), db)
+    dup = {"topic": "금액 표기", "text": "금액은 백만원으로 쓴다"}
+    assert _write_block_hint("upsert_guideline", dup, {}, db) is not None
+    assert _write_block_hint("upsert_guideline", {**dup, "confirm_new_topic": True}, {}, db) is None

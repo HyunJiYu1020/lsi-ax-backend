@@ -21,7 +21,6 @@ from app.accounts.overseas.services.entries import (
     current_basis_yyyymm,
     entry_months_bulk,
     get_or_create_entry,
-    resync_summaries,
     upsert_entry_months,
 )
 from app.accounts.overseas.services.extra_rows import check_lab_pk, check_version
@@ -65,8 +64,9 @@ def merge_rows(db: Session, body: RowMergeIn) -> RowMergeResult:
     되돌릴 수 없는 작업이라(원본 행이 cascade로 디테일까지 지워진다) dry_run=True가 기본이다.
     호출부가 먼저 미리보기로 보여주고 사람 확인을 받은 뒤 dry_run=False로 다시 부른다.
 
-    합친 뒤 분기·연간을 반드시 재계산한다(resync_summaries) — upsert_entry_months는 MONTH 행만
-    쓰기 때문에, 이걸 빼면 월은 맞고 분기·연간은 합치기 전 값에 멈춘다.
+    분기·연간(QUARTER/YEAR)은 만들지 않는다 — 저장은 연구소가 적어 보낸 칸만 담고, 보는 쪽이 월에서
+    계산한다(services/entries.bulk_upsert_cost_entries 주석). 합친 행에 그 칸이 저장돼 있었고 월 합과
+    안 맞게 되면 업로드 미리보기가 색으로 알린다(anomaly: period_mismatch).
     """
     version = check_version(body.version)
     if len(body.yyyymm) != 6 or not body.yyyymm.isdigit():
@@ -121,7 +121,6 @@ def merge_rows(db: Session, body: RowMergeIn) -> RowMergeResult:
 
     preview: list[RowMergePreview] = []
     base_year = ym_year(body.yyyymm)
-    touched: set[tuple[int, int]] = set()
     removed = 0
 
     for scope, rows in by_scope.items():
@@ -161,9 +160,6 @@ def merge_rows(db: Session, body: RowMergeIn) -> RowMergeResult:
             if target.anchor_key is None:
                 target.anchor_key = next((e.anchor_key for e in rows if e.anchor_key), None)
         upsert_entry_months(db, target_id, base_year, merged)
-        touched.add((target_id, base_year))
-        for i in range(1, (width // 12)):
-            touched.add((target_id, base_year + i))
         db.execute(delete(CostEntry).where(CostEntry.id.in_([e.id for e in rows])))
         removed += len(rows)
 
@@ -178,8 +174,9 @@ def merge_rows(db: Session, body: RowMergeIn) -> RowMergeResult:
         )
         return result
 
-    # 분기·연간을 다시 계산한다. 빼먹으면 월은 맞는데 분기·연간이 합치기 전 값에 멈춘다.
-    resync_summaries(db, touched)
+    # 분기·연간은 다시 계산하지 않는다 (2026-11-24) — 저장은 연구소가 적어 보낸 칸만 담고, 보는
+    # 쪽이 월에서 계산한다(services/entries.bulk_upsert_cost_entries 주석). 합친 뒤 저장된 분기 칸이
+    # 월 합과 안 맞으면 업로드 미리보기가 색으로 알린다(anomaly: period_mismatch).
     # 값이 바뀌었으니 확정은 거짓이 된다 — 화면의 ovUnconfirm과 같은 처리를 서버도 한다.
     result.unconfirmed = unconfirm_account(db, body.yyyymm, version, ACCOUNT_KEY)
     db.commit()

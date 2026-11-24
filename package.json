@@ -1,0 +1,11 @@
+{
+  "name": "slsi-backend-test-tools",
+  "private": true,
+  "description": "테스트가 쓰는 node 도구. 앱 코드는 전부 파이썬이고, 여기 의존성은 pytest가 프런트(frontend-html)를 실제로 띄워 확인할 때만 쓴다 — tests/overseas/screens_harness.mjs · js_formula_harness.mjs.",
+  "devDependencies": {
+    "playwright": "1.49.1"
+  },
+  "scripts": {
+    "postinstall": "playwright install chromium"
+  }
+}

@@ -1,6 +1,6 @@
 """해외연구소 증감분석 화면의 HTTP 엔드포인트 — 파라미터 검증 → services 호출 → 응답.
 
-계산·판정은 app/services/overseas/variance.py에 있다(PLAN.md P1-1). 여기 남은 건 라우트 핸들러
+계산·판정은 app/services/overseas/variance.py에 있다. 여기 남은 건 라우트 핸들러
 14개뿐이다 — 다른 화면(집계·결산)이 이 모듈의 내부 이름을 꺼내 쓰던 걸 끊기 위해 갈랐다.
 """
 
@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.accounts.overseas.cost_groups import CATEGORY_LABELS, CATEGORY_LABELS_EN, VARIANCE_ROWS, resolve_leaves
+from app.shared.core.guidelines import guide_fingerprint, guidelines_text
 from app.shared.core.periods import PERIOD_IX, month_value, yyyymm
 from app.shared.core.values import n, source_hash
 from app.accounts.overseas.services.entries import current_basis_month, entry_months_bulk, plan_entry_months_bulk
@@ -47,6 +48,7 @@ from app.accounts.overseas.schemas import (
     VarianceDriverIn,
     VarianceDriverOut,
     VarianceDriverRow,
+    VarianceLabsResult,
     VarianceReasonCheck,
     VarianceReasonDraftIn,
     VarianceReasonDraftResult,
@@ -58,9 +60,11 @@ from app.accounts.overseas.schemas import (
     VarianceRow,
 )
 from app.accounts.overseas.services.variance import (
+    compute_variance_labs,
     compute_variance_table,
     compute_reason_check,
     BASE_LABELS,
+    DEFAULT_REASON_THRESHOLD_AMOUNT,
     DEFAULT_REASON_THRESHOLD_PCT,
     DRIVER_OPS,
     GROUP_KEYS,
@@ -99,7 +103,7 @@ from app.accounts.overseas.services.variance import (
     scope_pks,
     stage_out,
     stage_row,
-    to_kdollar,
+    to_dollar,
     variance_cells,
     variance_rows,
     visible_drivers,
@@ -168,18 +172,42 @@ def get_variance_table(
 ) -> VarianceTable:
     """증감분석 화면 표 전체 — 17기간(월 12 + 분기 4 + 연간) × 계정 전부를 한 번에.
 
-    PLAN.md Phase 6(수식 백엔드 단일화). 화면은 이 표를 그리기만 한다.
+    (수식 백엔드 단일화). 화면은 이 표를 그리기만 한다.
     기간을 하나씩 받는 `/overseas/variance`는 그대로 둔다 — 챗봇이 "SARC 인건비 왜 늘었어?"에
     답할 때는 기간 하나만 필요하고, 17기간을 다 계산해 보낼 이유가 없다.
 
     둘은 같은 함수(`variance_cells`)를 쓴다 — 쓰기 규칙이 두 벌이 되면 화면과 챗봇이 다른 숫자를
-    말하게 된다(P1-3에서 겪은 그 문제다)."""
+    말하게 된다."""
     check_kind(kind)
     month = basis_month or current_basis_month(db) or 1
     check_stage(stage, kind)
     return compute_variance_table(
         db, basis_year, month, kind, base_version, lab_scope, plan_no, stage
     )
+
+
+@router.get("/overseas/variance-labs", response_model=VarianceLabsResult)
+def get_variance_labs(
+    basis_year: int,
+    base_version: str = "prev",
+    basis_month: int | None = None,
+    kind: str = "forecast",
+    plan_no: str | None = None,
+    stage: str = "",
+    db: Session = Depends(get_db),
+) -> VarianceLabsResult:
+    """증감분석 **연구소별 요약** 표 — 17기간 × 연구소를 한 번에.
+
+    계정별 표(`/overseas/variance-table`)와 축이 반대인 짝이다. 두 표가 같은 화면에 같이 떠 있어서,
+    한쪽만 서버가 계산하면 같은 자리에서 다른 숫자가 나온다 — 이 표가 브라우저 계산으로 남아 있던
+    동안 실제로 연간 개발비가 25억 벌어져 있었다.
+
+    lab_scope를 받지 않는다: 이 표는 **연구소가 행**이라 전부 필요하다(한 곳만 보려면 그 줄을
+        고르면 된다). 전체 합계는 맨 윗줄(is_total)로 같이 내려간다."""
+    check_kind(kind)
+    month = basis_month or current_basis_month(db) or 1
+    check_stage(stage, kind)
+    return compute_variance_labs(db, basis_year, month, kind, base_version, plan_no, stage)
 
 
 @router.get("/overseas/variance-reasons", response_model=list[VarianceReasonOut])
@@ -269,6 +297,33 @@ def upsert_variance_reason(body: VarianceReasonIn, db: Session = Depends(get_db)
     return reason_out(row, current_diff)
 
 
+# 담당자가 AI 초안을 실제로 어떻게 고쳐 썼는지 몇 건 뽑아 다음 초안의 예시로 넘긴다(AI-18 수정 반영).
+# 말로 등록하는 지침(guidelines)과 하는 일이 다르다 — 지침은 "환율 변동폭을 넣어라"처럼 담당자가
+# 의식해서 말할 수 있는 것이고, 이건 "매번 같은 식으로 고치지만 말로 적어 본 적은 없는" 말투·생략
+# 습관을 전한다. 둘 다 넘기는 이유가 그것이다.
+#
+# 초안과 확정 문장이 같은 건(담당자가 그대로 쓴 것)은 제외한다 — 고친 게 없으면 배울 것도 없고,
+# 예시 자리를 차지해서 실제로 고친 사례가 밀려난다.
+PAST_EDIT_LIMIT = 5
+
+
+def past_draft_edits(db: Session, account_key: str, limit: int = PAST_EDIT_LIMIT) -> list[tuple[str, str]]:
+    """(AI 초안, 담당자 확정 문장) 쌍을 최근 저장 순으로 돌려준다."""
+    rows = db.execute(
+        select(VarianceReason.ai_draft, VarianceReason.reason_text)
+        .where(
+        VarianceReason.account_key == account_key,
+        VarianceReason.ai_draft != "",
+        VarianceReason.reason_text != "",
+        VarianceReason.reason_text != VarianceReason.ai_draft,
+        VarianceReason.saved_at.is_not(None),
+        )
+        .order_by(VarianceReason.saved_at.desc())
+        .limit(limit)
+        ).all()
+    return [(draft, final) for draft, final in rows]
+
+
 @router.post("/overseas/variance-reason-draft", response_model=VarianceReasonDraftResult)
 async def make_variance_reason_draft(
     body: VarianceReasonDraftIn, db: Session = Depends(get_db)
@@ -290,24 +345,36 @@ async def make_variance_reason_draft(
     provider = resolve_provider(body.provider)
     engine = engine_label(provider)
 
+    guide = guidelines_text(db, ACCOUNT_KEY, "translate")
+    gh = guide_fingerprint(db, ACCOUNT_KEY, "translate")
     cached = db.scalar(
         select(TextTranslation).where(TextTranslation.source_hash == source_hash(source))
     )
-    source_ko = cached.ko_text if cached and cached.ko_text else ""
+    # 다른 지침으로 만들어진 캐시는 쓰지 않는다 — /overseas/reason-translate와 같은 규칙이어야
+    # 두 경로가 같은 원문에 서로 다른 번역을 보여주지 않는다.
+    fresh_enough = bool(cached and cached.ko_text and cached.guide_hash == gh)
+    source_ko = cached.ko_text if fresh_enough else ""
     error = ""
     if not source_ko:
         try:
-            translated = await translate_batch([source], provider)
+            translated = await translate_batch([source], provider, guidelines=guide)
             source_ko = translated[0] or ""
         except HTTPException as e:
             error = str(e.detail)
-    if source_ko and not cached:
-        cache_translation(db, source, source_ko, engine)
+            if source_ko and not fresh_enough:
+                cache_translation(db, source, source_ko, engine, gh)
 
     ai_draft = ""
     if not error:
         try:
-            ai_draft = await draft_reason(source_ko, source, body.diff, body.diff_pct, provider) or ""
+            ai_draft = (
+                await draft_reason(
+                source_ko, source, body.diff, body.diff_pct, provider,
+                guidelines=guidelines_text(db, ACCOUNT_KEY, "variance_reason"),
+                examples=past_draft_edits(db, ACCOUNT_KEY),
+                )
+                or ""
+                )
         except HTTPException as e:
             error = str(e.detail)
 
@@ -337,15 +404,17 @@ def check_variance_reasons(
     lab_scope: str = "ALL",
     plan_no: str | None = None,
     threshold_pct: float = DEFAULT_REASON_THRESHOLD_PCT,
+    threshold_amount: float = DEFAULT_REASON_THRESHOLD_AMOUNT,
     db: Session = Depends(get_db),
 ) -> VarianceReasonCheck:
     """확정 직전 경고 — 증감률이 기준치를 넘었는데 사유가 비었거나 재확인이 필요한 칸.
 
-    판정은 services가 한다 — 집계 화면의 확정 사전점검도 같은 함수를 부른다(PLAN.md P1-1).
+    판정은 services가 한다 — 집계 화면의 확정 사전점검도 같은 함수를 부른다.
     두 군데서 따로 세면 같은 상황에서 다른 건수를 보여준다."""
     return compute_reason_check(
         db, basis_year=basis_year, base_version=base_version, period=period, basis_month=basis_month,
         kind=kind, stage=stage, lab_scope=lab_scope, plan_no=plan_no, threshold_pct=threshold_pct,
+        threshold_amount=threshold_amount,
     )
 
 
@@ -472,7 +541,7 @@ def update_actual_stage(body: ActualStageIn, db: Session = Depends(get_db)) -> A
         db.add(row)
     if body.close_first_done is not None:
         # API 이름(close_first_done)은 그대로 두고 저장만 mapping_done으로 간다 — 프런트·챗봇
-        # 계약을 바꾸지 않으려는 것이다(PLAN Phase 3·4는 API 모양 유지가 원칙).
+        # 계약을 바꾸지 않으려는 것이다.
         row.mapping_done = body.close_first_done
         row.first_done_at = datetime.now(timezone.utc) if body.close_first_done else None
     if body.first_locked is not None:
@@ -536,15 +605,15 @@ def get_actual_first(
 
         local = float(row.local_amount) if row else 0.0
         usd_from_source = bool(row and row.usd_amount is not None)
-        # 저장된 금액은 현지통화 "그 통화의 1단위"(ILS 1 등)인데, 비용 데이터는 전부 K$라서 환산
-        # 결과도 K$로 맞춘다 — 여기서 1000으로 안 나누면 1차 금액만 1000배로 보인다.
-        k_cur = to_kdollar(local, lrc) if lc else local / 1000
-        k_base = to_kdollar(local, lrb) if lc else k_cur
+        # 저장된 금액은 현지통화 "그 통화의 1단위"(ILS 1 등)이고, 비용 데이터도 $ 1단위라 환산만
+        # 하면 그대로 맞는다.
+        k_cur = to_dollar(local, lrc) if lc else local
+        k_base = to_dollar(local, lrb) if lc else k_cur
         if usd_from_source:
             # ERP가 $ 환산액을 같이 줬으면 그 값을 이긴다(환율로 다시 계산하면 ERP 보고서와 어긋난다).
             # 그때는 현지→$ 단계를 ERP가 이미 밟은 것이므로 환차 현지→$를 가를 근거가 없다.
             k_cur = k_base = float(row.usd_amount)
-        krw = k_cur * rc * 1000
+        krw = k_cur * rc
 
         # 비교 기준은 그 연구소의 모든 파트를 합친 개발비(매출) 총액이다(1차는 파트 구분이 없다).
         base_k = 0.0
@@ -553,15 +622,15 @@ def get_actual_first(
                 continue
             cats = base_d.get(pk, {})
             base_k += sum(n(month_value(cats, leaf, j)) for leaf in tot_leaves)
-        base_krw = base_k * rb * 1000
+        base_krw = base_k * rb
 
         # 세 칸의 합이 반드시 증감(krw - base_krw)과 같아야 한다 — 환차를 가른 뒤 남는 몫이 환차外다.
         #   현지→$ = (당월 현지환율로 본 $ − 비교 현지환율로 본 $) × 당월 원/$
         #   $→원   = 비교 현지환율로 본 $ × (당월 원/$ − 비교 원/$)
         #   환차外  = 비교 환율로 환산한 금액 − 비교 기준 금액
-        fx_local = (k_cur - k_base) * rc * 1000
-        fx_usd = k_base * (rc - rb) * 1000
-        fx_outside = k_base * rb * 1000 - base_krw
+        fx_local = (k_cur - k_base) * rc
+        fx_usd = k_base * (rc - rb)
+        fx_outside = k_base * rb - base_krw
 
         rows.append(
             ActualFirstRow(
@@ -677,8 +746,8 @@ def get_actual_stage_shift(
         if first and first.usd_amount is not None:
             usd = float(first.usd_amount)
         else:
-            usd = to_kdollar(local, lr) if lc else local / 1000
-        first_krw = usd * rate["USD"][j] * 1000
+            usd = to_dollar(local, lr) if lc else local
+            first_krw = usd * rate["USD"][j]
 
         second_k = 0.0
         for pk, view in labs.items():
@@ -686,7 +755,7 @@ def get_actual_stage_shift(
                 continue
             cats = second_d.get(pk, {})
             second_k += sum(n(month_value(cats, leaf, j)) for leaf in tot_leaves)
-        second_krw = second_k * rate["USD"][j] * 1000
+            second_krw = second_k * rate["USD"][j]
 
         rows.append(
             ActualStageShift(

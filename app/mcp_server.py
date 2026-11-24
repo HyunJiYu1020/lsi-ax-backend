@@ -22,7 +22,7 @@ mcp = MCPServer("slsi-overseas", instructions="S.LSI 해외연구소 예산 데�
 _client = httpx.AsyncClient(base_url=API_BASE, timeout=10.0)
 
 # overseas.html의 OV_EL과 1:1로 맞춰야 한다 — 늘어나면 여기도 같이 고칠 것.
-# hc(인력)만 단위가 명(名)이고 나머지는 전부 K$(천 달러)다.
+# hc(인력)만 단위가 명(名)이고 나머지는 전부 $다(저장 단위 — 화면은 이 값을 K$로 보여준다).
 COST_CATEGORY_KEYS = (
     "hc(인력, 단위 명) · sal(급여) · bonus(상여) · welf(복리후생) · edu(교육훈련비) · travel(출장비) · "
     "dep(감가상각비) · amort(무형자산상각) · rent(임차료) · repair(수선비) · ins(보험료) · "
@@ -36,7 +36,8 @@ COST_CATEGORY_KEYS = (
 ANCHOR_KEYS = (
     COST_CATEGORY_KEYS + " · hr(인원성경비, 그룹) · asset(자산성경비, 그룹) · direct(직접개발비, 그룹) · "
     "gen(일반운영비, 그룹) · mgr(통제성경비, 그룹) · itx(IT 관련 비용, 그룹) · eda(EDA Tool) · "
-    "emu(Emulator) · swl(SW/License구매) · svr(SVR/Storage임대) · itoth(IT 기타) · outs(외주용역비)"
+    "emu(Emulator) · swl(SW/License구매) · svr(SVR/Storage임대) · itoth(IT 기타) · outs(외주용역비) · "
+    "__none__(합산 제외 — 표시만 하고 어느 합계에도 안 들어감)"
 )
 
 # 추가 행을 붙여도 **개발비 총계에 안 잡히는** 자리. 이 키들은 집계표의 참고 행이라(cost_groups.py의
@@ -334,7 +335,8 @@ async def list_cost_across_labs(
 @mcp.tool(
     description=(
         "비용 데이터 한 칸(연구소×버전×계정×연월×월)을 넣거나 덮어쓴다. amount 단위는 hc(인력)만 명(名)이고 "
-        f"나머지는 전부 K$(천 달러)다. category_key(전체 목록, 헷갈리지 말 것): {COST_CATEGORY_KEYS}. "
+        f"나머지는 전부 $다(저장 단위 — 화면은 K$로 보여준다. 사용자가 K$로 말했으면 서버가 ×1000해서 "
+        f"저장하니 네가 미리 곱하지 마라). category_key(전체 목록, 헷갈리지 말 것): {COST_CATEGORY_KEYS}. "
         'yyyymm은 이 헤더의 편성 기준 연월 "YYYYMM"(예: "202609"). month는 보통 1~12(그 연도 1~12월)이지만, '
         "기간을 12개월 너머로 늘려 받는 경우엔 13부터 그다음 연도 1월(13=다음해 1월, 24=다음해 12월), "
         "25부터 또 그다음 연도로 — 12개씩 다음 해로 이어진다."
@@ -360,7 +362,7 @@ async def upsert_cost_entry(
 async def list_uploads(version: str | None = None, lab_pk: str | None = None) -> Any:
     """연구소별 파일 업로드 이력을 조회한다(최신순). version: cur(당월 속보)|prev(전실행)|prior(전년 실적)|
     plan(경영계획) — list_cost_entries 등과 달리 forecast/actual이 아니라 화면이 보는 그대로의 코드를
-    쓴다(list_memo_cols와 동일). version을 생략하면 전체 버전을 다 가져온다."""
+    쓴다. version을 생략하면 전체 버전을 다 가져온다."""
     return await _get("/overseas/uploads", {"version": version, "lab_pk": lab_pk})
 
 
@@ -468,8 +470,164 @@ async def delete_row_alias(alias_label: str) -> Any:
 
 @mcp.tool(
     description=(
+        "**이미 적재된** 추가 행의 금액을 다른 행으로 합쳐 옮긴다 — \"'Other'랑 'Misc' 행은 기타경비로 "
+        "합쳐줘\"처럼 이번 달에 이미 들어간 값까지 합쳐 달라는 요청에 쓴다.\n"
+        "upsert_row_alias와 **짝이지만 다르다**: 별칭은 앞으로 올라올 파일의 이름을 맞추고(다음 "
+        "업로드부터), 이 도구는 이미 들어간 금액을 옮긴다(이번 달). 둘 다 필요하면 "
+        "upsert_row_alias를 먼저 부르고 이 도구를 뒤에 불러라 — 별칭은 지울 수 있지만 합치기는 "
+        "되돌릴 수 없어서, 사용자가 \"앞으로만 적용해\"를 고를 수 있어야 한다.\n"
+        "**dry_run=true로 먼저 불러서 사용자에게 보여주고 확인을 받아라.** 합치면 원본 행이 지워져서 "
+        "'Other'가 얼마였는지 영구히 사라진다. 확인 뒤에만 dry_run=false로 다시 불러라.\n"
+        "yyyymm·version은 '현재 화면' 정보에 나온 값을 그대로 써라. 지나간 달은 서버가 거절한다 — "
+        "이미 보고된 숫자를 뒤에서 바꾸게 되기 때문이고, 그때는 '그 달 파일을 다시 업로드하세요'로 안내해라.\n"
+        "target_kind: category(고정 계정으로 합침 — target_key에 비용항목 키, 기타경비는 misc) | "
+        "extra_row(이미 있는 추가 행으로 합침 — target_label에 그 행의 정식 이름). 집계로 계산되는 "
+        "그룹 행(개발비(A)·일반운영비 등)에는 합칠 수 없다.\n"
+        "lab_pk를 비우면 전체 연구소에서 그 이름을 찾아 연구소별로 각각 합친다(연구소를 섞어 더하지 "
+        "않는다). 사용자가 특정 연구소만 말했으면 그 pk를 넣어라."
+    )
+)
+async def merge_rows(
+    yyyymm: str,
+    version: str,
+    source_labels: list[str],
+    target_kind: str,
+    target_key: str = "",
+    target_label: str = "",
+    lab_pk: str = "",
+    dry_run: bool = True,
+) -> Any:
+    return await _post(
+        "/overseas/row-merge",
+        {
+            "yyyymm": yyyymm, "version": version, "source_labels": source_labels,
+            "target_kind": target_kind, "target_key": target_key, "target_label": target_label,
+            "lab_pk": lab_pk, "dry_run": dry_run,
+        },
+    )
+
+
+# ---------- 업무 지침 (AI-18) ----------
+# "금액은 억원으로 써"처럼 담당자가 한 번 말하면 계속 적용돼야 하는 약속을 저장한다. 저장한 지침은
+# 서버가 매 요청의 시스템 프롬프트에 넣어 주므로(chat.py), 도구로 다시 읽지 않아도 이미 보인다 —
+# list_guidelines는 담당자가 "지금 걸린 지침 뭐야?"를 물을 때 쓴다.
+
+
+@mcp.tool(
+    description=(
+        "지금 걸려 있는 업무 지침 목록(담당자가 말로 등록해 둔 것). account_key를 주면 그 계정 "
+        "지침 + 전 계정 공통 지침을 같이 돌려준다. applies_to: all(어디서나) | chat(대화 답변) | "
+        "variance_reason(증감사유 초안) | translate(회신 번역)."
+    )
+)
+async def list_guidelines(account_key: str = "", applies_to: str = "all") -> Any:
+    return await _get("/guidelines", {"account_key": account_key, "applies_to": applies_to})
+
+
+@mcp.tool(
+    description=(
+        "업무 지침을 등록한다(\"사유는 3줄 이내로 써\" · \"금액은 억원으로 써\"). 다음 요청부터 "
+        "답변에 적용된다.\n"
+        "topic: 지침의 주제를 짧게(\"금액 단위\" · \"사유 길이\"). **같은 주제면 덮어쓴다** — "
+        "시스템 프롬프트의 '담당자가 등록해 둔 업무 지침'에 이미 있는 주제면 그 주제를 글자 그대로 "
+        "재사용해라. 새 주제를 지어내면 덮어쓰지 못하고 같은 주제 지침이 두 줄이 된다.\n"
+        "text: 지침 문장 그대로. 이 문장이 프롬프트에 들어간다.\n"
+        "account_key: 그 계정에만 걸 지침이면 계정 키(해외연구소는 \"overseas\"), 전 계정 공통이면 "
+        "비워 둔다 — 금액 단위·사유 길이처럼 보고서 전체의 약속은 비워 두는 게 맞다.\n"
+        "applies_to: all(어디서나) | chat(대화 답변만) | variance_reason(증감사유 초안만) | "
+        "translate(회신 번역만). 사유 작성 규칙은 variance_reason, 번역 용어는 translate로 나눠라 — "
+        "all로 두면 번역 지침이 집계표 질문 답변까지 바꾼다.\n"
+        "이미 같은 주제의 지침이 걸려 있으면 바로 부르지 말고 기존 문장을 보여주며 바꿀지 먼저 물어라.\n"
+        "confirm_new_topic: 기본값 false로 두고 부른다. 주제는 다른데 뜻이 겹치는 지침이 이미 있으면 "
+        "서버가 저장하지 않고 그 지침들을 돌려주니, 사용자에게 보여주며 '기존 걸 바꿀지 / 별개로 "
+        "둘지'를 물어라. 별개로 두겠다는 답을 받은 **뒤에만** true로 다시 불러라 — 묻지 않고 true로 "
+        "부르면 뜻이 겹치는 지침이 쌓여서 답변 단위·형식이 매번 달라진다."
+    )
+)
+async def upsert_guideline(
+    topic: str,
+    text: str,
+    account_key: str = "",
+    applies_to: str = "all",
+    confirm_new_topic: bool = False,
+) -> Any:
+    return await _put(
+        "/guidelines",
+        {
+            "topic": topic, "text": text, "account_key": account_key, "applies_to": applies_to,
+            "source": "chat", "confirm_new_topic": confirm_new_topic,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "등록해 둔 업무 지침을 지운다 — 다음 요청부터 적용되지 않는다. topic·account_key·"
+        "applies_to가 등록할 때와 같아야 지워진다(시스템 프롬프트에 보이는 주제를 그대로 써라)."
+    )
+)
+async def delete_guideline(topic: str, account_key: str = "", applies_to: str = "all") -> Any:
+    return await _delete(
+        "/guidelines", {"topic": topic, "account_key": account_key, "applies_to": applies_to}
+    )
+
+
+# ---------- 실적결산 전표 매칭 규칙 ----------
+# 담당자가 "앞으로 이렇게 판별해"라고 정한 규칙이다. 서버가 스스로 만들지 않는다 — 한 달만 예외로
+# 옮긴 전표도 반복처럼 보이기 때문이다(close_match_rules 주석).
+
+
+@mcp.tool(
+    description=(
+        "실적결산 전표 매칭 규칙 목록(담당자가 승인한 '앞으로 이렇게' 규칙). rejected=true인 행은 "
+        "규칙이 아니라 '이 제안은 거절했다'는 기록이라 매칭에 쓰이지 않는다."
+    )
+)
+async def list_match_rules(account_key: str = "overseas") -> Any:
+    return await _get("/close/match-rules", {"account_key": account_key})
+
+
+@mcp.tool(
+    description=(
+        "실적결산 전표 매칭 규칙을 등록한다 — \"CP는 Assignment가 'CP-'로 시작하는 걸로 판별해줘\" "
+        "같은 요청에 쓴다. 다음 매칭부터 적용된다.\n"
+        "match_field: vendor(거래처) | text(적요) | cost_center(코스트센터) | project(과제코드) | "
+        "assignment(ERP 지정 필드).\n"
+        "match_op: equals(같음) | contains(포함) | starts_with(~로 시작). 생략하면 필드 기본값"
+        "(text는 contains, 나머지는 equals)이다. \"'CP-'로 시작하는\"은 starts_with다 — equals로 "
+        "걸면 다음 과제번호에는 안 걸리고, contains로 걸면 'NON-CP-'까지 걸린다.\n"
+        "scope_key: 붙일 연구소 pk(list_labs의 값만 써라). excluded=true면 '이 조건은 해외연구소 "
+        "실적이 아니다'라는 제외 규칙이라 scope_key를 비워야 한다 — 둘 중 하나만 지정한다.\n"
+        "apply_basis_year·apply_basis_month를 주면 그 달의 AI 추천에 바로 적용한다(담당자가 직접 "
+        "고친 전표는 건드리지 않는다). 안 주면 다음 매칭부터 적용된다.\n"
+        "규칙은 AI 추천을 이긴다 — 사용자가 말하지 않은 조건을 네가 만들어 넣지 마라."
+    )
+)
+async def upsert_match_rule(
+    match_field: str,
+    match_value: str,
+    match_op: str = "",
+    scope_key: str = "",
+    excluded: bool = False,
+    note: str = "",
+    account_key: str = "overseas",
+    apply_basis_year: int | None = None,
+    apply_basis_month: int | None = None,
+) -> Any:
+    return await _post(
+        "/close/match-rules",
+        {
+            "account_key": account_key, "match_field": match_field, "match_value": match_value,
+            "match_op": match_op, "scope_key": scope_key, "excluded": excluded, "note": note,
+            "apply_basis_year": apply_basis_year, "apply_basis_month": apply_basis_month,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
         "연구소가 편성 화면에서 직접 추가한 행(계정에 없는 비용 항목)을 조회한다. "
-        'yyyymm: v(12개월치 값, K$)가 속한 편성 기준 연월 "YYYYMM"(필수, 예: "202609"). '
+        'yyyymm: v(12개월치 값, $)가 속한 편성 기준 연월 "YYYYMM"(필수, 예: "202609"). '
         "version: forecast(속보)|actual(실적) — '현재 화면' 정보에 나온 값을 그대로 써라."
     )
 )
@@ -496,8 +654,10 @@ async def list_extra_rows(
         "자동으로 따라 바뀐다(네가 숫자를 미리 계산해서 v에 박아 넣으면 그 숫자는 곧 낡아버리니 "
         "그렇게 하지 마라 — combine_series로 값을 구해서 v에 넣는 방식은 파생 행에는 쓰지 않는다). "
         'formula 모양: {"op":"div_elementwise","operands":["labor","hc"]} — operands는 계정 키 목록이고 '
-        "월별로(같은 달끼리) 계산한다. op: sum_elementwise(2개 이상을 더함) | div_elementwise"
-        "(정확히 2개, [분자, 분모]). operands에는 집계 그룹 키(labor=인건비, A=개발비 등)도 쓸 수 있고 "
+        "월별로(같은 달끼리) 계산한다. op: sum_elementwise(2개 이상을 더함) | sub_elementwise"
+        "(정확히 2개, [피감수, 감수] — 예: '인건비외' = [A, labor]) | mul_elementwise(정확히 2개, "
+        "[피승수, 승수]) | div_elementwise(정확히 2개, [분자, 분모]). "
+        "operands에는 집계 그룹 키(labor=인건비, A=개발비 등)도 쓸 수 있고 "
         "서버가 리프까지 알아서 전개한다. 파생 행은 '개발비(A)' 합계에 더해지지 않는다. "
         "is_derived=True는 사용자가 지금 '집계' 탭을 보고 있을 때만 받아준다 — 다른 탭이면 거부되니"
         "(단계를 네가 대신 바꾸지 마라) 거부 사유를 그대로 사용자에게 설명해라.\n"
@@ -505,8 +665,10 @@ async def list_extra_rows(
         "사용자에게 이 행을 설명할 때 그 값을 근거로 그대로 보여줘라.\n"
         "(헷갈리기 쉬움) 이 도구는 표 안의 '행'을 만드는 것이다 — 사용자가 '연구소'를 추가·수정· "
         "삭제해달라고 한 거면 이 도구가 아니라 upsert_lab/delete_lab이다.\n"
+        "(행인지 열인지) 사용자가 '행'·'열'을 말하지 않고 '~추가해줘'라고만 했으면 단정하지 마라 — 어디 아래에 넣을지 묻는 질문에 \"열(칼럼)로 추가하려던 거면 '열로'라고 말해달라\"를 한 줄로 같이 붙여서 **한 번에** 물어라(행/열 따로, 자리 따로 두 번 묻지 마라). '열'·'칼럼'이라고 말했으면 이 도구가 아니라 upsert_extra_col이다.\n"
         "(이미 있는 행을 다른 항목 아래로 옮기기) 같은 row_key로 다시 부르되 **v를 아예 넣지 "
-        "마라** — 그러면 금액은 그대로 두고 이름·위치만 바뀐다. 금액을 다시 넣으면 안 된다: "
+        "마라** — 그러면 저장된 금액은 손대지 않은 채 행이 통째로 옮겨간다(금액도 그 행을 따라가서 "
+        "새 상위 항목의 합계에 잡힌다). 금액을 다시 넣으면 안 된다: "
         "화면이 $ 단위로 보고 있으면 서버가 받은 금액을 1000으로 나누기 때문에(해외-6), "
         "조회해서 받은 값을 그대로 되보내면 금액이 1000배 작아진다. 옮길 행의 row_key는 "
         "list_extra_rows로 찾아라.\n"
@@ -533,8 +695,13 @@ async def upsert_extra_row(
     return await _put(
         "/overseas/extra-rows",
         {
+            # v를 None 그대로 넘긴다(_put이 None인 키를 빼 준다) — []로 바꿔 보내면 서버가 "빈 배열을
+            # 보냈다"로 읽어서 "v는 12개월치여야 한다"로 막힌다. v 생략은 "저장된 금액은 손대지
+            # 않는다"는 뜻이고(금액은 행에 매달려 함께 옮겨간다), []로 바꾸면 '행 옮기기'가 죽는다.
             "lab_pk": lab_pk, "version": version, "row_key": row_key, "label": label, "yyyymm": yyyymm,
-            "v": v if v is not None else [], "anchor_key": anchor_key, "is_derived": is_derived, "formula": formula,
+            "v": v, "anchor_key": anchor_key, "is_derived": is_derived, "formula": formula,
+            # 챗봇 경로임을 알린다 — 이름이 이미 있는 행과 겹치면 서버가 막는다(TC-016).
+            "source": "chat",
         },
     )
 
@@ -582,8 +749,7 @@ async def list_cost_extras(yyyymm: str, version: str | None = None, lab_pk: str 
 @mcp.tool(
     description=(
         "그리드에 열 하나를 만들거나 고친다 — 화면의 '+ 열 추가' 버튼과 같은 결과를 만드는 도구다"
-        "(이걸로 만든 열만 그리드에 실제로 보인다 — upsert_memo_col은 메모 전용 열이라 그리드에는 "
-        "안 보이니, '표에 열을 추가해달라'는 요청에는 이 도구를 써라). 열도 두 종류다.\n"
+        "('표에 열을 추가해달라'·'칼럼 추가해줘'는 전부 이 도구다). 열도 두 종류다.\n"
         "① 원시 열(is_derived=False, 기본): 사람이 칸마다 값을 직접 넣는 열. 이 도구로 열만 만들고, "
         "칸 값은 upsert_cost_extra로 따로 넣는다.\n"
         "② 파생 열(is_derived=True): 월을 가로로 묶어 계산하는 열(예: '3분기 합계' = 7+8+9월). "
@@ -593,18 +759,22 @@ async def list_cost_extras(yyyymm: str, version: str | None = None, lab_pk: str 
         "파생 열에는 upsert_cost_extra로 칸 값을 직접 넣을 수 없다(거부된다). is_derived=True는 "
         "사용자가 '집계' 탭을 보고 있을 때만 받아준다.\n"
         "label이 열 이름이자 식별자라 이름 자체를 바꾸는 기능은 없다(바꾸려면 delete_extra_col로 옛 "
-        '이름을 지우고 새 이름으로 다시 추가). yyyymm: "현재 화면" 정보의 yyyymm_api 값을 그대로 써라.'
+        '이름을 지우고 새 이름으로 다시 추가). yyyymm: "현재 화면" 정보의 yyyymm_api 값을 그대로 써라.\n'
+        "fmt는 칸을 **그리는 방법**이다(값은 원문 그대로 저장된다): raw(그대로 · 기본) | "
+        "pct_ratio(소수를 백분율로, 0.825 → 82.5%) | pct_plain(이미 퍼센트로 적힌 숫자에 기호만, "
+        "82.5 → 82.5%). 사용자가 '사용률을 %로 보이게 해줘'처럼 **보이는 방식**을 말할 때만 바꿔라 — "
+        "저장된 값을 네가 ×100 해서 덮어쓰지 마라(원문이 사라진다). 글자 값은 형식과 무관하게 그대로다."
     )
 )
 async def upsert_extra_col(
     lab_pk: str, version: str, yyyymm: str, label: str,
-    is_derived: bool = False, formula: dict[str, Any] | None = None,
+    is_derived: bool = False, formula: dict[str, Any] | None = None, fmt: str = "raw",
 ) -> Any:
     return await _put(
         "/overseas/extra-cols",
         {
             "lab_pk": lab_pk, "version": version, "yyyymm": yyyymm, "label": label,
-            "is_derived": is_derived, "formula": formula,
+            "is_derived": is_derived, "formula": formula, "fmt": fmt,
         },
     )
 
@@ -616,11 +786,13 @@ async def upsert_extra_col(
         "upsert_extra_col로 열만 만드는 게 더 깔끔하다). "
         f"row_key: 값을 넣을 행(고정 계정 key — 유효값: {ANCHOR_KEYS} — 또는 custom row_key). "
         "생략하면 'hc'(인력) 행에 들어간다. 파생 열에는 쓸 수 없다(계산식 결과와 수동 입력이 섞이면 "
-        '어느 쪽이 참인지 알 수 없어져서 거부된다). yyyymm: "현재 화면" 정보의 yyyymm_api 값을 쓴다.'
+        '어느 쪽이 참인지 알 수 없어져서 거부된다). yyyymm: "현재 화면" 정보의 yyyymm_api 값을 쓴다. '
+        "value는 숫자와 글자를 다 받는다(추가 열은 금액·비율·메모가 섞이는 자유 칸이다) — 사용자가 "
+        "말한 값을 그대로 넣어라. 숫자로 읽히는 값은 숫자로, 나머지는 글자 원문으로 저장된다."
     )
 )
 async def upsert_cost_extra(
-    lab_pk: str, version: str, yyyymm: str, label: str, row_key: str = "hc", value: float = 0
+    lab_pk: str, version: str, yyyymm: str, label: str, row_key: str = "hc", value: float | str = 0
 ) -> Any:
     return await _put(
         "/overseas/cost-extras",
@@ -642,42 +814,6 @@ async def delete_extra_col(
     return await _delete(
         "/overseas/extra-cols",
         {"lab_pk": lab_pk, "version": version, "label": label, "yyyymm": yyyymm, "step": step},
-    )
-
-
-@mcp.tool()
-async def list_memo_cols(version: str | None = None, lab_pk: str | None = None) -> Any:
-    """편성 화면에 추가한 메모 전용 열 목록을 조회한다(집계·증감분석 계산에는 들어가지 않음).
-    version: cur(당월 속보)|prev(전실행)|prior(전년 실적)|plan(경영계획) — list_cost_entries 등과
-    달리 forecast/actual이 아니라 화면이 보는 그대로의 코드를 쓴다."""
-    return await _get("/overseas/memo-cols", {"version": version, "lab_pk": lab_pk})
-
-
-@mcp.tool()
-async def upsert_memo_col(lab_pk: str, version: str, col_key: str, label: str) -> Any:
-    """메모 열 하나를 넣거나 덮어쓴다. col_key는 처음 만들 때는 새 id를 하나 지어서 쓰면 된다.
-    version: cur|prev|prior|plan(list_memo_cols와 동일)."""
-    return await _put("/overseas/memo-cols", {"lab_pk": lab_pk, "version": version, "col_key": col_key, "label": label})
-
-
-@mcp.tool()
-async def delete_memo_col(lab_pk: str, version: str, col_key: str) -> Any:
-    """메모 열을 삭제한다(그 열의 메모 셀도 같이 지워진다). version: cur|prev|prior|plan."""
-    return await _delete("/overseas/memo-cols", {"lab_pk": lab_pk, "version": version, "col_key": col_key})
-
-
-@mcp.tool()
-async def list_memos(version: str | None = None, lab_pk: str | None = None) -> Any:
-    """메모 셀(행×열 교차점의 자유 텍스트)을 조회한다. row_key는 고정 계정 key 또는 추가 행의 row_key.
-    version: cur|prev|prior|plan(list_memo_cols와 동일)."""
-    return await _get("/overseas/memos", {"version": version, "lab_pk": lab_pk})
-
-
-@mcp.tool()
-async def upsert_memo(lab_pk: str, version: str, row_key: str, col_key: str, text: str) -> Any:
-    """메모 셀 하나를 넣거나 덮어쓴다. version: cur|prev|prior|plan(list_memo_cols와 동일)."""
-    return await _put(
-        "/overseas/memos", {"lab_pk": lab_pk, "version": version, "row_key": row_key, "col_key": col_key, "text": text}
     )
 
 
@@ -929,8 +1065,8 @@ async def list_fx_rates(year_month: str | None = None, year: str | None = None) 
         "registered=false는 '계약액이 0원'이 아니라 '그 시점에 계약이 등록되지 않았다'는 뜻이다 — "
         "0원이라고 답하지 말고 '등록되지 않았다(그래서 CP 정산 칸이 빈칸이고 합계에서 빠진다)'고 "
         "설명해라.\n"
-        "금액은 **$ 단위**다(K$가 아니다) — 5,200,000이면 5.2M$다. 집계 표의 CP 정산 칸은 같은 "
-        "금액을 K$로(÷1000) 보여주므로, 집계 숫자와 비교해 말할 때 단위를 섞지 마라."
+        "금액은 **$ 단위**다 — 5,200,000이면 5.2M$다(비용 데이터 저장 단위와 같다). 집계 표의 CP "
+        "정산 칸은 같은 금액을 K$로(÷1000) 보여주므로, 집계 숫자와 비교해 말할 때 단위를 섞지 마라."
     )
 )
 async def get_cp_contract(year: int, as_of: str) -> Any:
@@ -949,8 +1085,8 @@ async def get_cp_contract(year: int, as_of: str) -> Any:
         "밝히고 어느 POC를 바꾸려는 건지 확인해라 — 실제로는 특정 POC의 계약이 바뀐 경우가 많고, "
         "그때 비중대로 나누면 안 바뀐 POC의 계약액까지 같이 움직인다. POC가 1개뿐이면 그냥 진행해도 "
         "된다. 먼저 get_cp_contract로 POC가 몇 개인지 확인해라.\n"
-        "(금액 단위, 틀리기 쉬움) CP 계약은 **$ 단위 그대로** 저장한다 — K$가 아니다. 5.2M$는 "
-        "5200이 아니라 **5200000**이다. 집계 표가 K$로 보여주는 건 서버가 1000으로 나눠서 "
+        "(금액 단위) CP 계약은 **$ 단위 그대로** 저장한다 — 비용 데이터도 같은 $ 단위다. 5.2M$는 "
+        "5200이 아니라 **5200000**이다. 집계 표가 K$로 보여주는 건 화면이 1000으로 나눠서 "
         "그런 것이고, 여기 넣는 값은 계약서에 적힌 $ 금액 그대로다. 이 값은 화면 표시 단위"
         "(해외-6의 usd_unit)와도 무관하다 — 화면이 K$ 모드든 $ 모드든 계약서 금액을 그대로 "
         "넣어라. 지금 금액이 얼마인지 모르겠으면 get_cp_contract로 먼저 확인해라(그 응답도 "
@@ -1228,32 +1364,127 @@ _DISPLAY_UNITS = {
     "dollar": "dollar", "$": "dollar", "usd": "dollar", "d": "dollar",
     "kdollar": "kdollar", "k$": "kdollar", "k": "kdollar", "kusd": "kdollar", "thousand": "kdollar",
 }
+# 원화 칸의 표시 단위. 달러 칸(위)과 **다른 축**이다 — 해외연구소 표는 달러 칸과 원화 칸이 같이 있어서
+# 한쪽을 바꾼다고 다른 쪽이 바뀌면 안 된다. 화면 상단 [원 · 백만원 · 억원] 토글과 같은 값을 쓴다.
+_KRW_UNITS = {
+    "won": 1, "원": 1, "1": 1,
+    "million": 1_000_000, "백만원": 1_000_000, "백만": 1_000_000, "mn": 1_000_000,
+    "eok": 100_000_000, "억원": 100_000_000, "억": 100_000_000,
+}
+_KRW_UNIT_NAMES = {1: "원", 1_000_000: "백만원", 100_000_000: "억원"}
 
 
 @mcp.tool(
     description=(
-        "해외연구소 화면의 달러 금액 표시 단위를 바꾼다 — 화면 표시만 바꾸는 도구다. 저장된 데이터는 "
-        "건드리지 않는다(DB는 그대로 K$이고, 화면이 1000을 곱해서 보여주는 것뿐이다). "
-        "unit: dollar($ 단위) | kdollar(K$ 단위, 원래 값). 'K$ 말고 $로 보여줘'·'달러 단위로 "
-        "받을래'·'천 달러 말고 달러로'처럼 단위 표시를 바꿔달라는 요청에 이 도구를 써라.\n"
+        "적용 환율 화면에 **그 통화를 늘 보이게 하거나 뺀다** — '앞으로 TWD도 기본으로 보여줘'·"
+        "'JPY는 이제 안 봐도 돼' 같은 요청에 쓴다. 화면의 [통화 추가] 드롭다운·📌 고정과 같은 결과다.\n"
+        "show=true면 추가, false면 뺀다. currency는 3자리 통화 코드(TWD·JPY…)다.\n"
+        "**보는 사람 화면에만 적용되고 다음 접속에도 남는다** — 다른 담당자 화면은 안 바뀐다. "
+        "환율 값이나 환산 결과는 건드리지 않는다(무엇을 보여줄지만 고른다).\n"
+        "그 통화에 환율이 아직 없으면 줄은 생기지만 칸이 빈다 — get_fx_currency_coverage로 먼저 "
+        "확인하고, 없으면 환율부터 넣자고 안내해라(해외-14 규칙과 같은 이유)."
+    )
+)
+async def pin_fx_currency(currency: str, show: bool = True) -> Any:
+    code = str(currency or "").strip().upper()
+    if not (len(code) == 3 and code.isalpha()):
+        raise ValueError("currency는 3자리 통화 코드여야 한다(예: TWD).")
+    return {
+        "currency": code,
+        "show": bool(show),
+        "scope": "적용 환율 화면의 기본 표시 통화(보는 사람 화면에만)",
+        "persists": True,
+        "note": "환율 값은 바뀌지 않는다 — 무엇을 보여줄지만 고른다",
+    }
+
+
+@mcp.tool(
+    description=(
+        "증감분석 화면에서 **작은 변동을 숨긴다** — '증감률 10% 이상만 보여줘'·'1억 넘는 것만' 같은 "
+        "요청에 쓴다. 화면 표와 [엑셀로 받기]에 같은 기준이 걸린다.\n"
+        "pct: 증감률(%) 기준. amount: 증감액(원) 기준. 둘 다 주면 **둘 다 넘는 것만** 남는다.\n"
+        "기준은 연간 증감으로 본다 — 월별로 보면 어느 한 달만 튀어도 남아서 '주요 변동'이 아니게 된다. "
+        "합계 행은 기준과 상관없이 항상 보인다(합계가 사라지면 표를 읽을 수 없다).\n"
+        "pct=0·amount=0으로 부르면 필터를 끄고 전부 다시 보여준다.\n"
+        "화면에서 **숨기는 것뿐이고 저장된 값은 그대로다** — 답변에 그 점을 같이 알려줘라. "
+        "사유 작성 대상을 고르는 기준(check_variance_reasons의 threshold_pct)과는 다른 설정이다."
+    )
+)
+async def set_variance_filter(pct: float = 0, amount: float = 0) -> Any:
+    if pct < 0 or amount < 0:
+        raise ValueError("pct·amount는 0 이상이어야 한다(0이면 그 기준은 안 쓴다).")
+    on = bool(pct or amount)
+    return {
+        "pct": pct, "amount": amount, "enabled": on,
+        "scope": "증감분석 화면의 연구소별 증감 요약 표 + 엑셀 다운로드",
+        "basis": "연간 증감",
+        "note": "화면에서 숨기는 것뿐이고 저장된 값은 바뀌지 않는다" if on else "필터를 껐다 — 전부 보인다",
+    }
+
+
+@mcp.tool(
+    description=(
+        "비용 표와 증감분석 계정별 상세에서 **행 하나를 보기에서 뺀다** — '복리후생 숨겨줘'·'출장비는 "
+        "빼고 보여줘'·'다시 보여줘' 같은 요청에 쓴다.\n"
+        "rows: 계정 이름이나 키를 배열로 준다(예: [\"복리후생\"] · [\"welf\",\"travel\"]). "
+        f"키 목록: {COST_CATEGORY_KEYS}\n"
+        "show: false(기본)면 숨기고, true면 다시 보여준다. 전부 다시 보이게 하려면 숨겼던 행을 "
+        "rows에 담아 show=true로 불러라.\n"
+        "합계 행(개발비·인건비처럼 하위 행을 더한 행)은 숨기지 않는다 — 하위 행이 남은 채 합계만 "
+        "사라지면 표를 읽을 수 없다. 그런 행을 지목하면 화면은 그대로 둔다.\n"
+        "화면에서 **숨기는 것뿐이고 저장된 값도 합계도 그대로다** — 답변에 그 점을 같이 알려줘라. "
+        "행을 **지우는** 도구(delete_extra_row)와 혼동하지 마라: 그건 연구소가 직접 추가한 행 전용이고 "
+        "금액이 사라진다. 사용자가 '숨겨'·'빼고 보여줘'라고 하면 이 도구다."
+    )
+)
+async def set_row_visibility(rows: list[str], show: bool = False) -> Any:
+    if not rows:
+        raise ValueError("rows에 계정 이름이나 키를 하나 이상 담아라(예: [\"복리후생\"]).")
+    return {
+        "rows": rows,
+        "show": bool(show),
+        "scope": "해외연구소 비용 표 + 증감분석 계정별 상세(보는 사람 화면에만)",
+        "note": "화면에서 빼는 것뿐이고 저장된 값도 합계도 바뀌지 않는다",
+    }
+
+
+@mcp.tool(
+    description=(
+        "화면의 금액 표시 단위를 바꾼다 — 화면 표시만 바꾸는 도구다. 저장된 데이터는 건드리지 않는다.\n"
+        "**달러 칸과 원화 칸은 서로 다른 축이다**(해외연구소 표에는 둘이 같이 있다). 사용자가 말한 "
+        "쪽만 바꿔라:\n"
+        "- unit: dollar($ 단위, 저장값 그대로) | kdollar(K$ 단위, 화면 기본) — 'K$ 말고 $로 보여줘'·'천 달러 말고 달러로'\n"
+        "- krw_unit: 원 | 백만원 | 억원 — '단위는 백만원으로 바꿔줘'·'억원으로 보여줘'\n"
+        "둘 다 생략하면 아무것도 안 바뀐다. 원화 단위만 바꿀 때는 unit을 넣지 마라(달러 칸이 같이 바뀐다).\n"
+        "엑셀로 받을 때는 이 설정과 무관하게 원래 금액이 내려간다 — 표시 단위는 화면에만 적용된다.\n"
         "이 호출 자체가 화면 표를 즉시 그 단위로 다시 그린다 — 환산한 숫자를 챗창에 나열하지 마라. "
-        "답변에는 (1) 화면 표시만 바뀌었고 저장된 값은 그대로라는 점, (2) 새로고침하면 K$로 "
+        "답변에는 (1) 화면 표시만 바뀌었고 저장된 값은 그대로라는 점, (2) 새로고침하면 K$ 표시로 "
         "돌아간다는 점을 꼭 같이 알려줘라.\n"
         "단위를 바꿔달라는 요청에 upsert_* 같은 쓰기 도구로 저장된 숫자를 1000배 해서 덮어쓰지 마라 "
         "— 그건 되돌리기 어려운 데이터 손상이다."
     )
 )
-async def set_display_unit(unit: str = "dollar") -> Any:
-    resolved = _DISPLAY_UNITS.get(str(unit or "").strip().lower())
-    if resolved is None:
-        raise ValueError("unit은 dollar($ 단위) 또는 kdollar(K$ 단위)만 쓸 수 있다.")
-    return {
-        "display_unit": resolved,
-        "scope": "해외연구소 화면의 달러 금액 칸",
-        "factor": 1000 if resolved == "dollar" else 1,
-        "stored_unit": "K$ (저장된 데이터는 바뀌지 않음)",
-        "resets_on_reload": True,
-    }
+async def set_display_unit(unit: str | None = None, krw_unit: str | None = None) -> Any:
+    out: dict[str, Any] = {"resets_on_reload": True, "download_unit": "원래 금액(표시 단위와 무관)"}
+    if unit:
+        resolved = _DISPLAY_UNITS.get(str(unit).strip().lower())
+        if resolved is None:
+            raise ValueError("unit은 dollar($ 단위) 또는 kdollar(K$ 단위)만 쓸 수 있다.")
+        out["display_unit"] = resolved
+        out["dollar_scope"] = "해외연구소 화면의 달러 금액 칸"
+        # 저장값이 $라서 $ 모드는 그대로 보여주고(배수 1), K$ 모드가 1000으로 나눈다.
+        out["factor"] = 1 if resolved == "dollar" else 0.001
+        out["stored_unit"] = "$ (저장된 데이터는 바뀌지 않음)"
+    if krw_unit:
+        won = _KRW_UNITS.get(str(krw_unit).strip().lower())
+        if won is None:
+            raise ValueError("krw_unit은 원 | 백만원 | 억원만 쓸 수 있다.")
+        out["krw_unit"] = won
+        out["krw_unit_name"] = _KRW_UNIT_NAMES[won]
+        out["krw_scope"] = "화면 전체의 원화 금액 칸"
+    if len(out) == 2:
+        raise ValueError("unit(달러 칸) 또는 krw_unit(원화 칸) 중 하나는 지정해야 한다.")
+    return out
 
 
 @mcp.tool(
@@ -1291,7 +1522,7 @@ async def list_vendor_by_project(
     description=(
         "인건비 증감을 인원 효과 · 단가 효과로 나눈 금액을 조회한다 — '인원 때문이야 단가 때문이야?', "
         "'SARC 인원 효과 얼마야?'처럼 금액을 말로 듣고 싶어 할 때 쓴다(화면에 펼쳐주기만 하면 될 때는 "
-        "set_labor_split을 써라; 둘을 같이 써도 된다).\n"
+        "화면에는 그 줄이 없으니 숫자는 말로 답해라).\n"
         "base_version: prev(전실행, 기본값) | prior(전년 실적). period: y(연간, 기본값)|q1~q4|m1~m12. "
         "lab_scope: 'ALL'(전체 연구소, 기본값) 또는 연구소 코드('SARC'면 파트 합계) 또는 pk('SARC:CPU'). "
         "basis_year(필수)에는 '현재 화면' 정보의 'year' 키 값을 그대로 넣어라.\n"
@@ -1349,36 +1580,6 @@ async def get_labor_ratio(
     )
 
 
-@mcp.tool(
-    description=(
-        "해외연구소 '계정별 증감분석' 화면에서 인건비 증감을 인원 효과 · 단가 효과로 나눈 줄을 "
-        "펼치거나 접는다 — 화면 표시만 바꾸는 도구다(저장된 데이터는 건드리지 않는다). "
-        "open: True(펼치기, 기본값) | False(접기).\n"
-        "'인건비 쪼개줘'·'인건비 왜 늘었는지 인원이랑 단가로 나눠줘'·'인원 때문인지 단가 때문인지 "
-        "보여줘'처럼 인건비 증감의 원인을 인원/단가로 갈라서 보고 싶다는 요청에 이 도구를 써라.\n"
-        "이 호출 자체가 계정별 상세 표를 펼치고 인건비 아래에 네 줄(인원 효과 · 단가 효과 · 인력 "
-        "미제출 연구소 몫 · 참고용 인당 인건비 증감률)을 즉시 그려준다 — 그러니 금액을 네가 계산해서 "
-        "챗창에 나열하지 마라(화면 숫자와 어긋날 수 있다). 답변에는 (1) 화면 계정별 상세의 인건비 "
-        "아래에 펼쳤다는 것, (2) 인원 효과 + 단가 효과(+ 인력 미제출 몫)를 더하면 그 위 인건비 행의 "
-        "환차外 금액과 같다는 것, (3) 환율 때문에 변한 몫은 환차 열에 따로 있어서 이 분해에는 안 "
-        "들어간다는 것을 설명해라.\n"
-        "이 분해는 해외연구소 계정별 증감분석 화면에만 있다 — 다른 계정 화면에는 없다."
-    )
-)
-async def set_labor_split(open: bool = True) -> Any:
-    return {
-        "labor_split_open": bool(open),
-        "scope": "해외연구소 계정별 증감분석 > 계정별 상세 > 인건비 행",
-        "rows": [
-            "환차外 · 인원 효과 = (당월 인원 − 비교 인원) × 비교 단가",
-            "환차外 · 단가 효과 = 당월 인원 × (당월 단가 − 비교 단가)",
-            "환차外 · 인력 미제출 연구소 (CP처럼 인력을 안 낸 곳 몫, 0이면 줄이 안 생김)",
-            "(참고) 인당 인건비 증감률 (합계에 들어가지 않음)",
-        ],
-        "ties_to": "위 세 줄의 합 = 인건비 행의 환차外 금액",
-        "fx_excluded": "환율이 움직여서 변한 몫은 환차(현지→$ · $→원) 열에 따로 있어 이 분해에는 포함되지 않는다",
-        "resets_on_reload": False,
-    }
 
 
 @mcp.tool(
@@ -1387,8 +1588,10 @@ async def set_labor_split(open: bool = True) -> Any:
         "증감률 등)은 모델이 직접 더하거나 나누지 말고 반드시 이 도구를 써라 — 숫자가 몇 개든 모델이 "
         "직접 계산하면 오차가 날 수 있다. op: sum(합계) | avg(평균) | max(최댓값) | min(최솟값) | "
         "count(개수) | pct_change(증감률 %, numbers는 [이전값, 이후값] 두 개여야 함) | "
+        "sub(빼기, numbers는 [피감수, 감수] 두 개여야 함 — 예: '인건비외' = [총계, 인건비]) | "
+        "mul(곱하기, numbers 2개 이상의 곱) | "
         "div(나누기, numbers는 [분자, 분모] 두 개여야 함 — 예: '인당 개발비' 연간 하나만 필요하면 "
-        "[개발비 합계, 인력 합계]). 월별로 12개를 한 번에 나눠야 하면 이 도구 대신 combine_series를 써라."
+        "[개발비 합계, 인력 합계]). 월별로 12개를 한 번에 계산해야 하면 이 도구 대신 combine_series를 써라."
     )
 )
 async def calculate(numbers: list[float], op: str) -> Any:
@@ -1411,6 +1614,17 @@ async def calculate(numbers: list[float], op: str) -> Any:
         if before == 0:
             return {"error": "이전값이 0이라 증감률을 계산할 수 없다"}
         return {"result": round((after - before) / abs(before) * 100, 2)}
+    if op == "sub":
+        if len(numbers) != 2:
+            return {"error": "sub는 numbers가 [피감수, 감수] 두 개여야 한다"}
+        return {"result": round(numbers[0] - numbers[1], 4)}
+    if op == "mul":
+        if len(numbers) < 2:
+            return {"error": "mul은 numbers가 2개 이상이어야 한다"}
+        product = 1.0
+        for v in numbers:
+            product *= v
+        return {"result": round(product, 4)}
     if op == "div":
         if len(numbers) != 2:
             return {"error": "div는 numbers가 [분자, 분모] 두 개여야 한다"}
@@ -1418,7 +1632,7 @@ async def calculate(numbers: list[float], op: str) -> Any:
         if den == 0:
             return {"error": "분모가 0이라 나눌 수 없다"}
         return {"result": round(num / den, 4)}
-    return {"error": f"알 수 없는 op: {op} (sum|avg|max|min|count|pct_change|div 중 하나)"}
+    return {"error": f"알 수 없는 op: {op} (sum|avg|max|min|count|pct_change|sub|mul|div 중 하나)"}
 
 
 @mcp.tool(
@@ -1426,8 +1640,10 @@ async def calculate(numbers: list[float], op: str) -> Any:
         "길이가 같은 12개월 숫자 배열(각 list_cost_entries 결과의 'months'를 월(1~12) 순서로 늘어놓은 "
         "것) 여러 개를 월별로(같은 달끼리) 묶어 계산한다. 그리드의 집계 행(예: '개발비(A)' = 여러 "
         "계정의 월별 합)이나 비율 행(예: '인당 개발비' = 개발비 ÷ 인력, 월별로 나눠야 함)을 만들 때 "
-        "쓴다 — calculate는 숫자를 한 줄로 뭉쳐서 계산해 월별 구분이 안 되고, 나누기도 없다. "
+        "쓴다 — calculate는 숫자를 한 줄로 뭉쳐서 계산해 월별 구분이 안 된다. "
         "op: sum_elementwise(series 2개 이상을 같은 달끼리 더함) | "
+        "sub_elementwise(series가 정확히 2개 — series[0] − series[1]) | "
+        "mul_elementwise(series가 정확히 2개 — series[0] × series[1]) | "
         "div_elementwise(series가 정확히 2개 — series[0] ÷ series[1]을 같은 달끼리 나눔). "
         "결과 배열을 upsert_extra_row의 v에 그대로 넣으면 된다."
     )
@@ -1443,12 +1659,23 @@ async def combine_series(series: list[list[float]], op: str) -> Any:
         if len(series) < 2:
             return {"error": "sum_elementwise는 series가 2개 이상이어야 한다"}
         return {"result": [round(sum(s[i] for s in series), 4) for i in range(n)]}
+    if op == "sub_elementwise":
+        if len(series) != 2:
+            return {"error": "sub_elementwise는 series가 정확히 2개([피감수 배열, 감수 배열])여야 한다"}
+        return {"result": [round(a - b, 4) for a, b in zip(*series)]}
+    if op == "mul_elementwise":
+        if len(series) != 2:
+            return {"error": "mul_elementwise는 series가 정확히 2개([피승수 배열, 승수 배열])여야 한다"}
+        return {"result": [round(a * b, 4) for a, b in zip(*series)]}
     if op == "div_elementwise":
         if len(series) != 2:
             return {"error": "div_elementwise는 series가 정확히 2개([분자 배열, 분모 배열])여야 한다"}
         num, den = series
         return {"result": [round(a / b, 4) if b != 0 else None for a, b in zip(num, den)]}
-    return {"error": f"알 수 없는 op: {op} (sum_elementwise|div_elementwise 중 하나)"}
+    return {
+        "error": f"알 수 없는 op: {op} "
+        "(sum_elementwise|sub_elementwise|mul_elementwise|div_elementwise 중 하나)"
+    }
 
 
 @mcp.tool(
@@ -1522,7 +1749,11 @@ async def get_variance_basis(
     description=(
         "증감률이 큰데 증감사유가 비어 있거나, 사유를 저장한 뒤 금액이 바뀌어 재확인이 필요한 항목을 "
         "조회한다 — '확정해도 돼?'·'사유 안 쓴 데 있어?'처럼 확정 전 점검을 묻는 질문에 쓴다.\n"
-        "threshold_pct(기본 10)보다 증감률 절댓값이 큰 항목만 본다. missing은 사유가 아예 없는 항목, "
+        "기준이 둘이고 **둘 다 넘을 때만** 걸린다: threshold_pct(증감률 %, 기본 10)와 "
+        "threshold_amount(증감액, 원 단위, 기본 0 = 금액으로는 안 걸러냄). '1억 이상 변동만 사유 "
+        "써줘'는 threshold_amount=100000000으로 좁히는 요청이다. 금액만으로 보고 싶다면(비율이 "
+        "작아도 금액이 크면 걸리게) threshold_pct=0을 같이 넣어라.\n"
+        "missing은 사유가 아예 없는 항목, "
         "stale은 사유는 있지만 저장 뒤 금액이 바뀐 항목(화면에 '재확인 필요'로 뜬다)이다.\n"
         "집계 행(개발비(매출)·개발비(A) 등)과 인력·(%) 행은 목록에서 빠진다 — 하위 계정의 합이라 "
         "사유를 따로 쓰지 않는다.\n"
@@ -1539,13 +1770,14 @@ async def check_variance_reasons(
     period: str = "y",
     lab_scope: str = "ALL",
     threshold_pct: float = 10.0,
+    threshold_amount: float = 0.0,
 ) -> Any:
     return await _get(
         "/overseas/variance-reason-check",
         {
             "basis_year": basis_year, "basis_month": basis_month, "kind": kind,
             "base_version": base_version, "period": period, "lab_scope": lab_scope,
-            "threshold_pct": threshold_pct,
+            "threshold_pct": threshold_pct, "threshold_amount": threshold_amount,
         },
     )
 
@@ -1623,7 +1855,7 @@ async def list_variance_drivers(
     description=(
         "실적 1차 분석(ERP 약식) 표를 조회한다 — 연구소 총액만 있고 계정 상세·외주용역은 없다"
         "(ERP가 그것까지 주지 않는다. 계정별로 보려면 2차(PL) 쪽인 get_variance를 써라).\n"
-        "행마다: currency(현지통화) · local_amount(현지통화 총액) · usd_amount(K$) · krw_amount(원) · "
+        "행마다: currency(현지통화) · local_amount(현지통화 총액) · usd_amount($) · krw_amount(원) · "
         "base_krw(비교 기준, 원) · diff · fx_local(환차 현지→$) · fx_usd(환차 $→원) · fx_outside · "
         "reason_text(1차 사유). 1차 사유는 2차 사유와 별도로 저장된다.\n"
         "stage.close_first_done이 false면 실적결산 1차가 아직 안 끝나서 가져올 ERP 값이 없다는 뜻이다. "
@@ -1656,9 +1888,19 @@ async def get_actual_stage_shift(basis_year: int, basis_month: int) -> Any:
 
 
 @mcp.tool()
-async def list_errors(status_code: int | None = None, path: str | None = None, limit: int = 100) -> Any:
-    """API 서버에서 발생한 처리되지 않은 예외(500) 로그를 최신순으로 조회한다."""
-    return await _get("/errors", {"status_code": status_code, "path": path, "limit": limit})
+async def list_errors(
+    status_code: int | None = None,
+    path: str | None = None,
+    log_level: str | None = None,
+    limit: int = 100,
+) -> Any:
+    """API 서버 로그를 최신순으로 조회한다. 미처리 500(log_level="ERROR")과 서버가 의도적으로
+    거절한 4xx(log_level="WARNING")가 같이 쌓이므로, 한쪽만 보려면 log_level로 거른다.
+    "저장이 안 된다"는 문의에는 WARNING을 먼저 봐라 — 거절 이유(error_message)와 보낸
+    값(params)이 같이 남아 있다."""
+    return await _get(
+        "/errors", {"status_code": status_code, "path": path, "log_level": log_level, "limit": limit}
+    )
 
 
 def main() -> None:

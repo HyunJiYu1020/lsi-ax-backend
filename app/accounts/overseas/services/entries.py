@@ -1,33 +1,32 @@
 """해외연구소 비용·경영계획 값의 읽기/쓰기 — cost_entries · management_plan_entries 접근.
 
-왜 여기로 옮겼나: 원래 overseas.py의 `_entry_months_bulk` · `_bulk_upsert_*`였고 증감분석·집계
-엔드포인트가 그 밑줄 이름을 직접 import해서 썼다(PLAN.md P1-1).
+**쓰기 경로를 한곳에 모으는 파일**이다 — 비용 값을 쓰는 길이 여기 하나다.
 
-더 중요한 이유는 **쓰기 경로를 한곳에 모으는 것**이다(PLAN.md P1-3). 분기·연간(QUARTER/YEAR) 행은
-공용 경로(cost.py의 _resync_summary)에서는 월 값을 쓸 때마다 12개월 합으로 재계산되는데,
-해외연구소 경로(/overseas/state)는 월 행만 쓰고 재계산을 하지 않았다. 그래서 overseas의 분기·연간
-행은 한 번 백필된 값에서 멈춰 있었다 — "같은 데이터, 두 가지 쓰기 규칙"이고, 정체된 그 행을 읽는
-경로가 하나라도 생기면 화면 합계와 다른 숫자가 나온다. 쓰기가 이 모듈로 모이는 지금이 고칠 자리다
-(resync_summaries).
+분기·연간(QUARTER/YEAR) 행 규칙: **저장은 연구소가 파일에 적어 보낸 칸만 담고, 월에서 계산해
+만들어 두지 않는다.** 월에서 계산할 수 있는 값을 복사해 두면 그 복사본만 틀어진다 — 인력(명)을
+합으로 재계산해 분기가 3배·연간이 12배가 된 행이 전체의 96%였다. 보는 쪽은 저장된 칸이 있으면 그 값을,
+없으면 월에서 계산한 값을 그린다(core.js withPer → run17 · services/aggregate.to_17). 안 적어 보낸
+칸과 월 합이 안 맞는 칸은 업로드 미리보기가 색으로 알린다(shared/core/anomaly.py).
 """
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.accounts.overseas.cost_groups import AGGREGATE_ROWS
 from app.shared.core.periods import ym_month, ym_year
 from app.shared.models.common import CostEntry, CostEntryDetail
 from app.shared.models.plan import ManagementPlanEntry, ManagementPlanEntryDetail, ManagementPlanVersion
-from app.accounts.overseas.services.labs import ACCOUNT_KEY
+from app.accounts.overseas.services.labs import ACCOUNT_KEY, summable_pks
 
 # 분기 → 그 분기에 드는 월(1-based). cost.py의 QUARTERS와 같은 정의다 — 분기·연간을 두 경로가
 # 다르게 자르면 같은 데이터가 다른 합계를 갖는다.
 QUARTERS: dict[int, tuple[int, int, int]] = {1: (1, 2, 3), 2: (4, 5, 6), 3: (7, 8, 9), 4: (10, 11, 12)}
-# 경영계획 차수를 고르는 규칙이 여기 한 곳에 있다(2026-11-17). 전에는 `PLAN_NO = "P00"` 상수였다 —
-# 차수가 쌓여도(P00 → P01 → P02) 읽기·쓰기 모두 P00만 보고 있어서, 확정한 새 차수가 화면·챗봇
-# 어디에도 반영되지 않았다.
+# 경영계획 차수를 고르는 규칙이 여기 한 곳에 있다. 차수 상수를 박아 두면 차수가 쌓여도
+# (P00 → P01 → P02) 읽기·쓰기가 한 차수만 보게 되고, 확정한 새 차수가 화면·챗봇 어디에도
+# 반영되지 않는다.
 #
 # 규칙(읽기): ★(is_final, 그 연도의 공식 비교 기준)이 지정돼 있으면 그것 → 없으면 **확정된
 # (is_confirmed) 차수 중 가장 최근** → 확정된 게 없으면 가장 최근 차수. 마지막 단계는 작성 중인
@@ -79,51 +78,6 @@ def writable_plan_no(db: Session, year: int) -> str:
     return drafts[-1].plan_no if drafts else ""
 
 
-def resync_summaries(db: Session, entry_years: set[tuple[int, int]]) -> None:
-    """(cost_entry_id, year) 묶음의 QUARTER·YEAR 행을 저장된 MONTH 12개로 다시 계산해 덮어쓴다.
-
-    PLAN.md P1-3 해결. cost.py의 _resync_summary와 같은 규칙이지만 두 가지가 다르다:
-
-    ① 들어온 값 배열이 아니라 **저장된 MONTH 행을 다시 읽어서** 계산한다. 해외연구소 저장은
-       None인 달을 건너뛰는 부분 갱신이라(bulk_upsert_cost_entries), 보낸 배열만 보고 더하면
-       "이번에 안 보낸 달"이 0으로 빠져 분기 합이 줄어든다.
-    ② 조합마다 따로 upsert하지 않고 한 문장으로 모아 쓴다 — 해외연구소는 연구소×비용항목 조합이
-       많아서(수백 개) 조합당 5번씩 왕복하면 저장 한 번이 수천 번 왕복이 된다.
-    """
-    if not entry_years:
-        return
-    ids = {eid for eid, _ in entry_years}
-    years = {y for _, y in entry_years}
-    months: dict[tuple[int, int], dict[int, float]] = {}
-    for r in db.scalars(
-        select(CostEntryDetail).where(
-            CostEntryDetail.cost_entry_id.in_(ids),
-            CostEntryDetail.year.in_(years),
-            CostEntryDetail.period_type == "MONTH",
-        )
-    ):
-        months.setdefault((r.cost_entry_id, r.year), {})[r.period] = float(r.amount)
-
-    values = []
-    for eid, year in sorted(entry_years):
-        got = months.get((eid, year), {})
-        quarters = {q: sum(got.get(m, 0.0) for m in mos) for q, mos in QUARTERS.items()}
-        for q, amount in quarters.items():
-            values.append({"cost_entry_id": eid, "year": year, "period_type": "QUARTER",
-                           "period": q, "col_name": "", "amount": amount})
-        values.append({"cost_entry_id": eid, "year": year, "period_type": "YEAR",
-                       "period": 0, "col_name": "", "amount": sum(quarters.values())})
-    if not values:
-        return
-    stmt = pg_insert(CostEntryDetail).values(values)
-    db.execute(
-        stmt.on_conflict_do_update(
-            index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
-            set_={"amount": stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
-        )
-    )
-
-
 def entry_months_bulk(db: Session, entries: list[CostEntry]) -> dict[int, list[float | None]]:
     """엔트리별 월 값을 한 번의 쿼리로 모아 돌려준다 (호출부가 엔트리마다 따로 조회하지 않도록).
     기본은 12개월(그 헤더의 yyyymm 연도)이지만, 다음 연도치(year+1)까지 저장돼 있으면 24개월(그다음도
@@ -171,11 +125,26 @@ def plan_entry_months_bulk(db: Session, entry_ids: list[int]) -> dict[int, list[
     return {eid: [by_entry.get(eid, {}).get(m) for m in range(1, 13)] for eid in entry_ids}
 
 
-def bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, list[float | None]]]) -> None:
+def bulk_upsert_cost_entries(
+    db: Session,
+    rows: list[tuple[str, str, str, str, list[float | None]]],
+    clear_blanks: bool = False,
+    periods: dict[tuple[str, str, str, str], list[float | None]] | None = None,
+) -> None:
     """(scope_code, version, category_code, yyyymm, months) 목록을 헤더·디테일 각각 단일 upsert
     문으로 한 번에 처리한다 — save_overseas_state가 행마다 get_or_create_entry+월별 insert를
     따로 호출하면 (lab×category 조합 수)×14번 왕복이 나서, 그걸 피하려고 모아서 처리한다.
-    같은 키가 두 번 들어오면 (호출부가 겹쳐 보낸 경우) 마지막 값이 이긴다 — 기존의 순차 upsert와 동일한 규칙."""
+    같은 키가 두 번 들어오면 (호출부가 겹쳐 보낸 경우) 마지막 값이 이긴다 — 기존의 순차 upsert와 동일한 규칙.
+
+    periods는 (scope_code, version, category_code, yyyymm) -> [1Q,2Q,3Q,4Q,연간]이다. 연구소가 파일에
+    적어 보낸 분기·연간 칸을 **그대로** 저장한다. 안 주면(None) 그 칸은 **저장하지 않는다** — 월에서
+    계산해 만들어 두지 않는다(머리 주석). 보는 쪽이 저장된 칸이 있으면 그 값을, 없으면 월에서 계산한
+    값을 그린다.
+
+    clear_blanks는 **빈칸의 뜻**을 고른다. 기본(False)은 "그 달은 건드리지 마라"(부분 갱신)이고,
+    True는 "그 달은 아직 안 냈다"라서 저장된 상세 행을 지운다. 파일 업로드가 True를 쓴다 — 연구소가
+    칸을 비워 다시 보냈는데 건너뛰기만 하면 지난 업로드의 숫자가 남아 화면이 거짓으로 채워지고,
+    0으로 덮으면 "0으로 보고"가 된다. 0.0은 보고된 값이라 지우지 않는다."""
     dedup: dict[tuple[str, str, str, str], list[float | None]] = {
         (scope_code, version, category_code, yyyymm): months
         for scope_code, version, category_code, yyyymm, months in rows
@@ -211,20 +180,63 @@ def bulk_upsert_cost_entries(db: Session, rows: list[tuple[str, str, str, str, l
         for i, amount in enumerate(months)
         if amount is not None
     ]
-    if not detail_values:
-        return
-    detail_stmt = pg_insert(CostEntryDetail).values(detail_values)
-    detail_stmt = detail_stmt.on_conflict_do_update(
-        index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
-        set_={"amount": detail_stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
-    )
-    db.execute(detail_stmt)
+    # 비워 보낸 달을 지운다(clear_blanks) — 올린 칸과 같은 규칙으로(연도 넘김 포함) 좌표를 만든다.
+    if clear_blanks:
+        blanks = [
+            (id_by_key[(scope_code, category_code, yyyymm, version)], ym_year(yyyymm) + i // 12, i % 12 + 1)
+            for (scope_code, version, category_code, yyyymm), months in dedup.items()
+            for i, amount in enumerate(months)
+            if amount is None
+        ]
+        if blanks:
+            db.execute(
+                delete(CostEntryDetail).where(
+                    CostEntryDetail.period_type == "MONTH",
+                    CostEntryDetail.col_name == "",
+                    tuple_(CostEntryDetail.cost_entry_id, CostEntryDetail.year, CostEntryDetail.period).in_(
+                        blanks
+                    ),
+                )
+            )
 
-    # 월 값을 쓴 바로 그 자리에서 분기·연간을 다시 계산한다(PLAN.md P1-3) — 호출부가 따로
-    # 불러 줘야 하는 구조면 언젠가 빠뜨리고, 그러면 다시 "같은 데이터, 두 가지 쓰기 규칙"이 된다.
-    # flush가 필요하다: resync가 방금 upsert한 MONTH 행을 다시 읽어 더하기 때문이다.
-    db.flush()
-    resync_summaries(db, {(v["cost_entry_id"], v["year"]) for v in detail_values})
+    if detail_values:
+        detail_stmt = pg_insert(CostEntryDetail).values(detail_values)
+        detail_stmt = detail_stmt.on_conflict_do_update(
+            index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
+            set_={"amount": detail_stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
+        )
+        db.execute(detail_stmt)
+
+    # 파일이 적어 보낸 분기·연간을 그대로 쓴다. 月 합으로 덮이지 않게 자리를 따로 모아 둔다.
+    from_file: set[tuple[int, int]] = set()
+    period_values = []
+    for key, cells in (periods or {}).items():
+        entry_id = id_by_key.get((key[0], key[2], key[3], key[1]))
+        if entry_id is None or not cells:
+            continue
+        year = ym_year(key[3])
+        for i, amount in enumerate(cells[:5]):
+            if amount is None:
+                continue
+            kind = ("QUARTER", i + 1) if i < 4 else ("YEAR", 0)
+            period_values.append({
+                "cost_entry_id": entry_id, "year": year, "period_type": kind[0],
+                "period": kind[1], "col_name": "", "amount": amount,
+            })
+            from_file.add((entry_id, year))
+    if period_values:
+        period_stmt = pg_insert(CostEntryDetail).values(period_values)
+        db.execute(period_stmt.on_conflict_do_update(
+            index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
+            set_={"amount": period_stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
+        ))
+
+    # 분기·연간은 **연구소가 파일에 적어 보낸 칸만** 저장한다 — 월에서 계산해 만들어 두지 않는다
+    # (2026-11-24). 월에서 만들 수 있는 값을 DB에 복사해 두면 그 복사본이 틀어질 뿐이다: 실제로
+    # 인력(명)을 합으로 재계산해 분기가 3배·연간이 12배가 된 행이 전체의 96%였다.
+    # 보는 쪽은 저장된 칸이 있으면 그 값을, 없으면 월에서 계산한 값을 그린다(core.js withPer →
+    # run17 · aggregate.to_17). 안 적어 보낸 칸과 월 합이 안 맞는 칸은 업로드 미리보기가
+    # 색으로 알린다(anomaly: blank · missing_cell · period_mismatch).
 
 
 def bulk_upsert_plan_entries(
@@ -334,10 +346,68 @@ def upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months:
     db.execute(stmt)
 
 
-def current_basis_month(db: Session) -> int:
-    """forecast(속보) 버전 중 가장 최근(yyyymm 최댓값)의 월 — 지금 편성 기준월.
-    yyyymm이 "YYYYMM" 6자리 고정폭이라 문자열 최댓값이 곧 날짜순 최댓값과 같다."""
-    latest = db.scalar(
-        select(func.max(CostEntry.yyyymm)).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == "forecast")
+def filled_cost_yyyymm(
+    db: Session, version: str, before: str | None = None, after: str | None = None
+) -> str:
+    """그 버전에서 **합산 대상 연구소 데이터가 실제로 들어 있는** 가장 늦은 편성 연월. 없으면 빈 문자열.
+
+    왜 max(yyyymm)이 아닌가 (2026-11-23): 그냥 최댓값을 집으면 연구소 행이 하나도 없는 달도 "그
+    버전이 있는 달"로 집힌다. 실제로 11월 속보에 원화 기타(_ETC) 빈 줄 하나만 들어간 적이 있는데,
+    그것 때문에 편성 기준월이 11월로 밀려서 화면이 11월로 열리고 증감분석은 "26.11 속보 데이터가
+    없다"로 404가 났다 — 같은 달을 두고 한쪽은 "있다", 계산은 "없다"고 답한 것이다.
+
+    그래서 판정 기준을 계산이 실제로 읽는 집합(versions.load_cost_version → scope_code가 합산 대상)
+    과 같게 맞춘다. 합산 대상은 그 달 시점 기준정보로 가린다(labs.summable_pks) — 통화·활성 여부가
+    달마다 다를 수 있어서 달을 먼저 알아야 하고, 그래서 최댓값 하나를 묻는 대신 연월을 내림차순으로
+    훑어 처음 걸리는 달을 돌려준다(보통 첫 번째에서 끝난다).
+
+    추가 행(label이 있는 행)도 "데이터 있음"으로 본다 — 연구소가 올린 금액이라 고정 계정이 비어도
+    그 달은 일이 시작된 달이다(증감분석 표도 추가 행 줄에 그 금액을 보여준다).
+    """
+    stmt = (
+        select(CostEntry.yyyymm)
+        .where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.version == version)
+        .group_by(CostEntry.yyyymm)
+        .order_by(CostEntry.yyyymm.desc())
     )
+    if before is not None:
+        stmt = stmt.where(CostEntry.yyyymm < before)
+    if after is not None:
+        stmt = stmt.where(CostEntry.yyyymm > after)
+    for ym in db.scalars(stmt):
+        if has_summable_rows(db, version, ym):
+            return ym
+    return ""
+
+
+def has_summable_rows(db: Session, version: str, ym: str) -> bool:
+    """그 버전·연월에 합산 대상 연구소 행이 하나라도 있나 — filled_cost_yyyymm과 같은 판정이다
+    (달을 알고 있을 때 쓴다)."""
+    if not ym:
+        return False
+    return bool(
+        db.scalar(
+            select(CostEntry.id)
+            .where(
+                CostEntry.account_code == ACCOUNT_KEY,
+                CostEntry.version == version,
+                CostEntry.yyyymm == ym,
+                CostEntry.scope_code.in_(summable_pks(db, f"{ym[:4]}-{ym[4:6]}")),
+            )
+            .limit(1)
+        )
+    )
+
+
+def current_basis_yyyymm(db: Session) -> str:
+    """지금 편성 기준 연월 "YYYYMM" — forecast(속보) 중 가장 최근. 아무것도 없으면 빈 문자열.
+
+    current_basis_month가 월만 돌려주는 것과 달리 연도까지 필요한 곳이 있다. "지나간 칸은 건드리지
+    않는다"를 판정할 때가 그렇다 — 월만 보면 연말에 202512와 202601을 거꾸로 비교한다."""
+    return filled_cost_yyyymm(db, "forecast")
+
+
+def current_basis_month(db: Session) -> int:
+    """지금 편성 기준월 — 속보 데이터가 실제로 들어 있는 가장 늦은 달의 월(filled_cost_yyyymm)."""
+    latest = current_basis_yyyymm(db)
     return ym_month(latest) if latest else 0

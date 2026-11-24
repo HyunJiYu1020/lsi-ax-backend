@@ -217,9 +217,9 @@ def test_bulk_upsert_reason_rows(db):
     assert yms == {"202609", "202611"}
 
 
-# ---------- 적용 차수 고르기 (2026-11-17) ----------
-# 전에는 읽기·쓰기가 모두 `PLAN_NO = "P00"` 상수였다 — P01·P02를 확정해도 화면·챗봇이 계속
-# P00을 보고, 저장도 P00에만 들어갔다. 규칙은 pick_plan_no 한 곳에 있다.
+# ---------- 적용 차수 고르기 ----------
+# 규칙은 pick_plan_no 한 곳에 있다 — 차수 상수를 박아 두면 P01·P02를 확정해도 화면·챗봇이 계속
+# 한 차수만 보고, 저장도 거기로만 들어간다.
 class _Rev:
     def __init__(self, plan_no, is_final=False, is_confirmed=False):
         self.plan_no, self.is_final, self.is_confirmed = plan_no, is_final, is_confirmed

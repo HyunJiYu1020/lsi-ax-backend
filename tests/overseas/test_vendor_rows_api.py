@@ -1,27 +1,38 @@
-"""외주용역 전용 저장 API — PLAN.md Phase 5(PUT /state 점진 분해)의 첫 조각.
+"""외주용역 전용 저장 API — `PUT /state`에서 떼어낸 도메인별 저장.
 
-저장이 `PUT /overseas/state` 하나에 뭉쳐 있어서 외주용역 한 시트를 올려도 화면 상태 전부가
-전송됐다. 외주용역은 이미 "연구소×버전 단위 전체 교체" 의미라 떼어내기 가장 쉬운 자리다.
+`PUT /overseas/state`로 보내면 외주용역 한 시트를 올려도 화면 상태 전부가 전송된다.
+외주용역은 이미 "연구소×버전 단위 전체 교체" 의미라 떼어내기 가장 쉬운 자리다.
 
 가장 중요한 성질은 **두 경로가 같은 결과를 낸다**는 것이다 — 전용 API와 일괄 저장이 같은 서비스
-함수를 부르므로, 롤백을 위해 둘을 병행해 둬도 데이터가 갈리지 않는다(PLAN Phase 5의 롤백 조건).
+함수를 부르므로 둘을 병행해 둬도 데이터가 갈리지 않는다.
 """
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
 from app.accounts.overseas.endpoints.collect import (
     get_overseas_state,
-    save_overseas_state,
+    save_overseas_state as _save_overseas_state,
     save_vendor_rows,
 )
 from app.accounts.overseas.models import OverseasVendorRow, OverseasVendorRowDetail
 from app.accounts.overseas.schemas import VendorRow, VendorRowsIn
 from app.accounts.overseas.services.labs import all_labs
 
+
+# 이 엔드포인트들은 BackgroundTasks를 받는다 — 증감사유 번역을 응답 뒤로 미루기 때문이다
+# (services/reason_rows.prewarm_in_background). 테스트는 BackgroundTasks를 만들어 넘기고 그 안에
+# 쌓인 작업은 실행하지 않는다 — 저장 로직만 검증하고 LLM을 타지 않는다(번역은 test_reason_prewarm).
+def save_overseas_state(*a, **kw):
+    kw.setdefault("background", BackgroundTasks())
+    return _save_overseas_state(*a, **kw)
+
 BASIS_YEAR = 2026
-VER = "cur"
+BASIS_MONTH = 9
+# 외주용역·증감사유는 이제 "어느 달 회신인지"(yyyymm)를 들고 다닌다 — 없으면 400이다.
+YM = f"{BASIS_YEAR}{BASIS_MONTH:02d}"
+VER = "forecast"   # version은 cost_entries와 같은 값만 받는다(forecast|actual)
 
 
 @pytest.fixture
@@ -35,7 +46,7 @@ def lab_code(db) -> str:
 
 def _row(lab: str, no: int, amount: float, company: str = "테스트상사") -> VendorRow:
     return VendorRow(
-        lab_code=lab, version=VER, row_no=no, category="개발", project=f"P{no}",
+        lab_code=lab, version=VER, yyyymm=YM, row_no=no, category="개발", project=f"P{no}",
         company=company, description="설명", m=[amount] * 12, source_file="t.xlsx",
     )
 
@@ -102,8 +113,7 @@ def test_other_labs_are_untouched(db):
 def test_matches_the_bulk_state_path(db, lab_code):
     """전용 API와 일괄 저장(PUT /state)이 같은 결과를 낸다.
 
-    같은 서비스 함수를 부르므로 성립해야 하는 성질이다 — 이게 깨지면 롤백을 위해 두 경로를
-    병행해 둘 수 없다(PLAN Phase 5의 롤백 조건)."""
+    같은 서비스 함수를 부르므로 성립해야 하는 성질이다 — 이게 깨지면 두 경로를 병행해 둘 수 없다."""
     rows = [_row(lab_code, 1, 7.5, "A사"), _row(lab_code, 2, 8.5, "B사")]
 
     save_vendor_rows(body=VendorRowsIn(basis_year=BASIS_YEAR, rows=rows), db=db)

@@ -28,7 +28,7 @@ SHARED = {"shared_centers": {"C10I8000"}}
 
 
 def _vou(**kw):
-    base = {"vendor": "", "text": "", "cost_center": "", "project_code": ""}
+    base = {"vendor": "", "text": "", "cost_center": "", "project_code": "", "assignment": ""}
     return {**base, **kw}
 
 
@@ -147,6 +147,68 @@ def test_text_rule_matches_by_containment():
 
     assert match_rule(_vou(text="9월 클라우드 사용분 정산"), rules)["scope_key"] == "SARC:CPU"
     assert match_rule(_vou(text="9월 서버 임차료"), rules) is None
+
+
+# ---------- 비교 방법(match_op) · 지정 필드 · 거절 (TC-081 · TC-085) ----------
+def test_assignment_rule_with_starts_with():
+    """\"CP는 Assignment가 'CP-'로 시작하는 걸로 판별해줘\" — starts_with가 있어야 성립한다."""
+    rules = [{
+        "match_field": "assignment", "match_value": "CP-", "match_op": "starts_with",
+        "scope_key": "CP", "excluded": False,
+    }]
+
+    assert match_rule(_vou(assignment="CP-2026-01"), rules)["scope_key"] == "CP"
+    assert match_rule(_vou(assignment="CP-2027-07"), rules)["scope_key"] == "CP", "다음 과제번호에도 걸려야 한다"
+    assert match_rule(_vou(assignment="NON-CP-2026"), rules) is None, "contains로 동작하면 이것까지 걸린다"
+    assert match_rule(_vou(assignment=""), rules) is None  # 지정 필드가 비어 있으면 안 걸린다
+
+
+def test_match_op_narrows_and_widens():
+    """같은 값이라도 비교 방법에 따라 결과가 달라진다 — equals는 안 걸리고 contains는 걸린다."""
+    def rule(op):
+        return [{"match_field": "assignment", "match_value": "CP-", "match_op": op,
+                 "scope_key": "CP", "excluded": False}]
+
+    vou = _vou(assignment="NON-CP-2026")
+    assert match_rule(vou, rule("equals")) is None
+    assert match_rule(vou, rule("contains"))["scope_key"] == "CP"
+    assert match_rule(vou, rule("starts_with")) is None
+
+
+def test_blank_match_op_keeps_old_behavior():
+    """match_op가 비어 있는(이 컬럼이 생기기 전에 만든) 규칙은 예전대로 동작해야 한다 —
+    적요는 '포함', 나머지는 '같음'. 일괄 백필하면 기존 적요 규칙이 전부 어긋난다."""
+    text_rule = [{"match_field": "text", "match_value": "클라우드", "scope_key": "SARC:CPU", "excluded": False}]
+    assert match_rule(_vou(text="9월 클라우드 사용분"), text_rule)["scope_key"] == "SARC:CPU"
+
+    vendor_rule = [{"match_field": "vendor", "match_value": "한빛", "scope_key": "DSRA", "excluded": False}]
+    assert match_rule(_vou(vendor="한빛상사"), vendor_rule) is None, "거래처는 '같음'이어야 한다"
+
+
+def test_rejected_rule_is_never_applied():
+    """거절한 제안은 같은 테이블에 남지만 매칭에는 쓰이지 않는다 (TC-085).
+
+    남기는 이유는 "다시 묻지 않기" 하나다 — 매칭에서 빼지 않으면 담당자가 [닫기]를 눌렀는데
+    그 규칙이 그대로 적용돼서, 거절이 승인과 같은 결과가 된다."""
+    rejected = {"match_field": "vendor", "match_value": "한빛상사", "scope_key": "DSRA",
+                "excluded": False, "rejected": True}
+    assert match_rule(_vou(vendor="한빛상사"), [rejected]) is None
+
+    # 거절 행이 앞에 있어도 뒤의 정상 규칙은 걸려야 한다(continue이지 break가 아니다).
+    ok = {"match_field": "vendor", "match_value": "한빛상사", "scope_key": "SARC:CPU", "excluded": False}
+    assert match_rule(_vou(vendor="한빛상사"), [rejected, ok])["scope_key"] == "SARC:CPU"
+
+
+def test_rejected_rule_stops_the_same_suggestion():
+    """거절 행이 있으면 같은 제안을 다시 내지 않는다 — suggest_rules의 '이미 답한 것' 집합에 든다."""
+    corrections = [
+        {"vendor": "한빛상사", "cost_center": "", "project_code": "", "scope_key": "DSRA", "excluded": False}
+    ] * RULE_MIN_HITS
+
+    assert any(s["match_field"] == "vendor" for s in suggest_rules(corrections, []))
+
+    rejected = [{"match_field": "vendor", "match_value": "한빛상사", "rejected": True}]
+    assert not suggest_rules(corrections, rejected), "거절했는데 다음 조회에 또 뜨면 안 된다"
 
 
 # ---------- 반복 수정 → 규칙 제안 ----------

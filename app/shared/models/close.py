@@ -79,6 +79,11 @@ class CloseVoucher(Base):
     fc_amount: Mapped[float] = mapped_column(Numeric(18, 2), default=0, comment="거래통화 금액(원본)")
     krw_amount: Mapped[float] = mapped_column(Numeric(18, 0), default=0, comment="원화 금액(원본). 집계·다운로드가 쓰는 값")
     ref_no: Mapped[str] = mapped_column(String(40), default="", comment="품의번호")
+    assignment: Mapped[str] = mapped_column(
+        String(60), default="",
+        comment='ERP 지정(Assignment) 필드. 연구소·CP 구분을 여기에만 적어 보내는 전표가 있어 '
+        '매칭 규칙의 단서로 쓴다(close_match_rules.match_field="assignment"). ERP가 안 주면 빈 문자열',
+        )
     account_key: Mapped[str] = mapped_column(
         String(32), default="", index=True, comment="자동 분류된 19개 계정 key(overseas 등). 빈 문자열이면 미분류"
     )
@@ -173,14 +178,26 @@ class CloseMatchRule(Base):
     아무도 모른다.
 
     match_field가 여럿인 이유: 단서가 전표마다 다르다. 거래처가 분명한 전표는 vendor로, 연구소
-    이름이 적요에만 있는 전표는 text로, 과제 단위로 딱 나뉘는 전표는 project로 걸어야 한다.
+    이름이 적요에만 있는 전표는 text로, 과제 단위로 딱 나뉘는 전표는 project로, 구분을 ERP 지정
+    필드에만 적어 보내는 전표는 assignment로 걸어야 한다.
+
+    비교 방법(match_op)을 따로 둔 이유: 같은 필드라도 걸고 싶은 방식이 다르다. "CP는 지정 필드가
+    'CP-'로 시작하는 것"은 starts_with여야 하고, 'CP-2026-01'을 equals로 걸면 다음 과제번호에는
+    안 걸린다. 반대로 contains로 걸면 'NON-CP-'까지 걸린다.
+
+    거절(rejected)도 저장한다 — 담당자가 제안에 [닫기]를 누른 것도 판단이라서, 안 남기면 다음
+    조회에 같은 제안이 다시 뜬다(row_aliases가 "별개 행이다"를 저장하는 것과 같은 이유).
     """
 
     __tablename__ = "close_match_rules"
     __table_args__ = (
         UniqueConstraint("account_key", "match_field", "match_value", name="uq_close_match_rules_key"),
         CheckConstraint(
-            "match_field IN ('vendor', 'text', 'cost_center', 'project')", name="ck_close_match_rules_match_field"
+        "match_field IN ('vendor', 'text', 'cost_center', 'project', 'assignment')",
+        name="ck_close_match_rules_match_field",
+        ),
+        CheckConstraint(
+        "match_op IN ('', 'equals', 'contains', 'starts_with')", name="ck_close_match_rules_match_op"
         ),
         {
             "comment": "담당자가 승인한 전표→편성항목 매칭 규칙. 반복 수정을 감지해 물어보고, 승인한 "
@@ -191,9 +208,17 @@ class CloseMatchRule(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     account_key: Mapped[str] = mapped_column(String(32), comment="이 규칙이 적용되는 계정 key(overseas 등)")
     match_field: Mapped[str] = mapped_column(
-        String(12), comment="무엇으로 거는지: vendor(거래처) | text(적요 포함) | cost_center(코스트센터) | project(과제코드)"
+        String(12),
+        comment="무엇으로 거는지: vendor(거래처) | text(적요) | cost_center(코스트센터) | "
+        "project(과제코드) | assignment(ERP 지정 필드)",
     )
-    match_value: Mapped[str] = mapped_column(String(100), comment="비교할 값. text는 '포함'으로, 나머지는 '같음'으로 본다")
+    match_value: Mapped[str] = mapped_column(String(100), comment="비교할 값")
+    match_op: Mapped[str] = mapped_column(
+        String(12), default="",
+        comment="비교 방법: equals(같음) | contains(포함) | starts_with(~로 시작). 빈 문자열이면 "
+        "필드별 기본값(text는 contains, 나머지는 equals) — 이 컬럼이 생기기 전 규칙이 그 동작이라 "
+        "빈 값을 그대로 두고 해석한다(일괄 백필하면 기존 적요 규칙이 '같음'으로 바뀌어 다 어긋난다)",
+        )
     scope_key: Mapped[str] = mapped_column(
         String(50), default="", comment="붙일 곳(연구소 pk 등). excluded가 True면 빈 문자열"
     )
@@ -202,6 +227,12 @@ class CloseMatchRule(Base):
         SmallInteger, default=0, comment="규칙을 만들게 한 반복 수정 횟수(화면에 '3번 같은 수정'으로 보여준다)"
     )
     note: Mapped[str] = mapped_column(String(200), default="", comment="규칙 설명. 나중에 왜 만든 규칙인지 알아보려면 필요하다")
+    rejected: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="True면 담당자가 이 규칙 제안에 [닫기]를 눌렀다는 뜻 — 규칙으로 쓰지 않고(매칭에서 "
+        "건너뛴다) 같은 제안을 다시 띄우지 않기 위해 남긴다. row_aliases의 "
+        "target_kind='distinct'와 같은 이유다: '아니다'도 사람이 판단한 결과라 안 남기면 매달 다시 묻는다",
+        )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), comment="승인한 시각")
 
 
@@ -254,9 +285,8 @@ class CloseAccountStage(Base):
     시뮬레이션 화면의 [확정]으로만 된다. 그래서 여기서 '1차 완료'까지만 표시하고 계정 완료는
     건드리지 않는다(first_done_at이 그 1차 완료 시각이다).
 
-    "1차 완료"의 진실은 mapping_done 하나다 — 예전에는 overseas_actual_stages.close_first_done이
-    같은 사실을 따로 들고 있어서 애플리케이션이 둘을 맞춰 줘야 했다(한쪽만 바뀌면 [1차 분석] 탭은
-    열렸는데 값이 없는 상태가 된다). PLAN.md Phase 4로 그 테이블을 흡수했다.
+    "1차 완료"의 진실은 mapping_done 하나다 — 같은 사실을 두 테이블이 나눠 들면 한쪽만 바뀌었을 때
+    [1차 분석] 탭은 열렸는데 값이 없는 상태가 된다.
     """
 
     __tablename__ = "close_account_stages"

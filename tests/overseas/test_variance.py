@@ -93,14 +93,62 @@ def _lab(pk: str, currency: str) -> LabView:
     )
 
 
-def _cells_with_rates(monkeypatch, labs, cur_d, base_d, rate_cur, rate_base, ix=(0,)):
+def _cells_with_rates(monkeypatch, labs, cur_d, base_d, rate_cur, rate_base, ix=(0,),
+                      cur_extras=None, base_extras=None):
     """rate_arrays를 고정 환율로 바꿔치고 variance_cells만 돌린다 — 시드 환율은 속보·실적이
     같아서 DB로는 "환율이 움직인 상황"을 만들 수 없다."""
     calls = iter([rate_cur, rate_base])
     monkeypatch.setattr(varsvc, "rate_arrays", lambda *a, **k: next(calls))
     return varsvc.variance_cells(
-        None, labs, list(labs), cur_d, base_d, ix, (2026, 9, "forecast"), (2026, 8, "actual"), True
+        None, labs, list(labs), cur_d, base_d, ix, (2026, 9, "forecast"), (2026, 8, "actual"), True,
+        cur_extras, base_extras,
     )
+
+
+def test_extra_rows_count_in_variance_like_in_the_aggregate_table(monkeypatch):
+    """추가 행(사용자가 [+ 행 추가]로 만든 행)은 집계표와 **똑같이** 증감분석에도 더해진다.
+
+    고치기 전에는 집계표(agg_months)만 추가 행을 더하고 증감분석 서버 계산은 리프만 더해서, 같은
+    화면에서 위(연구소별 요약, 브라우저 계산)와 아래(계정별 상세, 서버 계산)가 다른 금액을 보여줬다.
+    실제 데이터에서 그 차이가 176억이었다 — 숫자가 틀린 게 아니라 두 표가 다른 걸 세고 있었다.
+
+    자리(anchor_key)가 가리키는 집계와 그 상위 합계에만 올라가야 한다: 전산비에 얹은 행은
+    전산비·개발비·개발비(매출)에 들어가고 인건비에는 안 들어간다.
+    """
+    labs = {"DSRA": _lab("DSRA", "USD")}
+    rate = {"USD": [1000.0]}
+    cells = _cells_with_rates(
+        monkeypatch, labs,
+        cur_d={"DSRA": {"sal": [100.0]}}, base_d={"DSRA": {"sal": [100.0]}},
+        rate_cur=rate, rate_base=rate,
+        cur_extras={"DSRA": {"it": [40.0]}},   # 전산비 아래 얹은 추가 행
+        base_extras={"DSRA": {"it": [10.0]}},
+    )
+    # 전산비 칸: 추가 행만 있는 자리라 전액이 추가 행에서 온다(40 − 10 = 30 → ×환율)
+    assert cells["it"]["cur"] == pytest.approx(40.0 * 1000)
+    assert cells["it"]["base"] == pytest.approx(10.0 * 1000)
+    # 개발비(매출)에는 급여 100 + 추가 행이 같이 들어간다
+    assert cells["tot"]["cur"] == pytest.approx((100.0 + 40.0) * 1000)
+    assert cells["tot"]["base"] == pytest.approx((100.0 + 10.0) * 1000)
+    # 인건비에는 안 들어간다 — 자리가 전산비이기 때문이다
+    assert cells["labor"]["cur"] == pytest.approx(100.0 * 1000)
+    # 환율이 그대로면 증감 전부가 환차外다(환차 0) — 추가 행도 같은 분해를 지난다
+    assert cells["tot"]["fx_local"] == 0 and cells["tot"]["fx_usd"] == 0
+    assert cells["tot"]["fx_outside"] == pytest.approx(30.0 * 1000)
+
+
+def test_extra_rows_do_not_touch_headcount(monkeypatch):
+    """인력(hc)은 명이라 추가 행을 더하지 않는다 — 금액을 인원에 더하면 인당 금액이 전부 깨진다.
+    집계표도 같은 규칙이다(anchor_key가 hc면 기타경비로 떨어뜨린다)."""
+    labs = {"DSRA": _lab("DSRA", "USD")}
+    rate = {"USD": [1000.0]}
+    cells = _cells_with_rates(
+        monkeypatch, labs,
+        cur_d={"DSRA": {"hc": [10.0]}}, base_d={"DSRA": {"hc": [10.0]}},
+        rate_cur=rate, rate_base=rate,
+        cur_extras={"DSRA": {"misc": [40.0]}}, base_extras={"DSRA": {"misc": [40.0]}},
+    )
+    assert cells["hc"]["cur"] == pytest.approx(10.0) and cells["hc"]["base"] == pytest.approx(10.0)
 
 
 def test_usd_lab_has_no_local_fx_step(monkeypatch):
@@ -114,7 +162,8 @@ def test_usd_lab_has_no_local_fx_step(monkeypatch):
     sal = cells["sal"]
     assert sal["fx_local"] == 0
     # 금액은 안 변했고 환율만 100원 올랐다 → 전부 환차($→원)다.
-    assert sal["fx_usd"] == pytest.approx(100 * 100 * 1000)
+    # 저장값이 $라 환차는 `$ × 환율차`다(전환 전에는 K$라 ×1000이 더 붙었다).
+    assert sal["fx_usd"] == pytest.approx(100 * 100)
     assert sal["fx_outside"] == pytest.approx(0)
 
 
@@ -281,18 +330,59 @@ def test_first_and_second_reasons_stored_separately(db):
     assert [r.reason_text for r in rows] == ["1차: ERP 약식 기준 감소"]
 
 
+def _check(db, month, **kw):
+    """확정 경고 조회 — 반복되는 인자를 한곳에 모아 둔다."""
+    return ov.check_variance_reasons(
+        basis_year=2026, base_version="prev", period="y", basis_month=month,
+        kind="forecast", stage="", lab_scope="ALL", plan_no=None, db=db, **kw,
+    )
+
+
 def test_reason_check_lists_only_big_moves_without_reason(db):
     """확정 경고는 증감률이 기준치를 넘었는데 사유가 없는 칸만 모은다. 집계 행(개발비(매출) 등)과
     인력·(%) 행은 빠진다 — 하위 계정의 합이라 같은 사유를 두 번 쓰게 된다."""
     month = current_basis_month(db) or 9
+    # 인자를 키워드로 넘긴다 — 이 엔드포인트는 선택 파라미터가 계속 늘어서(threshold_amount 등)
+    # 위치로 넘기면 새 파라미터가 끼어들 때 db가 그 자리로 밀려 들어간다(실제로 한 번 그랬다).
     try:
-        chk = ov.check_variance_reasons(2026, "prev", "y", month, "forecast", "", "ALL", None, 0.01, db)
+        chk = _check(db, month, threshold_pct=0.01)
     except HTTPException as e:
         pytest.skip(f"비교 기준 데이터가 없어 스킵: {e.detail}")
     assert chk.threshold_pct == 0.01
     keys = {g.category_key for g in chk.missing + chk.stale}
     assert not (keys & {"tot", "A", "hr", "labor", "asset", "hc", "pct"})
     assert all(abs(g.diff_pct) >= 0.01 for g in chk.missing)
+
+
+def test_reason_check_amount_threshold_narrows(db):
+    """"1억 이상 변동만 사유 써줘" — 금액 기준은 비율 기준과 **같이** 걸린다(둘 다 넘어야 한다).
+
+    이상 감지의 급변 기준과 같은 결합이다(anomaly.py) — 비율만 보면 금액이 작은 항목이 전부
+    걸려서 경고가 수십 개 뜨고, 그러면 아무도 안 읽는다."""
+    month = current_basis_month(db) or 9
+    try:
+        loose = _check(db, month, threshold_pct=0.01)
+    except HTTPException as e:
+        pytest.skip(f"비교 기준 데이터가 없어 스킵: {e.detail}")
+
+    tight = _check(db, month, threshold_pct=0.01, threshold_amount=1e8)
+    assert tight.threshold_amount == 1e8
+    assert all(g.diff is None or abs(g.diff) >= 1e8 for g in tight.missing)
+    # 좁힌 결과는 넓은 결과의 부분집합이어야 한다 — 금액 기준이 OR로 붙으면 오히려 늘어난다.
+    assert {g.category_key for g in tight.missing} <= {g.category_key for g in loose.missing}
+    # 어떤 기준으로 걸러낸 결과인지 문장에 밝힌다 — 안 밝히면 "사유 다 썼다"를 전체 기준으로 읽는다.
+    assert "1.0억원 이상" in tight.note
+
+
+def test_reason_check_amount_only_when_pct_is_off(db):
+    """threshold_pct=0이면 비율 조건이 꺼지고 금액만 본다 — 5%짜리 50억 변동도 잡으려면 이게 필요하다."""
+    month = current_basis_month(db) or 9
+    try:
+        chk = _check(db, month, threshold_pct=0, threshold_amount=1e8)
+    except HTTPException as e:
+        pytest.skip(f"비교 기준 데이터가 없어 스킵: {e.detail}")
+    assert "증감률" not in chk.note
+    assert all(g.diff is None or abs(g.diff) >= 1e8 for g in chk.missing)
 
 
 # ---------- 증감 동인 표 ----------
@@ -419,9 +509,9 @@ def test_first_lock_does_not_touch_version_status(db):
     assert before == after
 
 
-def test_first_converts_local_currency_to_kdollar(db):
-    """1차는 현지통화 총액을 현지/$ → 원/$ 순서로 환산한다. K$로 맞추지 않으면(1000으로 안 나누면)
-    1차 금액만 1000배로 보인다 — 2차와 더하거나 비교할 수 없게 된다."""
+def test_first_converts_local_currency_to_dollar(db):
+    """1차는 현지통화 총액을 현지/$ → 원/$ 순서로 환산한다. 비용 데이터와 같은 $ 단위로 맞춰야
+    2차와 더하거나 비교할 수 있다."""
     ov.update_actual_stage(ActualStageIn(basis_year=2026, basis_month=7, close_first_done=True), db)
     ov.upsert_actual_first(
         ActualFirstIn(basis_year=2026, basis_month=7, lab_code="SIRC", local_amount=12_000_000), db
@@ -429,8 +519,8 @@ def test_first_converts_local_currency_to_kdollar(db):
     res = ov.get_actual_first(2026, 7, "prev", None, db)
     sirc = next(r for r in res.rows if r.lab_code == "SIRC")
     assert sirc.currency == "ILS"
-    # ILS/$ 환율은 3~4 사이라 1,200만 ILS는 K$ 3,000~4,500 범위다(1000으로 안 나누면 수백만이 된다).
-    assert 2_000 < sirc.usd_amount < 6_000
+    # ILS/$ 환율은 3~4 사이라 1,200만 ILS는 $3,000,000~4,500,000 범위다(= 3,000~4,500 K$).
+    assert 2_000_000 < sirc.usd_amount < 6_000_000
     assert sirc.diff == pytest.approx(sirc.fx + sirc.fx_outside, abs=1.0)
 
 
@@ -491,3 +581,49 @@ def test_stage_shift_uses_one_rate_so_only_amounts_differ(db):
     assert sirc.first_reason == "채용 지연"
     assert sirc.diff == pytest.approx(sirc.second_krw - sirc.first_krw)
     assert res.total.diff == pytest.approx(sum(r.second_krw - r.first_krw for r in res.rows))
+
+
+# ---------- 연구소별 요약 표(화면 위)와 계정별 표(화면 아래)가 같은 숫자인가 ----------
+
+
+def test_lab_table_total_matches_the_category_table(db):
+    """연구소별 요약의 "전체 연구소" 줄 = 계정별 표의 개발비(매출) 줄.
+
+    두 표는 같은 화면에 위·아래로 같이 떠 있다. 축만 반대(연구소 × 기간 / 계정 × 기간)지 같은
+    금액을 다르게 자른 것이라 합이 어긋나면 둘 중 하나가 틀린 것이다. 2026-11-19 전에는 위 표만
+    브라우저가 계산해서 실제로 연간 개발비가 25억 벌어져 있었다 — 그 재발을 막는 계약이다.
+    """
+    try:
+        labs = ov.get_variance_labs(basis_year=2026, base_version="prev", basis_month=9, db=db)
+        table = ov.get_variance_table(basis_year=2026, base_version="prev", basis_month=9, db=db)
+    except HTTPException as e:  # 데이터가 없는 환경
+        pytest.skip(f"비교할 데이터가 없다: {e.detail}")
+
+    total = next(r for r in labs.labs if r.is_total)
+    for period in ("y", "m9", "q3"):
+        rows = {r.category_key: r for r in table.periods[period]}
+        cell, tot = total.cells[period], rows["tot"]
+        assert cell.diff == pytest.approx(tot.diff, abs=1.0), f"{period}: 증감"
+        assert cell.fx_local == pytest.approx(tot.fx_local, abs=1.0), f"{period}: 환차 현지→$"
+        assert cell.fx_usd == pytest.approx(tot.fx_usd, abs=1.0), f"{period}: 환차 $→원"
+        # 환차外을 인건비/인건비外로 가른 두 칸의 합 = 계정별 표의 개발비 환차外
+        assert cell.labor_outside + cell.non_labor_outside == pytest.approx(tot.fx_outside, abs=1.0)
+        # 인건비 칸은 계정별 표의 인건비 줄과 같아야 한다
+        assert cell.labor_outside == pytest.approx(rows["labor"].fx_outside, abs=1.0), f"{period}: 인건비"
+
+
+def test_lab_rows_add_up_to_the_total_row(db):
+    """연구소 줄을 전부 더하면 "전체 연구소" 줄이다 — 한 연구소가 빠지거나 두 번 세이면 어긋난다
+    (파트가 있는 연구소(SARC)를 합치는 자리라 실제로 틀리기 쉽다)."""
+    try:
+        labs = ov.get_variance_labs(basis_year=2026, base_version="prev", basis_month=9, db=db)
+    except HTTPException as e:
+        pytest.skip(f"비교할 데이터가 없다: {e.detail}")
+
+    total = next(r for r in labs.labs if r.is_total)
+    each = [r for r in labs.labs if not r.is_total]
+    assert each, "연구소 줄이 하나도 없다"
+    for period in ("y", "m9"):
+        for field in ("diff", "fx_local", "fx_usd", "labor_outside", "non_labor_outside"):
+            got = sum(getattr(r.cells[period], field) for r in each)
+            assert got == pytest.approx(getattr(total.cells[period], field), abs=1.0), f"{period}/{field}"

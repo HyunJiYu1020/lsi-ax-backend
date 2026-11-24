@@ -1,24 +1,39 @@
-"""증감사유 전용 저장 API — PLAN.md Phase 5의 세 번째(마지막) 조각.
+"""증감사유 전용 저장 API — `PUT /state`에서 떼어낸 도메인별 저장.
 
 외주용역·CP와 의미가 다르다: 전체 교체가 아니라 **보낸 것만 누적 반영**이다. 증감사유는 연구소
 회신을 항목별로 쌓아 가는 자료라, 한 시트를 올렸을 때 다른 항목의 사유가 사라지면 안 된다.
 """
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
 from app.accounts.overseas.endpoints.collect import (
     get_overseas_state,
-    save_overseas_state,
-    save_reason_rows,
+    save_overseas_state as _save_overseas_state,
+    save_reason_rows as _save_reason_rows,
 )
 from app.accounts.overseas.models import OverseasReasonRow
 from app.accounts.overseas.schemas import ReasonRow, ReasonRowsIn
 from app.accounts.overseas.services.labs import all_labs
 
+
+# 이 엔드포인트들은 BackgroundTasks를 받는다 — 증감사유 번역을 응답 뒤로 미루기 때문이다
+# (services/reason_rows.prewarm_in_background). 테스트는 BackgroundTasks를 만들어 넘기고 그 안에
+# 쌓인 작업은 실행하지 않는다 — 저장 로직만 검증하고 LLM을 타지 않는다(번역은 test_reason_prewarm).
+def save_overseas_state(*a, **kw):
+    kw.setdefault("background", BackgroundTasks())
+    return _save_overseas_state(*a, **kw)
+
+def save_reason_rows(*a, **kw):
+    kw.setdefault("background", BackgroundTasks())
+    return _save_reason_rows(*a, **kw)
+
 BASIS_YEAR = 2026
-VER = "cur"
+BASIS_MONTH = 9
+# 증감사유는 이제 "어느 달 회신인지"(yyyymm)를 들고 다닌다 — 없으면 400이다.
+YM = f"{BASIS_YEAR}{BASIS_MONTH:02d}"
+VER = "forecast"   # version은 cost_entries와 같은 값만 받는다(forecast|actual)
 
 
 @pytest.fixture
@@ -31,7 +46,7 @@ def lab_code(db) -> str:
 
 def _row(lab: str, cat: str, remark: str = "사유", block: str = "y") -> ReasonRow:
     return ReasonRow(
-        lab_code=lab, version=VER, category_key=cat, block=block, mon_label="",
+        lab_code=lab, version=VER, yyyymm=YM, category_key=cat, block=block, mon_label="",
         plan_value=10, prev_value=20, cur_value=30, diff_plan=20, diff_prev=10,
         remark_plan=remark, remark_prev=remark, prev_label="M2608A", cur_label="M2609A",
         source_file="r.xlsx",

@@ -1,0 +1,63 @@
+# 말 한마디 → 모델이 어떤 쓰기 도구를 고르나.
+#
+# 쓰기 도구는 실행 전에 승인 카드로 올라오므로(chat.py의 pending) **MCP 서버가 안 떠 있어도**
+# 판정할 수 있다. 저장은 일어나지 않고, 우리가 보는 건 "무엇을 하려 했나"다.
+
+- id: anomaly-threshold-only-pct
+  why: 비율만 말했는데 금액 하한까지 덮으면 경고 범위가 엉뚱하게 달라진다(API.md 이상 감지)
+  say: "이제 급변은 50% 넘는 것만 알려줘"
+  expect:
+    tool: set_anomaly_rule
+    args: {rule_key: jump, pct: 50}
+    args_absent: [amount]
+
+- id: anomaly-this-time-only
+  why: '"이번만"은 저장이 아니라 그 조회에만 적용하는 것 — 기준을 바꾸면 다음 달까지 따라간다'
+  say: "이번만 50%로 봐줘"
+  expect:
+    no_write_tool: true
+
+- id: guideline-duplicate-asks
+  why: 주제가 달라도 뜻이 겹치면 쌓기 전에 물어야 한다(이번에 넣은 중복 확인 장치)
+  given:
+    guidelines:
+      - {topic: 금액 단위, text: 금액은 억원으로 쓴다}
+  say: "금액은 백만원으로 적어줘"
+  expect:
+    asks_user: true
+    reply_has: ["금액 단위"]
+
+- id: extra-row-anchor-first
+  why: anchor_key를 비우면 표 맨 끝에 붙지만 집계에서는 기타경비로 합산된다 — 자리를 먼저 받아야 한다
+  say: "클라우드 사용료 행 추가해줘"
+  expect:
+    asks_user: true
+    reply_lacks: ["추가했습니다", "저장했습니다"]
+
+- id: amount-as-spoken
+  why: 환산은 코드(_to_stored_dollar)가 한다 — 모델이 곱하면 1000배 틀린 금액이 저장된다(규칙 9-1)
+  # 항목은 잎(급여=sal)으로 말한다. '인건비'는 급여·상여·복리후생의 상위 분류라 어디에 넣을지
+  # 되묻는 게 맞고(아래 labor-is-a-group), 그건 이 시나리오가 재려는 것과 다른 행동이다.
+  say: "SARC CPU 급여 3월에 2000 넣어줘"
+  expect:
+    tool: upsert_cost_entry
+    args: {month: 3, amount: 2000}
+
+- id: labor-is-a-group
+  why: |
+    "인건비"는 급여+상여+복리후생을 더해 만드는 줄이다(GROUP_CALC). 거기 저장하면 입력한 숫자가
+    화면에 안 보이거나 리프 합과 겹쳐 두 번 세어진다 — 자리가 틀리는 사고라 숫자만 봐선 못 본다.
+    이 시나리오가 처음 찾아낸 구멍이다: 같은 말에 모델이 어떤 때는 되묻고 어떤 때는 labor로
+    저장을 시도했다. 그래서 _group_category_hint로 코드에서 막았다.
+  say: "SARC CPU 인건비 3월에 2000 넣어줘"
+  expect:
+    asks_user: true
+    reply_has: ["급여"]
+
+- id: derived-row-wrong-tab
+  why: 파생 행은 '집계' 탭에서만 만들 수 있다 — 다른 탭에서 만들면 화면 어디에도 안 보인다
+  context: {step: 취합}
+  say: "인당 인건비 행을 인건비 나누기 인력수로 만들어줘"
+  expect:
+    asks_user: true
+    reply_has: ["집계"]

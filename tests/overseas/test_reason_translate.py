@@ -122,8 +122,11 @@ def test_parse_reads_json_array_even_with_fence_and_partial_result():
     assert _parse(raw, 3) == ["첫째", None, "셋째"]
     assert _parse("JSON이 아닌 답", 2) == [None, None]
     assert _parse('[{"i": 0, "ko": ""}, {"i": 1, "ko": null}]', 2) == [None, None]
-    # i가 빠져 있으면 나온 순서를 번호로 본다(모델이 i를 생략할 때가 있다).
-    assert _parse('[{"ko": "하나"}, {"ko": "둘"}]', 2) == ["하나", "둘"]
+    # i가 빠진 건은 **버린다**(다음 호출에서 다시 묻는다). 전에는 나온 순서를 번호로 봤는데,
+    # 모델이 i를 생략하면서 순서까지 섞으면 A연구소 사유가 B연구소 칸에 들어간다 — 번역문 자체는
+    # 멀쩡해서 담당자가 읽어도 알 수 없는, 아무 흔적도 남지 않는 오류였다.
+    assert _parse('[{"ko": "하나"}, {"ko": "둘"}]', 2) == [None, None]
+    assert _parse('[{"i": 1, "ko": "둘"}, {"ko": "하나"}]', 2) == [None, "둘"]
 
 
 def test_normalize_collapses_whitespace_only():

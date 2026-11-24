@@ -1,10 +1,8 @@
 """전 계정 공용 테이블 — 파일을 받고 증감을 분석하는 계정이면 모두 쓰는 기능들.
 
-왜 따로 뺐나 (PLAN.md P2-5): 이 7개는 원래 overseas_ 접두사를 달고 app/models/overseas.py에
-있었지만, 이름만 overseas일 뿐 해외연구소 고유 개념이 아니다. 행 이름 매칭·번역 캐시·파생 정의
-유지·이상 감지 기준·증감사유는 "엑셀을 받아 증감을 분석하는 계정"이면 똑같이 필요하다. 그대로
-두고 계정을 10개 만들면 dep_row_aliases · outsource_anomaly_rules처럼 계정당 7~8개씩 테이블이
-복제된다.
+왜 계정별 접두사를 안 쓰나: 행 이름 매칭·번역 캐시·파생 정의 유지·이상 감지 기준·증감사유는
+"엑셀을 받아 증감을 분석하는 계정"이면 똑같이 필요하다. 계정마다 테이블을 만들면
+dep_row_aliases · outsource_anomaly_rules처럼 계정당 7~8개씩 복제된다.
 
 이미 cost_entries · notes · uploads가 account_key 컬럼 패턴으로 전 계정을 받고 있으므로 같은
 패턴에 맞췄다 — 테이블은 하나고 계정은 행으로 구분한다.
@@ -64,6 +62,15 @@ class TextTranslation(Base):
     ko_text: Mapped[str] = mapped_column(String(600), comment="한국어 번역문(보고용 명사형 간결체)")
     engine: Mapped[str] = mapped_column(
         String(40), default="", comment='번역한 모델("gemini:gemini-3.5-flash-lite" 등). 모델을 바꾼 뒤 옛 번역을 구분·재번역할 때 쓴다'
+        )
+    guide_hash: Mapped[str] = mapped_column(
+        String(16), default="",
+        comment="이 번역에 적용된 번역 지침(guidelines, applies_to='translate')의 지문. 빈 문자열이면 "
+        "지침 없이 번역한 것이다.\n"
+        "왜 필요한가: 캐시는 원문 해시로만 찾으므로 담당자가 번역 지침을 바꿔도(\"Headcount는 인원으로 "
+        "써\") 이미 캐시된 번역은 옛 규칙 그대로 계속 나온다 — 지침을 등록했는데 번역이 안 바뀌는 걸 "
+        "담당자는 기능이 안 되는 것으로 읽는다. 조회할 때 이 값이 지금 지침과 다르면 캐시를 못 쓴 것으로 "
+        "보고 다시 번역해 덮어쓴다(원문 1건 = 번역 1개는 그대로 유지한다)",
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), comment="처음 번역한 시각")
     updated_at: Mapped[datetime] = mapped_column(
@@ -301,7 +308,7 @@ class AnomalyRule(Base):
         # 계정마다 급변 기준이 다를 수 있다(해외연구소는 50%, 다른 계정은 30% 등).
         UniqueConstraint("account_key", "rule_key", name="uq_anomaly_rules_key"),
         {
-            "comment": "이상 감지 기준(급변·합계 불일치·사유 누락·단위 의심). 금액 단위는 K$. "
+        "comment": "이상 감지 기준(급변·합계 불일치·사유 누락·단위 의심). 금액 단위는 $(저장 단위와 같다). "
             "행이 없으면 app/core/anomaly.py의 기본값으로 동작한다."
         },
     )
@@ -318,7 +325,7 @@ class AnomalyRule(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, comment="사용 여부. false면 그 기준은 검사하지 않는다")
     pct: Mapped[float | None] = mapped_column(Numeric(6, 2), comment="비율 기준(%). 급변만 쓴다")
     amount: Mapped[float | None] = mapped_column(
-        Numeric(14, 2), comment="금액 기준(K$). 급변=변동액 하한, 합계 불일치=허용 오차, 단위 의심=절대값 상한"
+        Numeric(14, 2), comment="금액 기준($). 급변=변동액 하한, 합계 불일치=허용 오차, 단위 의심=절대값 상한"
     )
     ratio: Mapped[float | None] = mapped_column(Numeric(10, 2), comment="배수 기준. 단위 의심만 쓴다(전 버전 대비 N배·1/N)")
     updated_at: Mapped[datetime] = mapped_column(
@@ -348,3 +355,70 @@ class AnomalyRuleLog(Base):
     source: Mapped[str] = mapped_column(String(10), default="screen", comment="chat(챗봇) | screen(화면) | reset(기본값 복구)")
     note: Mapped[str] = mapped_column(String(200), default="", comment='무슨 말로 바꿨는지(예: 챗봇 요청 "50% 넘는것만 알려줘")')
     changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), comment="바꾼 시각")
+
+
+class Guideline(Base):
+    """담당자가 챗봇에 말로 등록한 업무 지침 — "사유는 3줄 이내", "금액은 억원으로 써"(AI-18).
+
+    왜 테이블이 필요한가: 지침을 대화 안에서만 말하면 그 대화창을 닫는 순간 사라진다. 다음 달에
+    같은 담당자가 같은 말을 또 해야 하고, 사람이 바뀌면 "우리 팀은 금액을 억원으로 쓴다"는 약속
+    자체가 전해지지 않는다. 지침은 한 번 말하면 계속 적용돼야 하는 값이라 브라우저에도 둘 수
+    없다 — 여러 담당자가 같은 보고서를 만든다.
+
+    왜 프롬프트 파일(chat_prompts.py)에 적지 않는가: 거기 있는 규칙은 "숫자를 지어내지 마라"처럼
+    틀리면 사고가 나는 불변 규칙이고, 이 테이블은 "억원으로 써"처럼 팀의 취향이라 담당자가 말로
+    바꿔야 하는 값이다. 코드에 적으면 바꿀 때마다 배포가 필요하다.
+
+    topic이 핵심이다: 지침의 **주제**를 키로 잡아서 같은 주제를 다시 등록하면 덮어쓴다. 금액
+    단위 지침이 "억원"과 "백만원" 두 줄로 동시에 살아 있으면 모델이 둘 중 아무거나 고르고, 그게
+    매번 달라진다. 주제를 키로 두면 "금액은 백만원으로 써"가 들어올 때 기존 "억원" 지침이 바로
+    잡혀서 "바꿀까요?"를 물을 수 있다(TC-091 지침 충돌).
+
+    account_key에 FK를 걸지 않았다. 빈 문자열이 "전 계정 공통"이라는 뜻을 가져야 하는데(금액
+        단위는 해외연구소만의 약속이 아니다) FK로는 그 값을 표현할 수 없고, NULL로 두면 Postgres가
+    UNIQUE·ON CONFLICT에서 NULL을 서로 다른 값으로 취급해 같은 전 계정 지침이 여러 줄로 쌓인다
+    (cost_entry_details.col_name에 같은 함정이 적혀 있다). 그래서 빈 문자열로 두고, 비어 있지
+    않을 때 accounts.key에 있는지는 엔드포인트가 확인한다."""
+
+    __tablename__ = "guidelines"
+    __table_args__ = (
+        UniqueConstraint("account_key", "applies_to", "topic", name="uq_guidelines_topic"),
+        CheckConstraint(
+        "applies_to IN ('all', 'chat', 'variance_reason', 'translate')", name="ck_guidelines_applies_to"
+        ),
+        CheckConstraint("topic <> ''", name="ck_guidelines_topic_not_empty"),
+        CheckConstraint("text <> ''", name="ck_guidelines_text_not_empty"),
+        {
+        "comment": "담당자가 말로 등록한 업무 지침(AI-18). 주제(topic)를 키로 잡아 같은 주제를 "
+        "다시 등록하면 덮어쓴다. account_key=''는 전 계정 공통, applies_to로 적용 범위를 가른다."
+        },
+        )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(30), default="", index=True,
+        comment="비용계정 키(accounts.key). 빈 문자열이면 전 계정 공통 지침 — 그 값을 FK로 "
+        "표현할 수 없어 FK를 걸지 않고 엔드포인트가 확인한다",
+        )
+    applies_to: Mapped[str] = mapped_column(
+        String(20), default="all",
+        comment="적용 범위: all(어디서나) | chat(대화 답변) | variance_reason(증감사유 초안) | "
+        "translate(회신 번역). 번역 지침이 대화 답변까지 바꾸면 엉뚱한 곳에 적용된다",
+        )
+    topic: Mapped[str] = mapped_column(
+        String(40),
+        comment='지침의 주제("금액 단위" · "사유 길이"). 같은 주제를 다시 등록하면 덮어쓰는 키다 — '
+        "같은 주제 지침이 둘 이상 살아 있으면 모델이 매번 다른 걸 고른다",
+        )
+    text: Mapped[str] = mapped_column(
+        String(300), comment='지침 문장 그대로("금액은 억원 단위로 쓴다"). 프롬프트에 이 문장이 그대로 들어간다'
+        )
+    source: Mapped[str] = mapped_column(
+        String(10), default="chat", comment="chat(챗봇으로 등록) | screen(화면에서 등록)"
+        )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), comment="처음 등록한 시각"
+        )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="같은 주제로 덮어쓴 시각"
+        )

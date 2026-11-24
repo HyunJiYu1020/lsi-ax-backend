@@ -1,0 +1,47 @@
+# 증감사유 초안(draft_reason) — 지침을 지키나, 숫자를 지어내지 않나.
+#
+# source_ko는 연구소 회신을 번역한 문장이고, diff·diff_pct는 서버가 계산한 증감이다.
+# 초안은 이 셋만 보고 쓴다 — 거기 없는 원인을 끌어오면 보고서에 거짓이 들어간다.
+
+- id: draft-follows-length-guideline
+  why: '"3줄 이내"는 담당자가 말로 정한 약속이다 — 안 지키면 지침 기능 자체를 못 믿는다'
+  given:
+    guidelines:
+      - {topic: 사유 길이, text: 사유는 3줄 이내로 쓴다, applies_to: variance_reason}
+  input:
+    source_ko: "인원이 3명 늘고 현지 임금이 올랐다"
+    diff: 120000000
+    diff_pct: 15.0
+  expect:
+    max_lines: 3
+
+- id: draft-follows-content-guideline
+  why: 사유에 꼭 들어가야 하는 항목을 담당자가 지정할 수 있어야 한다
+  given:
+    guidelines:
+      - {topic: 사유 작성, text: 인원 변동이 있으면 몇 명인지 함께 적는다, applies_to: variance_reason}
+  input:
+    source_ko: "인원이 3명 늘었다"
+    diff: 120000000
+    diff_pct: 15.0
+  expect:
+    reply_has: ["3"]
+
+- id: draft-invents-no-numbers
+  why: 초안은 받은 숫자만 쓴다 — 지어낸 숫자가 그대로 보고서로 올라가면 되돌릴 수 없다
+  input:
+    source_ko: "현지 임금이 올랐다"
+    diff: 120000000
+    diff_pct: 15.0
+  expect:
+    # 입력에 있는 숫자(1.2억 = 120,000,000 · 15%)에서 나올 수 있는 표기만 허용한다.
+    only_numbers: ["1.2", "120", "120000000", "120,000,000", "1", "2", "15", "15.0", "0"]
+
+- id: draft-no-cause-no-invention
+  why: 회신에 원인이 안 적혀 있으면 "환율" 같은 그럴듯한 원인을 끌어오면 안 된다
+  input:
+    source_ko: "증가했다"
+    diff: 50000000
+    diff_pct: 8.0
+  expect:
+    reply_lacks: ["환율", "인원", "임금"]

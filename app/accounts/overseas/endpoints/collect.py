@@ -3,8 +3,8 @@
 
 라우트는 요청을 받고 검증한 뒤 services/를 부르는 얇은 층이다 — 계산·저장 규칙은 전부
 services/(state·summary·vendor·anomaly_rules·row_alias·row_merge·carry·translate·notes·uploads·
-extra_rows·labs)에 있다. 쓰기 규칙이 두 벌이 되면 "같은 데이터, 두 가지 쓰기 규칙"(PLAN P1-3)을
-다시 만들기 때문에, 일괄 저장(PUT /overseas/state)과 전용 저장 API는 같은 서비스 함수를 부른다.
+extra_rows·labs)에 있다. 쓰기 규칙이 두 벌이 되면 "같은 데이터, 두 가지 쓰기 규칙"이 되므로,
+일괄 저장(PUT /overseas/state)과 전용 저장 API는 같은 서비스 함수를 부른다.
 """
 
 import re
@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +41,7 @@ from app.shared.core.values import n
 from app.accounts.overseas.services import anomaly_rules as anomaly_rules_service
 from app.accounts.overseas.services import translate as translate_service
 from app.accounts.overseas.services.carry import carry_forward
+from app.accounts.overseas.services.cost_headers import check_labels, read_cost_headers, replace_cost_headers
 from app.accounts.overseas.services.cp import (
     contract_at,
     cp_rows_at,
@@ -60,8 +61,10 @@ from app.accounts.overseas.services.extra_rows import (
     check_lab_pk,
     check_row_formula,
     check_version,
+    classify_extra_value,
     eval_col_formula,
     eval_row_formula,
+    extra_cell_value,
     months_by_category,
     read_extra_rows,
 )
@@ -98,6 +101,8 @@ from app.accounts.overseas.schemas import (
     AnomalyScanResult,
     CarryDefIn,
     CarryDefOut,
+    CostHeaderIn,
+    CostHeaderOut,
     CarryForwardIn,
     CarryForwardResult,
     CostEntryIn,
@@ -148,10 +153,27 @@ from app.accounts.overseas.schemas import (
 router = APIRouter()
 
 
+def check_state_token(db: Session, token: str | None) -> None:
+    """전용 저장의 동시 편집 검사 — vendor-rows·cp-rows·PUT /overseas/state와 같은 규칙.
+
+    전용 저장(추가 행·추가 열 칸)도 지문(state_token)에 잡히는 테이블을 쓴다. 그래서 두 가지가
+    필요하다: ① 낡은 지문이면 거부(남의 저장을 모르고 덮지 않게) ② 성공 응답에 새 지문을 실어
+    화면이 갈아끼우게 — 안 그러면 칸 하나 고친 화면이 낡은 지문을 들고 있다가 다음 전체 저장에서
+    **자기 저장과** 충돌한다(409). 토큰이 없으면(챗봇) 검사하지 않는다."""
+    if token and token != state_token(db):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "다른 저장과 충돌했습니다 — 이 화면을 불러온 뒤 누군가 같은 화면을 저장했습니다. "
+                "화면을 다시 불러온 뒤 다시 입력해 주세요."
+            ),
+        )
+
+
 # 경영계획(plan) 역할태그는 cost_entries에 저장하지 않고 management_plan_entries가 담당한다
 # (plan_no별로 영구 보관·비교해야 해서 cost_entries의 forecast/actual과는 다른 테이블).
-# 어느 차수에 쓰는지는 services/entries.py가 정한다 — 전에는 여기 "P00" 상수가 있어서, 화면이
-# P02를 보고 있어도 저장은 늘 P00에 들어갔다.
+# 어느 차수에 쓰는지는 services/entries.py가 정한다 — 여기에 차수 상수를 두면 화면이 P02를 보고
+# 있어도 저장이 다른 차수로 들어간다.
 
 
 @router.get("/overseas/state", response_model=OverseasState)
@@ -167,8 +189,8 @@ def get_overseas_state(
 
     basis_month는 **보는 쪽이 어느 달 버전을 열었는지**다(다른 엔드포인트와 같은 규칙).
     화면이 속보 2026년 11월을 열었으면 11을 보내고, 그 달에 cost_entries 행이 없으면
-    V["cur"]가 빈 채로 내려간다 — 업로드 현황이 전부 "미"가 되어야 맞다. 안 보내면
-    종전처럼 DB의 최신 속보월로 짐작한다(옛 클라이언트 호환).
+    V["cur"]가 빈 채로 내려간다 — 업로드 현황이 전부 "미"가 되어야 맞다. 안 보내면 DB의 최신
+    속보월로 짐작한다.
 
     kind는 **속보를 보는지 실적을 보는지**다. 이게 있어야 비교 기준(전실행·전년·경영계획)을
     집계·증감분석과 같은 규칙으로 풀 수 있다 — 속보 M의 전실행은 실적 M-1이고, 실적 M의
@@ -196,13 +218,11 @@ def save_overseas_state(
 def save_vendor_rows(body: VendorRowsIn, db: Session = Depends(get_db)) -> dict[str, object]:
     """외주용역 상세만 저장한다 — 연구소×버전 단위 전체 교체.
 
-    왜 따로 있나: 저장이 `PUT /overseas/state` 하나에 뭉쳐 있어서 외주용역 한
-    시트를 올려도 화면이 가진 상태 전부가 전송됐다(메모 하나 고쳐도 마찬가지다). 외주용역은 이미
-    "단위 교체" 의미라 떼어내기 가장 쉬운 자리다.
+    왜 따로 있나: `PUT /overseas/state`로 보내면 외주용역 한 시트를 올려도 화면이 가진 상태
+    전부가 전송된다. 외주용역은 이미 "단위 교체" 의미라 떼어내기 가장 쉬운 자리다.
 
-    `PUT /overseas/state`와 **같은 서비스 함수**를 부른다 — 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서
-    겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다. 그래서 구 경로(일괄)와 신 경로(개별)를
-    같이 둬도 결과가 갈리지 않는다(PLAN Phase 5의 롤백 조건: 두 경로 병행 유지 후 전환).
+    `PUT /overseas/state`와 **같은 서비스 함수**를 부른다 — 쓰기 규칙이 두 벌이 되면 "같은
+    데이터, 두 가지 쓰기 규칙"이 되고, 일괄·개별 두 경로의 결과가 갈린다.
     """
     if body.state_token:
         if body.state_token != state_token(db):
@@ -397,7 +417,7 @@ def get_labor_split(
     """인건비 증감을 인원 효과 · 단가 효과로 나눈다(한 기간).
 
     계산은 services/labor_split.py에 있다 — 증감분석 표(17기간)와 **같은 함수**를 쓴다.
-    식이 두 벌이 되면 화면과 챗봇이 다른 답을 하고, 그건 PLAN P1-3에서 이미 겪은 사고다.
+    식이 두 벌이 되면 화면과 챗봇이 다른 답을 한다.
 
     basis_month · kind는 "어느 버전을 보고 있는가"다(집계표·증감 표와 같은 파라미터). 안 주면
     지금 편성 중인 속보로 떨어진다 — 과거 버전의 분해를 보려면 같이 보내야 한다.
@@ -785,6 +805,7 @@ async def upload_raw_file(
     lab_pk: str = Form(...),
     yyyymm: str = Form(""),
     version: str = Form(""),
+    client_token: str = Form("", alias="state_token"),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> UploadOut:
@@ -805,6 +826,9 @@ async def upload_raw_file(
         f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}_{safe_name}"
     )
     s3_key = upload_bytes(data, key, content_type=file.content_type)
+    # 보관도 uploads 행을 추가해 동시 편집 지문을 움직인다. 화면 지문이 보관 직전과 같았을 때만
+    # 새 지문을 돌려준다 — 409는 내지 않는다(UploadOut.state_token 주석).
+    token_was_fresh = bool(client_token) and client_token == state_token(db)
     up = Upload(
         account_key=ACCOUNT_KEY, scope_key=lab_pk, yyyymm=yyyymm, version=rev,
         filename=file.filename, s3_key=s3_key,
@@ -815,6 +839,7 @@ async def upload_raw_file(
     return UploadOut(
         lab_pk=lab_pk, version=rev, yyyymm=yyyymm, filename=file.filename,
         uploaded_at=up.uploaded_at, s3_key=up.s3_key,
+        state_token=state_token(db) if token_was_fresh else None,
     )
 
 
@@ -1128,6 +1153,7 @@ def merge_rows(body: RowMergeIn, db: Session = Depends(get_db)) -> RowMergeResul
 # ---------- 파생 행·열 · 추가 열 ----------
 @router.put("/overseas/extra-rows", response_model=ExtraRowOut)
 def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRowOut:
+    check_state_token(db, body.state_token)
     # 파생 행은 월별 값을 저장하지 않고 계산식만 저장한다 — 원본이 업로드로 바뀌면 파생값도 자동으로
     # 따라 바뀌어야 하므로, 조회할 때마다 계산식을 다시 평가한다(저장된 숫자는 금방 낡기 때문).
     formula = None
@@ -1190,9 +1216,37 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
         )
     elif not keep_months:
         upsert_entry_months(db, entry_id, ym_year(body.yyyymm), body.v)
+    # 파일에 적혀 온 1Q~4Q·연간 — 고정 계정(entries.py의 periods)과 같은 이유로 월 합으로 만들지
+    # 않고 그대로 저장한다. None이면 안 건드리고(이름·자리만 고치는 저장), 리스트면 전체 교체다 —
+    # 분기 칸 없이 다시 올라온 파일([])이 지난 파일의 분기값을 남기면 안 된다. 추가 행은 월 저장이
+    # 분기·연간을 재계산(resync)하지 않으므로, QUARTER·YEAR 디테일이 있다 = 연구소가 직접 적었다.
+    if not body.is_derived and body.per is not None:
+        if len(body.per) > 5:
+            raise HTTPException(status_code=400, detail="per는 [1Q,2Q,3Q,4Q,연간] 최대 5칸입니다.")
+        year = ym_year(body.yyyymm)
+        db.execute(
+            delete(CostEntryDetail).where(
+                CostEntryDetail.cost_entry_id == entry_id, CostEntryDetail.year == year,
+                CostEntryDetail.period_type.in_(("QUARTER", "YEAR")),
+            )
+        )
+        period_values = [
+            {
+                "cost_entry_id": entry_id, "year": year,
+                "period_type": "YEAR" if i == 4 else "QUARTER", "period": 0 if i == 4 else i + 1,
+                "col_name": "", "amount": amount,
+            }
+            for i, amount in enumerate(body.per)
+            if amount is not None
+        ]
+        if period_values:
+            db.execute(pg_insert(CostEntryDetail).values(period_values))
     db.commit()
 
     result = ExtraRowOut(**body.model_dump())
+    # 저장 뒤 새 지문 — 받은 토큰(낡은 것)이 응답에 그대로 실려 나가면 화면이 그걸 다시 들고
+    # 다음 저장에서 또 충돌한다(vendor-rows와 같은 규칙).
+    result.state_token = state_token(db)
     if keep_months:
         # 금액을 안 받았으니 응답에도 지금 저장돼 있는 값을 실어 보낸다 — 빈 배열을 돌려주면
         # 부르는 쪽이 "옮겼더니 금액이 지워졌다"로 읽는다.
@@ -1211,12 +1265,20 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
 @router.delete("/overseas/extra-rows")
 def delete_extra_row(
     lab_pk: str, version: str, row_key: str, yyyymm: str, step: str | None = None,
-    confirmed: bool = False, db: Session = Depends(get_db),
-) -> dict[str, str]:
+    confirmed: bool = False,
+    client_token: str | None = Query(None, alias="state_token"),
+    db: Session = Depends(get_db),
+) -> dict[str, str | None]:
     """cost_entries 행을 지운다(디테일도 FK cascade로 같이 삭제됨). label이 있는(=연구소가 직접 추가한)
     행만 지운다 — label.is_not(None) 조건이 없으면 row_key가 하필 고정 계정 code(예: "sal")와 같을 때
     업로드된 실제 데이터까지 지워버릴 수 있다.
-    step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다."""
+    step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다.
+
+    state_token은 **검사하지 않고** 응답에만 쓴다 — 삭제의 409는 "단계가 달라 정말 지울 거냐"는
+    물음이라서(화면이 확인창을 띄우고 재시도한다), 지문 충돌까지 같은 409로 보내면 화면이 둘을
+    구분할 수 없다. 대신 받은 지문이 삭제 직전과 같았을 때만 새 지문을 돌려줘서, 화면 지문이
+    낡은 채 남지 않게 한다(다른 사람 저장이 끼었으면 새 지문을 안 주고, 다음 전체 저장의 409가
+    그 사실을 알린다)."""
     check_lab_pk(db, lab_pk, allow_all=True)
     check_version(version)
     target = db.scalar(
@@ -1232,15 +1294,22 @@ def delete_extra_row(
     if target is None:
         return {"status": "ok"}  # 이미 없음 — 멱등하게 성공으로 둔다
     check_delete_step(step, target.is_derived, "행", confirmed)
+    token_was_fresh = bool(client_token) and client_token == state_token(db)
     db.execute(delete(CostEntry).where(CostEntry.id == target.id))
     db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "state_token": state_token(db) if token_was_fresh else None}
 
 
 # 추가 열은 extra_cols 테이블이 존재·이름·파생 여부를 관리하고, 원시 열의 칸 값은 그대로
 # cost_entry_details(period_type="CUSTOM", col_name=열 라벨)에 저장된다. 파생 열은 칸 값을 저장하지
 # 않고 계산식(월을 가로로 묶음)으로 조회할 때마다 계산한다.
 # label 자체가 열 식별자라 열 이름을 바꾸는 건 지원하지 않는다(지우고 새 이름으로 다시 넣으면 됨).
+#
+# 표시 형식(fmt)은 값이 아니라 **그리는 방법**이다. 양식 밖 열에는 비율이 연구소마다 다른 모양으로
+# 오는데("0.825" · "82.5"), 값만 보고는 어느 쪽인지 알 수 없다 — 0.825를 일률적으로 82.5%로 고쳐
+# 그리면 이미 퍼센트로 적어 보낸 연구소는 100배가 된다. 그래서 추측하지 않고 열마다 사람이 한 번
+# 골라 둔다. 저장된 칸 값은 형식과 무관하게 원문 그대로다(글자 값도 형식을 안 탄다).
+COL_FMTS = ("raw", "pct_ratio", "pct_plain")
 
 
 @router.get("/overseas/extra-cols", response_model=list[ExtraColOut])
@@ -1256,7 +1325,7 @@ def list_extra_cols(
     return [
         ExtraColOut(
             lab_pk=c.scope_key, version=c.version, yyyymm=c.yyyymm, label=c.label,
-            is_derived=c.is_derived, formula=c.formula,
+            is_derived=c.is_derived, formula=c.formula, fmt=c.fmt,
         )
         for c in db.scalars(stmt)
     ]
@@ -1271,15 +1340,18 @@ def upsert_extra_col(body: ExtraColIn, db: Session = Depends(get_db)) -> ExtraCo
     check_lab_pk(db, body.lab_pk, allow_all=body.is_derived)
     check_version(body.version)
     formula = check_col_formula(body.formula) if body.is_derived else None
+    if body.fmt not in COL_FMTS:
+        raise HTTPException(400, f"표시 형식은 {' | '.join(COL_FMTS)}만 쓸 수 있다.")
     stmt = pg_insert(ExtraCol).values(
         account_key=ACCOUNT_KEY, scope_key=body.lab_pk, version=body.version, yyyymm=body.yyyymm,
-        label=body.label, is_derived=body.is_derived, formula=formula,
+        label=body.label, is_derived=body.is_derived, formula=formula, fmt=body.fmt,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["account_key", "scope_key", "version", "yyyymm", "label"],
         set_={
             "is_derived": stmt.excluded.is_derived,
             "formula": stmt.excluded.formula,
+            "fmt": stmt.excluded.fmt,
             "updated_at": datetime.now(timezone.utc),
         },
     )
@@ -1311,7 +1383,9 @@ def list_cost_extras(
         out.append(
             ExtraValueOut(
                 lab_pk=entry.scope_code, version=entry.version, row_key=entry.category_code, yyyymm=yyyymm,
-                label=row.col_name, value=float(row.amount),
+                # JSON 타입이 곧 저장된 타입이다(숫자면 number, 문자열이면 text) — 화면은 typeof로
+                # 가른다: 숫자는 계산에 쓰고 글자는 그대로 그린다.
+                label=row.col_name, value=extra_cell_value(row.data_type, row.value, float(row.amount)),
             )
         )
 
@@ -1346,6 +1420,7 @@ def list_cost_extras(
 
 @router.put("/overseas/cost-extras", response_model=ExtraValueOut)
 def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> ExtraValueOut:
+    check_state_token(db, body.state_token)
     check_lab_pk(db, body.lab_pk)
     check_version(body.version)
     # 칸 값을 넣으면 그 열이 원시 열로 등록돼 있어야 한다(아직 없으면 지금 등록). 파생 열에는 칸 값을
@@ -1371,26 +1446,41 @@ def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> Extr
             .on_conflict_do_nothing(index_elements=["account_key", "scope_key", "version", "yyyymm", "label"])
         )
     entry_id = get_or_create_entry(db, body.lab_pk, body.version, body.row_key, body.yyyymm)
+    # 타입 판정(숫자인가 글자인가)은 classify_extra_value 한 곳에서만 한다 — 원문은 value에
+    # 글자 그대로, data_type이 읽는 쪽의 분기 기준이다(models.CostEntryDetail 주석).
+    data_type, raw, amount = classify_extra_value(body.value)
     stmt = pg_insert(CostEntryDetail).values(
         cost_entry_id=entry_id, year=ym_year(body.yyyymm), period_type="CUSTOM", period=0, col_name=body.label,
-        amount=body.value,
+        amount=amount, data_type=data_type, value=raw,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["cost_entry_id", "year", "period_type", "period", "col_name"],
-        set_={"amount": stmt.excluded.amount, "updated_at": datetime.now(timezone.utc)},
+        set_={
+            "amount": stmt.excluded.amount, "data_type": stmt.excluded.data_type,
+            "value": stmt.excluded.value, "updated_at": datetime.now(timezone.utc),
+        },
     )
     db.execute(stmt)
     db.commit()
-    return ExtraValueOut(**body.model_dump())
+    # 응답 값은 저장된 타입으로 돌려준다 — "1,200"을 보냈어도 number로 저장됐으면 1200.0이 온다.
+    # 조회(GET)와 같은 값이어야 호출부가 저장 직후 다시 읽지 않아도 된다.
+    # state_token은 저장 뒤의 새 지문으로 바꿔 싣는다(받은 낡은 토큰을 되돌려주면 안 된다).
+    return ExtraValueOut(
+        **body.model_dump()
+        | {"value": extra_cell_value(data_type, raw, amount), "state_token": state_token(db)}
+    )
 
 
 @router.delete("/overseas/extra-cols")
 def delete_extra_col(
     lab_pk: str, version: str, label: str, yyyymm: str, step: str | None = None,
-    confirmed: bool = False, db: Session = Depends(get_db),
-) -> dict[str, str]:
+    confirmed: bool = False,
+    client_token: str | None = Query(None, alias="state_token"),
+    db: Session = Depends(get_db),
+) -> dict[str, str | None]:
     """열 등록을 지우고, 그 열(label)이 달린 같은 yyyymm의 모든 행에서 칸 값도 같이 지운다.
-    step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다."""
+    step: 지금 보고 있는 화면 단계(취합|집계) — 추가한 단계에서만 지울 수 있게 검사한다.
+    state_token은 검사하지 않고 응답에만 쓴다 — delete_extra_row와 같은 이유(409의 뜻이 겹친다)."""
     check_lab_pk(db, lab_pk, allow_all=True)
     check_version(version)
     target = db.scalar(
@@ -1402,6 +1492,7 @@ def delete_extra_col(
     # 레지스트리가 생기기 전에 만들어졌는데 백필에서 빠진 열(칸 값이 하나도 없던 빈 열)도 지울 수
     # 있어야 하므로, 등록이 없으면 원시 열로 간주해서 단계만 확인하고 칸 값 삭제로 넘어간다.
     check_delete_step(step, bool(target and target.is_derived), "열", confirmed)
+    token_was_fresh = bool(client_token) and client_token == state_token(db)
     if target is not None:
         db.execute(delete(ExtraCol).where(ExtraCol.id == target.id))
     entry_ids = [
@@ -1421,7 +1512,40 @@ def delete_extra_col(
             )
         )
     db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "state_token": state_token(db) if token_was_fresh else None}
+
+
+# 비용 시트의 기간 열 머리글 원문(1월…12월 · 1Q~4Q · 연간). 연구소가 파일에 적어 보낸 글자를
+# 그대로 들고 있다가 취합 › 비용 표가 코드 머리글("1월") 대신 그 글자를 보여 준다 —
+# 왜 집계·증감분석 표에는 안 쓰는지는 models.OverseasCostHeader 주석에 적어 뒀다.
+# 추가 열(extra-cols)과 달리 머리글은 사람이 화면에서 고치는 값이 아니라 **파일에서 읽은 사실**이라,
+# 업로드를 반영할 때 그 시트 한 벌을 통째로 교체한다.
+
+
+@router.get("/overseas/cost-headers", response_model=list[CostHeaderOut])
+def list_cost_headers(
+    yyyymm: str, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
+) -> list[CostHeaderOut]:
+    if version:
+        check_version(version)
+    if lab_pk:
+        check_lab_pk(db, lab_pk)
+    return read_cost_headers(db, yyyymm, version, lab_pk)
+
+
+@router.put("/overseas/cost-headers", response_model=CostHeaderOut)
+def upsert_cost_headers(body: CostHeaderIn, db: Session = Depends(get_db)) -> CostHeaderOut:
+    """그 시트(연구소 · 버전 · 기준월)의 머리글 한 벌을 통째로 바꿔 넣는다.
+
+    빈 labels는 "머리글을 지운다"는 뜻이다(= 그 표가 코드 머리글로 돌아간다) — 머리글이 없는
+    파일을 다시 올렸을 때 지난 파일의 머리글이 남지 않게 하려고 지우기를 따로 두지 않았다."""
+    check_lab_pk(db, body.lab_pk)
+    check_version(body.version)
+    # 저장한 것과 돌려주는 것이 같아야 한다 — 빈 글자를 떨어낸 뒤의 한 벌이 실제로 저장된 머리글이다.
+    labels = check_labels(body.labels)
+    replace_cost_headers(db, body.lab_pk, body.version, body.yyyymm, labels, body.source_file)
+    db.commit()
+    return CostHeaderOut(**body.model_dump() | {"labels": labels})
 
 
 # ---------- 외주용역 상세 조회 ----------

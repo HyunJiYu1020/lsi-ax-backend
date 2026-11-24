@@ -301,8 +301,7 @@ def test_first_done_sets_variance_first_tab_but_not_account_done(seeded):
     assert got.mapping_done is True and got.first_done_at
     assert got.display_status == "1차 완료"
     assert got.account_done is False
-    # Phase 4로 1차 완료는 close_account_stages.mapping_done 하나가 진실이다 — 예전에는
-    # overseas_actual_stages.close_first_done이 같은 사실을 따로 들고 있었다.
+    # "1차 완료"는 close_account_stages.mapping_done 하나가 진실이다.
     stage = seeded.scalar(
         select(CloseAccountStage).where(
             CloseAccountStage.account_key == "overseas",

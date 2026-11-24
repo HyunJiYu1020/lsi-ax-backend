@@ -1,13 +1,11 @@
 """취합 화면 상태 조립 — GET /overseas/state가 돌려주는 전체 상태를 만든다.
 
-왜 여기로 옮겼나: 집계 엔드포인트가 이 라우트 핸들러를 **함수로 직접 호출**하고
-있었다(`get_overseas_state(basis_year=..., db=db)`). 그러면 집계 화면이 다른 화면의 응답 모델
-전체에 결합되고, 확정 사전점검 한 번에 화면 전체 상태를 로드하는 비용을 낸다. 라우트 핸들러는
-HTTP 입출력만 맡고, 조립은 이 모듈이 한다 — 집계는 서비스를 부른다.
+라우트 핸들러는 HTTP 입출력만 맡고 조립은 이 모듈이 한다 — 집계도 핸들러를 함수로 부르지 않고
+이 서비스를 부른다. 핸들러를 직접 부르면 집계 화면이 다른 화면의 응답 모델 전체에 결합되고,
+확정 사전점검 한 번에 화면 전체 상태를 로드하는 비용을 낸다.
 
 이 상태 모양은 도메인이 아니라 프런트 화면 구조(V/actualV/files/note/reason/vendor/cp)를
-모델링한 것이다. 그 점은 여기서 고치지 않는다 — Phase 5에서 도메인별 저장 API로
-점진 분해할 때 다룬다. 지금은 "어디에 사는가"만 바로잡는다.
+모델링한 것이다 — 도메인별 전용 저장 API로 떼어내면서 줄여 가는 중이다.
 """
 
 import hashlib
@@ -165,15 +163,13 @@ def build_state(
     # 기준월은 **호출하는 쪽이 정한다** — 보낸 월이 있으면 그 달을 그대로 쓴다. 그 달에 행이 하나도
     # 없어도 DB에 들어 있는 다른 달로 대체하지 않는다: 그게 이 함수가 유일하게 남아 있던 "월을
     # 짐작하는 자리"였고, 화면은 그 짐작 때문에 아직 아무것도 안 올린 달을 열어도 직전 달 데이터를
-    # 받아 업로드 현황에 ✓가 켜졌다(202611 행이 없는데 속보 11월이 업로드 완료로 보임).
-    # 월을 안 보내는 호출(옛 클라이언트·내부 도구)만 종전처럼 DB의 최신 속보월로 짐작한다.
-    # versions.py:385 · labor_split.py:70이 "build_state는 월을 짐작한다"며 이 함수를 피해 간
-    # 이유도 이것이었다 — 이제 월을 받으니 그 우회가 필요하지 않다.
+    # 받으면 업로드 현황에 ✓가 켜진다(202611 행이 없는데 속보 11월이 업로드 완료로 보임).
+    # 월을 안 보내는 호출(내부 도구)만 DB의 최신 속보월로 짐작한다.
     if basis_month is None:
         basis_month = current_basis_month(db)
-    # (예전 필드) 증감사유·외주용역이 yyyymm을 갖게 되어 더 이상 짐작하지 않는다 — 늘 보고 있는
-    # 달과 같다. 업로드 이력(uploads)만 아직 월이 없는데, 그쪽은 아래에서 "그 달에 값이 있는
-    # 연구소에만 파일명을 붙이는" 방식으로 따로 막고 있다.
+    # 늘 보고 있는 달과 같다 — 증감사유·외주용역이 yyyymm을 갖고 있어 짐작할 일이 없다. 업로드
+    # 이력(uploads)만 월이 없는데, 그쪽은 아래에서 "그 달에 값이 있는 연구소에만 파일명을 붙이는"
+    # 방식으로 따로 막는다.
     monthless_month = basis_month
 
     # 연구소가 직접 추가한 행(label이 있는 cost_entries 행)은 extra-rows 엔드포인트가 따로 내려주므로
@@ -258,9 +254,8 @@ def build_state(
                 # 전실행(V["prev"])은 여기서 정하지 않는다 — 위에서 resolve_bases가 버전 순서대로 푼다.
         actualV["cur"] = snap
 
-        # prior(전년 실적)·plan(경영계획)도 위 resolve_bases 결과로 이미 채워져 있다.
-        # 전에는 여기서 "작년 actual 중 최신"·"applied_plan_no"로 따로 골랐는데, 그 둘도 집계·증감분석이
-        # 쓰는 해석과 어긋날 수 있는 자리였다(전년 = 전년 12월 실적, 경영계획 = ★ 차수).
+        # prior(전년 실적)·plan(경영계획)도 위 resolve_bases 결과로 이미 채워져 있다 — 여기서
+        # 따로 고르면 집계·증감분석의 해석과 어긋난다(전년 = 전년 12월 실적, 경영계획 = ★ 차수).
 
     # 어느 달이 어느 자리인지 뒤집은 표. 한 달이 두 자리를 겸할 수도 있다(드물지만 막을 이유는 없다).
     roles_of_ym: dict[str, list[str]] = {}
@@ -268,8 +263,7 @@ def build_state(
         roles_of_ym.setdefault(ym, []).append(role)
 
     # 업로드 이력도 기준월로 읽는다 — 자리(cur·prev…)는 저장돼 있지 않고 **그 달이 어느 자리인지**로
-    # 정한다(증감사유·외주용역과 같은 규칙). 전에는 이력에 달이 없어서 "그 달에 비용 값이 실제로 있는
-    # 연구소에만 파일명을 붙인다"는 우회를 뒀는데, 이제 파일이 자기 달을 들고 있어 그럴 필요가 없다.
+    # 정한다(증감사유·외주용역과 같은 규칙) — 파일이 자기 달을 들고 있다.
     files: dict[str, dict[str, FileInfo]] = {v: {} for v in ("cur", "prev", "prior", "plan")}
     # 경영계획은 달이 없는 자료라 yyyymm이 빈 문자열이다(그때 version이 P02 같은 계획 차수다).
     ym_wanted = {ym for ym in slot_ym.values() if ym} | {""}
@@ -401,7 +395,7 @@ def build_state(
 #
 # 해결: GET이 "지금 상태의 지문"(state_token)을 같이 내려주고, PUT이 그걸 그대로 돌려보낸다.
 # 그 사이 누가 저장했으면 지문이 달라져 있으므로 409로 막고 "다시 불러오세요"라고 한다.
-# 스키마 변경이 없다(PLAN.md P1-2) — 기존 테이블의 타임스탬프만 읽는다.
+# 스키마 변경이 없다 — 기존 테이블의 타임스탬프만 읽는다.
 #
 # max(타임스탬프)만 쓰지 않고 count(*)도 섞는 이유: 외주용역·CP는 "단위 교체"(delete+insert)라
 # 행을 지우기만 하면 max는 그대로일 수 있다. 개수가 같이 들어가면 그 경우도 지문이 바뀐다.
@@ -467,8 +461,7 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
 
     # 동시 편집 보호 — 쓰기를 시작하기 전에 막는다. 검증이 쓰기보다 뒤에 있으면
     # 409를 받았는데 DB에는 절반만 들어간 상태가 된다.
-    # 토큰이 비어 있으면 검사하지 않는다: 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
-    # 문제가 생기면 서버에서 이 블록만 끄면 롤백된다(PLAN Phase 2의 롤백 조건).
+    # 토큰이 비어 있으면 검사하지 않는다.
     if state.state_token:
         now_token = state_token(db)
         if state.state_token != now_token:
@@ -514,7 +507,11 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
             for pk, cats in (state.cost_periods or {}).items():
                 for category_key, cells in cats.items():
                     cost_periods[(pk, "forecast", category_key, forecast_yyyymm)] = cells
-            if "_ETC" in lab_pks:
+            # 원화 기타(_ETC)는 연구소 금액이 하나도 없으면 쓰지 않는다. _ETC는 합산 대상이 아닌
+            # 가상 행이라, 이 줄만 들어간 달은 "속보가 있지만 계산할 연구소 데이터는 0개"인 달이
+            # 되고, 화면은 그 달로 열리는데 증감분석은 404를 낸다. 기준월 판정
+            # (entries.filled_cost_yyyymm)과 함께 빈 줄을 만들지 않는 쪽도 막는다.
+            if "_ETC" in lab_pks and (vd.d or any(vd.etc)):
                 cost_rows.append(("_ETC", "forecast", "etc", forecast_yyyymm, vd.etc))
         elif version == "plan":
             for pk, cats in vd.d.items():
@@ -532,7 +529,7 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
     plan_skipped = ""
     if plan_rows:
         rows = plan_version_rows(db, state.basis_year)
-        # 그 해 차수가 아예 없으면 첫 차수를 만들어 쓴다(종전 동작 그대로) — 차수가 하나라도
+        # 그 해 차수가 아예 없으면 첫 차수를 만들어 쓴다 — 차수가 하나라도
         # 있으면 "확정되지 않은 것"만 대상이다.
         target = state.plan_no or writable_plan_no(db, state.basis_year) or (FIRST_PLAN_NO if not rows else "")
         if not target:
@@ -602,12 +599,11 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
 
     # 4-1) 증감사유 — 전용 저장 API(PUT /overseas/reason-rows)와 **같은 함수**를 부른다.
     # 외주용역·CP와 달리 전체 교체가 아니라 보낸 것만 누적 반영이다(연구소 회신을 쌓아 가는 자료).
-    # 행에 기준월이 없으면 이 저장의 기준월로 채운다 — 화면은 버전마다 그 버전의 달을 실어 보내고,
-    # 월을 모르는 옛 클라이언트만 이 기본값으로 떨어진다.
+    # 행에 기준월이 없으면 이 저장의 기준월로 채운다 — 화면은 버전마다 그 버전의 달을 실어 보낸다.
     upsert_reason_rows(db, state.reason, lab_codes, yyyymm(state.basis_year, state.basis_month))
 
     # 4-2) 외주용역 상세 — 전용 저장 API(PUT /overseas/vendor-rows)와 **같은 함수**를 부른다.
-    # 쓰기 규칙이 두 벌이 되면 PLAN P1-3에서 겪은 "같은 데이터, 두 가지 쓰기 규칙"을 다시 만든다.
+    # 쓰기 규칙이 두 벌이 되면 "같은 데이터, 두 가지 쓰기 규칙"이 된다.
     replace_vendor_rows(
         db, state.basis_year, state.vendor, lab_codes, yyyymm(state.basis_year, state.basis_month)
     )

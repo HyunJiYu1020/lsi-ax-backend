@@ -1,8 +1,7 @@
 """GET · PUT /overseas/state 왕복 스냅샷 — 지금 동작을 고정해 이후 리팩토링의 회귀 기준으로 쓴다.
 
-PLAN.md Phase 0: 이 엔드포인트는 화면 전체 상태를 한 번에 주고받는 가장 큰 접합부(overseas.py:541-909)
-이고, Phase 1(services/ 추출) · Phase 2(낙관적 잠금) · Phase 5(도메인별 분해)가 모두 이 위를 지나간다.
-그래서 "무엇이 바뀌면 안 되는가"를 먼저 못 박아 둔다.
+이 엔드포인트는 화면 전체 상태를 한 번에 주고받는 가장 큰 접합부라, "무엇이 바뀌면 안 되는가"를
+못 박아 둔다.
 
 핵심 성질은 **왕복 동일성**이다: GET한 상태를 그대로 PUT하고 다시 GET하면 똑같아야 한다.
 이 성질은 DB에 어떤 데이터가 들어 있든 성립해야 하므로(로컬 DB 내용에 의존하지 않는다) 금액을
@@ -10,11 +9,20 @@ PLAN.md Phase 0: 이 엔드포인트는 화면 전체 상태를 한 번에 주�
 """
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
-from app.accounts.overseas.endpoints.collect import yyyymm, get_overseas_state, save_overseas_state
+from app.accounts.overseas.endpoints.collect import yyyymm, get_overseas_state, save_overseas_state as _save_overseas_state
+from app.accounts.overseas.services.entries import filled_cost_yyyymm
 from app.shared.models.common import CostEntry, CostEntryDetail
+
+
+# 이 엔드포인트들은 BackgroundTasks를 받는다 — 증감사유 번역을 응답 뒤로 미루기 때문이다
+# (services/reason_rows.prewarm_in_background). 테스트는 BackgroundTasks를 만들어 넘기고 그 안에
+# 쌓인 작업은 실행하지 않는다 — 저장 로직만 검증하고 LLM을 타지 않는다(번역은 test_reason_prewarm).
+def save_overseas_state(*a, **kw):
+    kw.setdefault("background", BackgroundTasks())
+    return _save_overseas_state(*a, **kw)
 
 BASIS_YEAR = 2026
 VERSIONS = ("cur", "prev", "prior", "plan")
@@ -40,8 +48,8 @@ def test_get_put_get_is_identical(db, state):
     """GET → PUT(그대로) → GET이 완전히 같은 상태를 돌려주는지.
 
     이후 모든 단계의 검증 기준이다. 저장 경로가 읽기 경로와 어긋나면(예: 분기·연간 재계산을
-    한쪽에만 넣으면) 여기서 바로 깨진다 — PLAN P1-3이 경고하는 "같은 데이터, 두 가지 쓰기 규칙"이
-    실제로 생겼는지 보는 자리다."""
+    한쪽에만 넣으면) 여기서 바로 깨진다 — "같은 데이터, 두 가지 쓰기 규칙"이 실제로 생겼는지
+    보는 자리다."""
     before = dump(state)
 
     assert save_overseas_state(state=state, db=db)["status"] == "ok"
@@ -133,25 +141,37 @@ def test_row_lists_have_a_defined_order(db, state):
 def test_cp_only_contains_basis_year(db, state):
     """CP 계약은 기준연도 것만 내려준다 — 화면이 그 연도만 그리므로(core.js가 r.year로 거른다).
 
-    PLAN P3에 "GET /overseas/state가 전 연도 CP 반환 → 2026-11-15 수정 완료"로 적힌 건이다.
-    전 연도를 내려주면 PUT이 받은 연도를 전체 교체(overseas.py:878-881)하므로 되돌아가기 쉬워서
-    여기서 고정해 둔다."""
+    전 연도를 내려주면 PUT이 받은 연도를 전체 교체하므로 되돌아가기 쉬워서 여기서 고정해 둔다."""
     for row in state.cp:
         assert row.year == f"{BASIS_YEAR:04d}", f"기준연도가 아닌 CP가 섞였다: {row.year}"
 
 
-def test_prev_is_derived_from_the_actual_snapshot(db, state):
-    """전실행(prev)은 저장된 버전이 아니라 cur의 실적 스냅샷에서 유도한 값이다(overseas.py:617-619).
+def test_prev_follows_the_version_order_like_the_server_does(db):
+    """전실행(prev)은 **버전 순서상 바로 앞 버전**이다 — 속보 M → 실적 M-1, 실적 M → 속보 M.
 
-    PUT은 prev·prior를 아예 쓰지 않으므로(overseas.py:785-786), 이 유도 규칙이 깨지면 전실행
-    대비 증감이 통째로 틀어진다. '유도된 값'이라는 사실 자체를 고정한다."""
-    snap = state.actualV.get("cur")
-    if snap is None:
-        assert state.V["prev"].d == {}
-        return
+    2026-11-19까지는 여기서만 따로 "그 해 actual 중 yyyymm 최댓값"으로 골랐다. 실적 버전이
+    하나뿐일 땐 우연히 같았는데, 26.09·26.10 실적이 생기자 /overseas/state가 주는 전실행과
+    집계·증감분석이 쓰는 전실행이 다른 달이 됐다(26.09 속보를 열어도 전실행이 26.10 실적).
+    같은 화면에서 위(브라우저 계산)와 아래(서버 계산)가 다른 달을 비교하던 원인이라, 이제
+    resolve_bases 하나로 푼다. PUT은 prev·prior를 쓰지 않으므로 읽기 규칙만 고정한다."""
+    cost = {
+        (e.version, e.yyyymm)
+        for e in db.scalars(
+            select(CostEntry).where(CostEntry.account_code == "overseas")
+        )
+    }
+    if ("forecast", f"{BASIS_YEAR}09") not in cost or ("actual", f"{BASIS_YEAR}08") not in cost:
+        pytest.skip("26.09 속보 · 26.08 실적이 없어 버전 순서를 확인할 수 없다")
 
-    assert state.V["prev"].d == snap.d
-    assert state.V["prev"].etc == snap.etc
+    # 속보 9월의 전실행 = 실적 8월
+    sok = get_overseas_state(basis_year=BASIS_YEAR, basis_month=9, kind="forecast", db=db)
+    aug = get_overseas_state(basis_year=BASIS_YEAR, basis_month=8, kind="actual", db=db)
+    assert sok.V["prev"].d == aug.V["cur"].d
+
+    # 실적 9월의 전실행 = 속보 9월 (같은 달 속보다 — "그 해 최신 실적"이 아니다)
+    if ("actual", f"{BASIS_YEAR}09") in cost:
+        act = get_overseas_state(basis_year=BASIS_YEAR, basis_month=9, kind="actual", db=db)
+        assert act.V["prev"].d == sok.V["cur"].d
 
 
 # ---------- 빈칸(미등록) 처리 ----------
@@ -226,13 +246,15 @@ def test_unregistered_months_survive_the_round_trip(db):
     assert zeros, "0.0으로 올라온 칸이 하나도 없어 '0 vs 빈칸' 구분의 반쪽만 확인했다"
 
 
-def test_put_cannot_clear_a_month(db, state):
-    """PUT으로 None을 보내도 이미 저장된 달은 지워지지 않는다(덧쓰기만 한다).
+def test_put_clears_a_month_back_to_blank(db, state):
+    """PUT으로 None을 보내면 그 달은 **미등록으로 되돌아간다**(저장된 행을 지운다).
 
-    _bulk_upsert_cost_entries가 amount=None인 달을 건너뛰기 때문이다 — "미등록을 0으로 저장하지
-    않기" 위한 선택이고, 그 대가로 "값을 빈칸으로 되돌리는" 경로가 없다. 지금은 화면에 지우는
-    기능이 없어 문제되지 않지만, Phase 5에서 도메인별 저장 API를 만들 때 반드시 마주칠 제약이라
-    의도된 동작으로 고정해 둔다(바뀌면 이 테스트가 알려준다)."""
+    2026-11에 바뀐 동작이다. 전에는 None인 달을 건너뛰기만 해서(0으로 저장하지 않으려고) 한 번
+    들어간 값을 빈칸으로 되돌릴 방법이 없었다. 업로드 양식에서 연구소가 칸을 비워 다시 보내면
+    그게 "미제출"이라는 보고인데, 옛 동작에서는 지난달 숫자가 그대로 남아 화면이 거짓으로 채워져
+    있었다(0으로 덮어쓰는 것도 답이 아니다 — 그건 "0으로 보고"가 된다).
+
+    0.0은 지워지지 않는다 — 그건 "0으로 올라온 달"이라는 보고다(test_unregistered_months_survive_the_round_trip)."""
     target = next(
         (
             (pk, key, j)
@@ -252,7 +274,16 @@ def test_put_cannot_clear_a_month(db, state):
     save_overseas_state(state=state, db=db)
 
     after = get_overseas_state(basis_year=BASIS_YEAR, db=db)
-    assert after.V["cur"].d[pk][key][j] == kept, "None을 보냈더니 저장된 값이 지워졌다(동작이 바뀌었다)"
+    assert after.V["cur"].d[pk][key][j] is None, (
+        f"None을 보냈는데 {kept}가 그대로 남았다 — 연구소가 비워 보낸 칸을 미제출로 되돌릴 수 없다"
+    )
+
+    # 다시 숫자를 넣으면 돌아온다(지우기가 한쪽 방향으로만 가는 문이 아닌지 확인).
+    # 저장을 한 번 했으므로 토큰이 바뀌었다 — 다시 읽어서(동시 편집 보호) 값을 넣는다.
+    again = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+    again.V["cur"].d[pk][key][j] = kept
+    save_overseas_state(state=again, db=db)
+    assert get_overseas_state(basis_year=BASIS_YEAR, db=db).V["cur"].d[pk][key][j] == kept
 
 
 # ---------- 값 수정이 실제로 저장되는지 ----------
@@ -284,6 +315,9 @@ def test_edited_month_is_saved(db, state):
     assert after["V"]["cur"]["d"][pk][key][j] == pytest.approx(new_value)
     # 고친 칸 하나 말고는 그대로여야 한다.
     before["V"]["cur"]["d"][pk][key][j] = pytest.approx(new_value)
+    # per(분기·연간)는 **연구소가 파일에 적어 보낸 칸**이라 월을 고쳐도 서버가 따라 바꾸지 않는다
+    # (2026-11-24에 규칙이 뒤집혔다 — test_quarter_year_resync 머리 주석). 월 합과 어긋나게 되면
+    # 업로드 미리보기가 색으로 알리고, 값은 사람이 다시 올려서 고친다.
     assert after["V"]["cur"] == before["V"]["cur"]
 
 
@@ -313,7 +347,7 @@ def test_put_rejects_unknown_lab_code_in_reason(db, state):
     연구소 코드(lab_code)라 V의 pk와 검증 대상이 다르다."""
     from app.accounts.overseas.schemas import ReasonRow
 
-    state.reason.append(ReasonRow(lab_code="NOPE", version="cur", category_key="sal", block="y"))
+    state.reason.append(ReasonRow(lab_code="NOPE", version="forecast", category_key="sal", block="y"))
 
     with pytest.raises(HTTPException) as e:
         save_overseas_state(state=state, db=db)
@@ -324,8 +358,8 @@ def test_put_rejects_unknown_lab_code_in_reason(db, state):
 def test_rejected_put_saves_nothing(db, state):
     """거부된 저장은 아무것도 남기지 않는다 — 검증이 쓰기보다 앞에 있어야 한다.
 
-    PLAN P1-2가 "원자성(commit 1회)은 유지 가치"로 꼽은 성질이다. 부분 저장이 생기면 화면은
-    400을 받았는데 DB에는 절반만 들어가 있는 상태가 된다."""
+    저장은 commit 1회로 원자성을 보장한다. 부분 저장이 생기면 화면은 400을 받았는데 DB에는
+    절반만 들어가 있는 상태가 된다."""
     before = dump(state)
     pk, key = next(
         ((pk, key) for pk, cats in state.V["cur"].d.items() for key in cats),
@@ -345,7 +379,7 @@ def test_rejected_put_saves_nothing(db, state):
     assert after == before, "거부된 저장이 일부 반영됐다"
 
 
-# ---------- 동시 편집 보호 (PLAN.md P1-2 · Phase 2) ----------
+# ---------- 동시 편집 보호 ----------
 
 
 def test_state_token_is_issued_and_stable(db, state):
@@ -367,7 +401,7 @@ def test_state_token_changes_after_a_save(db, state):
 
 def test_stale_token_is_rejected_with_409(db, state):
     """다른 세션이 먼저 저장한 뒤에 옛 토큰으로 저장하면 막는다 — 조용히 덮어쓰면 먼저 저장한
-    사람의 수정이 사라지고, 그 사실을 아무도 모른다(PLAN P1-2의 핵심 사고)."""
+    사람의 수정이 사라지고, 그 사실을 아무도 모른다."""
     stale = state.state_token
 
     # 다른 세션이 먼저 저장했다고 가정
@@ -402,18 +436,16 @@ def test_conflict_saves_nothing(db, state):
 
 
 def test_empty_token_skips_the_check(db, state):
-    """토큰을 안 보내면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
-    서버에서 이 동작만 끄면 기능을 롤백할 수 있다(PLAN Phase 2의 롤백 조건)."""
+    """토큰을 안 보내면 검사하지 않는다."""
     other = get_overseas_state(basis_year=BASIS_YEAR, db=db)
     save_overseas_state(state=other, db=db)  # 토큰이 낡게 만든다
 
-    state.state_token = ""  # 옛 클라이언트처럼
+    state.state_token = ""
     assert save_overseas_state(state=state, db=db)["status"] == "ok"
 
 
-# ---------- 경영계획 차수 (2026-11-17) ----------
-# 전에는 읽기·쓰기가 `PLAN_NO = "P00"` 고정이었다. 이제 읽기는 적용 차수(★ → 확정 최신 → 최신),
-# 쓰기는 "확정되지 않은 차수"만 대상으로 한다.
+# ---------- 경영계획 차수 ----------
+# 읽기는 적용 차수(★ → 확정 최신 → 최신), 쓰기는 "확정되지 않은 차수"만 대상으로 한다.
 def test_state_tells_which_plan_revision_it_is(db, state):
     """GET이 V["plan"]의 차수를 같이 준다 — 화면이 "P02 기준"이라고 밝힐 수 있어야 한다.
     차수가 없으면 빈 문자열이고, 그건 "경영계획 0원"이 아니라 "데이터 없음"이다."""
@@ -464,6 +496,9 @@ def test_save_opens_the_first_revision_when_the_year_has_none(db, state):
     if pk is None:
         pytest.skip("저장할 연구소 값이 없다")
     state.basis_year = year
+    # 그 해(2097) 경영계획 차수는 아직 없다 — 지금 상태가 들고 있는 차수(올해 ★ 차수)를 그대로
+    # 두면 "다른 해의 차수에 저장"이 되어 이 테스트가 보려는 분기(첫 차수 열기)를 안 지난다.
+    state.plan_no = ""
     state.V["plan"].d = {pk: {"hc": [3.0] * 12}}
 
     out = save_overseas_state(state, db=db)
@@ -475,3 +510,57 @@ def test_save_opens_the_first_revision_when_the_year_has_none(db, state):
         )
     )
     assert opened is not None and opened.is_confirmed is False
+
+
+# ---------- 기준월은 호출하는 쪽이 정한다 ----------
+
+
+def test_month_with_no_rows_comes_back_empty_not_substituted(db):
+    """아직 아무것도 안 올린 달을 열면 cur가 **비어서** 와야 한다 — 다른 달로 대체하지 않는다.
+
+    화면이 속보 2026년 11월을 열었는데 `select * from cost_entries where yyyymm='202611'`이
+    0행이면, 업로드 현황은 전 연구소 "미"가 맞다. 전에는 build_state가 기준월을
+    current_basis_month(DB의 최신 속보월)로 **짐작**해서 직전 달 데이터를 cur로 내려줬고,
+    화면은 그걸 11월 버킷에 써넣어 ✓가 켜졌다. 그 짐작을 없앤 것을 고정한다."""
+    empty_month = 11
+    rows = db.scalars(
+        select(CostEntry).where(
+            CostEntry.account_code == "overseas",
+            CostEntry.version == "forecast",
+            CostEntry.yyyymm == yyyymm(BASIS_YEAR, empty_month),
+        )
+    ).all()
+    if rows:
+        pytest.skip(f"{BASIS_YEAR}-{empty_month:02d} 속보 행이 이미 있어 '빈 달'로 쓸 수 없다")
+
+    s = get_overseas_state(basis_year=BASIS_YEAR, basis_month=empty_month, db=db)
+
+    assert s.basis_month == empty_month, "보낸 달을 그대로 돌려줘야 화면이 그 달 버킷에 써넣는다"
+    assert s.V["cur"].d == {}, "그 달에 행이 없는데 다른 달 데이터가 cur로 들어왔다"
+    assert s.V["cur"].etc == [0.0] * 12
+
+
+def test_month_with_rows_still_comes_back_filled(db):
+    """반대쪽 — 행이 있는 달을 열면 그 달 값이 그대로 온다(빈 응답을 돌려주는 버그가 아니다).
+
+    "행이 있는 달"은 **합산 대상 연구소 행이 있는 달**이다(filled_cost_yyyymm). max(yyyymm)으로
+    고르면 안 된다 — 원화 기타(_ETC) 같은 가상 행 한 줄만 들어간 달이 집히고, 그 달의 cur는
+    당연히 비어 있어서 이 테스트가 "빈 응답 버그"라고 잘못 외친다(2026-11-23에 실제로 그랬다).
+    기준월을 정하는 코드도 같은 판정을 쓴다."""
+    latest = filled_cost_yyyymm(db, "forecast")
+    if not latest:
+        pytest.skip("속보 행이 없다")
+
+    s = get_overseas_state(basis_year=int(latest[:4]), basis_month=int(latest[4:]), db=db)
+
+    assert s.basis_month == int(latest[4:])
+    assert s.V["cur"].d, "행이 있는 달인데 cur가 비어서 왔다"
+
+
+def test_omitting_the_month_falls_back_to_the_latest(db):
+    """달을 안 보내는 호출은 DB의 최신 속보월로 짐작한다."""
+    from app.accounts.overseas.services.entries import current_basis_month
+
+    s = get_overseas_state(basis_year=BASIS_YEAR, db=db)
+
+    assert s.basis_month == current_basis_month(db)

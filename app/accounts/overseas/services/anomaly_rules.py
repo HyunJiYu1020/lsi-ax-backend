@@ -143,7 +143,7 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
         if not base_vals:
             base_vals = None
     if base_vals is None:
-        skipped.append("급변·단위(배수) — 비교할 전실행 값이 없습니다")
+        skipped.append("급변·단위(배수) — 비교할 전월 속보 값이 없습니다")
 
     rules = anomaly.merged_rules(rule_rows(db), body.overrides)
     findings = anomaly.detect(
@@ -159,9 +159,14 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
         outs_rows=[r.model_dump() for r in body.outs_rows] if body.outs_rows else None,
         analysis=body.analysis,
         basis_month=body.basis_month,
+        cols=body.cols,
     )
     if not body.sums and rules["sum_mismatch"]["enabled"]:
         skipped.append("합계 불일치 — 파일에 소계·합계 행이 없습니다")
+    # 열 목록은 업로드 파싱만 알 수 있다. 저장된 값으로 하는 검사([계정 확정] 전 재검사)는
+    # 어떤 열로 들어온 자료인지 알 수 없으므로 이 검사를 건너뛴다 — "열 이상 없음"으로 읽히면 안 된다.
+    if body.cols is None and rules["missing_column"]["enabled"]:
+        skipped.append("열 누락 — 파일의 열 목록이 이 검사에 함께 오지 않았습니다")
     # 못 한 검사는 반드시 밝힌다 — 입력이 없어서 건너뛴 것과 "이상 없음"은 화면에서 구분이 안 된다.
     #
     # 문구는 **우리가 실제로 아는 것**까지만 적는다. 머리글은 있고 값만 빈 파일(연구소가 양식을
@@ -183,7 +188,7 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
         # 이걸 안 밝히면 "전월 대조 이상 없음"으로 읽힌다.
         skipped.append(f"{rules['analysis_prev']['label']} — 증감분석 시트의 전실행 열이 비어 있습니다")
     if base_vals is None and rules["new_category"]["enabled"]:
-        skipped.append("신규 계정 — 비교할 전실행 값이 없습니다")
+        skipped.append(f"{rules['new_category']['label']} — 비교할 전월 속보 값이 없습니다")
     counts: dict[str, int] = {}
     for f in findings:
         counts[f["rule"]] = counts.get(f["rule"], 0) + 1

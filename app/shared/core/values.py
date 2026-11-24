@@ -1,8 +1,4 @@
-"""값 처리 규칙 — 전 계정 공용 순수 함수. DB도 HTTP도 모른다.
-
-원래 app/api/v1/endpoints/overseas.py의 `_n` · `_source_hash`였고, 증감분석·집계·결산이 그 밑줄
-이름을 직접 import해서 썼다(PLAN.md P1-1).
-"""
+"""값 처리 규칙 — 전 계정 공용 순수 함수. DB도 HTTP도 모른다."""
 
 import hashlib
 

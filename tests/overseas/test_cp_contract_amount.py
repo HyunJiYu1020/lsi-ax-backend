@@ -24,12 +24,14 @@ JUN, SEP = f"{YS}-06", f"{YS}-09"
 
 
 def _row(proj: str, total: float, title: str) -> CpRow:
-    """direct + ovh = total, cost_sum = total × 0.6으로 맞춰 둔다 — 배율이 관계를 보존하는지 본다."""
+    """양식의 합계 관계(인건비 + Direct + Overhead = Total)에 맞춰 둔다 — 실제 계약서
+    (CP_계약_2026.xlsx)가 그 관계이고, 저장이 그걸 검사한다(services/cp.validate_cp_rows).
+    인건비 비중 0.6을 고정해 둬서 배율이 관계를 보존하는지 본다."""
     return CpRow(
         year=YS, poc_type="POC", poc_proj=proj, poc_desc="설명", title=title,
         dedicated=2.0, common=1.0, man_month=12.0, cost_year=total / 2,
         poc_cost_sum=total * 0.6, poc_mm_sum=24.0,
-        poc_direct=total * 0.7, poc_ovh=total * 0.3, poc_total=total,
+        poc_direct=total * 0.25, poc_ovh=total * 0.15, poc_total=total,
         source_file="cp.xlsx",
     )
 
@@ -96,7 +98,7 @@ def test_single_poc_change_leaves_the_others_alone(db):
 
 
 def test_money_scales_together_but_headcount_does_not(db):
-    """금액끼리의 관계(direct + ovh = total)는 유지되고, 인원·맨먼스는 그대로다 —
+    """금액끼리의 관계(인건비 + direct + ovh = total)는 유지되고, 인원·맨먼스는 그대로다 —
     "계약액이 얼마로 바뀌었다"는 돈 이야기지 인력 구성 이야기가 아니다."""
     _seed(db, ("P1", 4.0 * M))
 
@@ -105,7 +107,8 @@ def test_money_scales_together_but_headcount_does_not(db):
     )
 
     for r in cp_rows_at(db, YEAR, SEP):
-        assert float(r.poc_direct) + float(r.poc_ovh) == pytest.approx(float(r.poc_total))
+        parts = float(r.poc_cost_sum) + float(r.poc_direct) + float(r.poc_ovh)
+        assert parts == pytest.approx(float(r.poc_total))
         assert float(r.poc_total) == pytest.approx(6.0 * M)
         assert float(r.poc_cost_sum) == pytest.approx(3.6 * M)  # 0.6 비율 유지
         assert float(r.cost_year) == pytest.approx(3.0 * M)  # 직급 행 금액도 같이 움직인다

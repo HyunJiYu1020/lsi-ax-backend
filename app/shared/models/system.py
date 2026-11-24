@@ -2,7 +2,19 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, SmallInteger, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -55,18 +67,57 @@ class CommonCode(Base):
 
 
 class ErrorLog(Base):
-    """API 서버에서 발생한 처리되지 않은 예외(500) 로그. main.py의 전역 예외 핸들러가 기록한다."""
+    """API 서버 로그. 컬럼 이름·의미는 사내 표준 DDL(sait `error_log`)에 맞췄다 — 나중에 운영
+    로그를 한 곳으로 모을 때 조회 쿼리·대시보드를 그대로 쓸 수 있어야 하기 때문이다. 테이블명만
+    이 프로젝트 관례(복수형)를 따라 `error_logs`로 둔다.
+
+    log4j 방식으로 적는다: 전역 예외 핸들러만이 아니라 `logger.warning()`/`logger.error()` 호출을
+    DBLogHandler(shared/core/logging_db.py)가 가로채 저장한다. 그래서 미처리 500뿐 아니라
+    **의도적으로 거절한 4xx도 남는다** — 500만 적으면 저장이 400으로 조용히 거부되는 사고가
+    로그에 아무 흔적도 남기지 않는다."""
 
     __tablename__ = "error_logs"
-    __table_args__ = {"comment": "API 서버 미처리 예외(500) 로그."}
+    __table_args__ = {
+        "comment": "API 서버 로그(WARNING 이상). 컬럼은 사내 표준 error_log DDL과 같은 이름·의미."
+    }
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), comment="발생 시각"
+    log_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, comment="로그 id")
+
+    # --- 추적 정보: SSO 전까지 user_id·session_id는 비어 있다(컬럼만 미리 맞춰 둔다) ---
+    trace_id: Mapped[str | None] = mapped_column(String(50), comment="요청 1건을 잇는 추적 id (요청마다 생성)")
+    user_id: Mapped[str | None] = mapped_column(
+        String(50), comment="요청한 사용자 식별자(사번). SSO 연동 전까지는 NULL — 표준이 문자열 사번이라 users.id FK가 아니다"
     )
-    method: Mapped[str] = mapped_column(String(10), comment="HTTP 메서드")
-    path: Mapped[str] = mapped_column(String(255), comment="요청 경로")
-    status_code: Mapped[int] = mapped_column(SmallInteger, comment="응답 상태 코드")
-    error_type: Mapped[str] = mapped_column(String(100), comment="예외 클래스명")
-    message: Mapped[str] = mapped_column(Text, comment="예외 메시지")
-    traceback: Mapped[str] = mapped_column(Text, comment="스택트레이스")
+    session_id: Mapped[str | None] = mapped_column(String(100), comment="세션 id. SSO 연동 전까지는 NULL")
+
+    # --- 시각 ---
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), comment="발생 시각")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), comment="로그 적재 시각"
+    )
+
+    # --- 요청 ---
+    client_ip: Mapped[str | None] = mapped_column(String(45), comment="클라이언트 IP (IPv6 길이까지 수용)")
+    user_agent: Mapped[str | None] = mapped_column(String(500), comment="User-Agent 헤더")
+    api_url: Mapped[str | None] = mapped_column(String(500), comment="요청 경로 (쿼리스트링 제외)")
+    http_method: Mapped[str | None] = mapped_column(String(10), comment="HTTP 메서드")
+    params: Mapped[str | None] = mapped_column(
+        Text, comment="쿼리스트링 + 요청 본문(재현에 필요). 본문을 읽을 수 없으면 쿼리스트링만 남는다"
+    )
+
+    # --- 결과 ---
+    log_level: Mapped[str] = mapped_column(String(20), comment="WARNING(거절된 4xx) | ERROR(미처리 500) | CRITICAL")
+    http_status: Mapped[int | None] = mapped_column(Integer, comment="응답 상태 코드")
+    error_code: Mapped[str | None] = mapped_column(
+        String(50), comment="예외 클래스명 (표준의 error_code 자리 — 사내 코드 체계가 생기면 그 값으로 바꾼다)"
+    )
+    error_message: Mapped[str | None] = mapped_column(String(1000), comment="예외 메시지 (1000자에서 자른다)")
+    stack_trace: Mapped[str | None] = mapped_column(Text, comment="스택트레이스. 4xx는 비어 있을 수 있다")
+    server_name: Mapped[str | None] = mapped_column(String(100), comment="처리한 서버 호스트명")
+    response_time: Mapped[int | None] = mapped_column(Integer, comment="응답 소요 시간(ms)")
+
+    # --- 운영 ---
+    process_status: Mapped[str | None] = mapped_column(
+        String(20), server_default=text("'UNPROCESSED'"), comment="운영 처리 상태 (UNPROCESSED | ...)"
+    )
+    handler: Mapped[str | None] = mapped_column(String(50), comment="이 로그를 남긴 로거 이름")

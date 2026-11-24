@@ -128,16 +128,16 @@ class CostEntryDetail(Base):
     """CostEntry 헤더에 달리는 디테일 행. period_type으로 월·분기·연간·커스텀열을 구분한다 —
     MONTH(period 1~12) | QUARTER(period 1~4) | YEAR(period 0) | CUSTOM(period 0, col_name에 라벨).
     분기·연간 행은 월 값을 쓸 때마다 그 해 12개월 합으로 재계산돼 덮어쓰인다 — 공용 엔드포인트는
-    cost.py의 _resync_summary, 해외연구소는 services/overseas/entries.py의 resync_summaries가 한다.
-    (예전에는 해외연구소 경로가 월 행만 쓰고 재계산을 안 해서 그 계정의 분기·연간이 백필 시점 값에
-    멈춰 있었다 — PLAN.md P1-3. Phase 1-4에서 쓰기 경로를 services로 모으며 고쳤다.) col_name은
-    CUSTOM이 아니면 빈 문자열(NULL 아님) — Postgres UNIQUE/ON CONFLICT가 NULL을 서로 다른 값으로
+    cost.py의 _resync_summary가 한다. 해외연구소는 **만들지 않는다** — 연구소가 파일에 적어 보낸
+    칸만 저장하고 분기·연간은 보는 쪽이 월에서 계산한다(services/overseas/entries.py 머리 주석).
+    col_name은 CUSTOM이 아니면 빈 문자열(NULL 아님) — Postgres UNIQUE/ON CONFLICT가 NULL을 서로 다른 값으로
     취급해 중복 삽입될 수 있기 때문이다."""
 
     __tablename__ = "cost_entry_details"
     __table_args__ = (
         UniqueConstraint("cost_entry_id", "year", "period_type", "period", "col_name"),
         CheckConstraint("period_type IN ('MONTH', 'QUARTER', 'YEAR', 'CUSTOM')", name="ck_cost_entry_details_period_type"),
+        CheckConstraint("data_type IN ('number', 'text')", name="ck_cost_entry_details_data_type"),
         {"comment": "cost_entries 헤더별 디테일 행(월·분기·연간·커스텀열). 분기·연간도 원본 숫자를 그대로 저장."},
     )
 
@@ -154,6 +154,20 @@ class CostEntryDetail(Base):
         String(100), default="", comment='CUSTOM일 때만 그 열의 라벨, 나머지는 ""'
     )
     amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, comment="금액")
+    # 추가 열(CUSTOM) 칸은 연구소가 뭘 적어 보낼지 모른다 — 금액일 수도, 사용률(0.825)일 수도,
+    # "환율 반영" 같은 글자일 수도 있다. 숫자를 amount에만 담으면 Numeric(14,2)가 소수 2자리에서
+    # 깎고(0.825 → 0.83) 글자는 담을 자리가 없어서, 원문은 value에 글자 그대로 두고 어느 쪽인지를
+    # data_type으로 박아 둔다. 타입 판정(숫자로 읽히는가)은 쓰는 쪽 한 곳(services/extra_rows.
+    # classify_extra_value)에서만 하고, 읽는 쪽은 저장된 data_type을 믿고 분기만 한다 — 숫자면
+    # 계산에 쓰고 글자면 그대로 그린다. 검증 대상 기간 행(MONTH·QUARTER·YEAR)은 지금처럼 amount가
+    # 참값이고 value는 NULL이다(이 컬럼이 생기기 전 저장분도 같다).
+    data_type: Mapped[str] = mapped_column(
+        String(10), default="number", server_default=text("'number'"),
+        comment="number | text — 읽는 쪽 분기 기준. CUSTOM 칸만 text가 될 수 있다",
+    )
+    value: Mapped[str | None] = mapped_column(
+        String(500), comment='CUSTOM 칸의 원문("0.825" · "환율 반영"). NULL이면 amount가 참값(월·분기·연간 행과 과거 저장분)'
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
     )
@@ -161,24 +175,36 @@ class CostEntryDetail(Base):
 
 
 class Upload(Base):
-    """업로드 이력 (계정×행×버전별로 받은 파일명·시각)."""
+    """업로드 이력 (계정×행×기준월별로 받은 파일명·시각).
+
+    기준월(yyyymm)이 키다 — 비용(cost_entries) · 증감사유 · 외주용역과 같은 축이다. 자리
+    이름(cur|prev|prior|plan)은 저장하지 않고 읽을 때 달로 정한다: 자리는 보는 달에 따라 달라지는
+    값이라(9월에 올린 파일이 11월 화면에서도 cur이다) 저장 키로 쓰면 같은 행이 아무 달에나
+    "이번에 받은 파일"로 보인다."""
 
     __tablename__ = "uploads"
     __table_args__ = (
-        # 읽기 핫패스 인덱스(마이그레이션 f2b7c9d14e08). PK 말고 인덱스가 없었다 — 지울 일 없이
-        # 계속 쌓이는 이력 테이블이라, (version, scope_key)별 최신 1건을 뽑는 DISTINCT ON 쿼리가
-        # 쌓인 만큼 정렬 비용을 그대로 떠안았다.
+        # 읽기 핫패스 인덱스(마이그레이션 f2b7c9d14e08 · a7c4e0f21d58). PK 말고 인덱스가 없었다 —
+        # 지울 일 없이 계속 쌓이는 이력 테이블이라, (scope_key, yyyymm)별 최신 1건을 뽑는
+        # DISTINCT ON 쿼리가 쌓인 만큼 정렬 비용을 그대로 떠안았다.
         Index(
-            "ix_uploads_account_version_scope_recent",
-            "account_key", "version", "scope_key", "uploaded_at",
+            "ix_uploads_account_scope_month_recent",
+            "account_key", "scope_key", "yyyymm", "uploaded_at",
         ),
-        {"comment": "계정×행×버전별 업로드 이력. 19개 계정이 공유."},
+        {"comment": "계정×행×기준월별 업로드 이력. 19개 계정이 공유."},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
     scope_key: Mapped[str] = mapped_column(String(40), comment="계정 안에서의 행 단위 식별자")
-    version: Mapped[str] = mapped_column(String(10), comment="cur | prev | prior | plan")
+    # 달이 없는 자료(경영계획)는 빈 문자열이고, 그때는 version이 그 해의 차수(P02)를 가리킨다.
+    yyyymm: Mapped[str] = mapped_column(
+        String(6), default="", comment='이 파일이 속한 기준연월 "YYYYMM". 경영계획처럼 달이 없는 자료는 빈 문자열'
+    )
+    # 같은 달에 **몇 번째로 받은 파일인지**. 경영계획이 차수를 P00·P01·P02로 관리하는 것과 같은
+    # 관례다 — 연구소가 같은 달에 두 번 보내면 v1 · v2로 남아 "무엇을 받아 지금 숫자가 됐나"를
+    # 되짚을 수 있다 — 최신 파일명만 남기면 그 전 파일은 자리를 잃는다.
+    version: Mapped[str] = mapped_column(String(10), comment="그 기준월의 차수(v1 · v2 …). 경영계획은 P02 같은 계획 차수")
     filename: Mapped[str] = mapped_column(String(255), comment="업로드한 원본 파일명")
     s3_key: Mapped[str | None] = mapped_column(
         String(512), comment="원본 파일이 보관된 S3 객체 키. S3 미설정이거나 업로드 실패 시 NULL(파일명·파싱 결과만 남음)"
@@ -218,11 +244,11 @@ class Note(Base):
 class ExtraCol(Base):
     """편성 그리드에 추가한 열(행×열 교차점에 숫자가 들어가는, 화면에 실제로 보이는 열).
 
-    이 테이블이 생기기 전에는 열이라는 개체가 DB에 없었다 — 같은 col_name을 가진
+    열 자체를 행으로 갖는 레지스트리다. 이 테이블이 없으면 같은 col_name을 가진
     cost_entry_details(period_type="CUSTOM") 칸들의 집합이 곧 "그 열"이어서, 열 단위 속성
-    (파생 여부·계산식)을 걸 자리가 없었다. 그래서 MemoCol과 같은 모양의 레지스트리를 둔다.
+    (파생 여부·계산식)을 걸 자리가 없다.
 
-    원시 열(is_derived=False)의 칸 값은 지금까지와 같이 cost_entry_details에 저장되고 여기는
+    원시 열(is_derived=False)의 칸 값은 cost_entry_details에 저장되고 여기는
     존재·이름만 관리한다. 파생 열(is_derived=True)은 칸 값을 저장하지 않고 formula로 매번 계산한다.
     label 자체가 열 식별자라 이름 변경은 지원하지 않는다(지우고 새 이름으로 다시 만들면 된다)."""
 
@@ -231,6 +257,7 @@ class ExtraCol(Base):
         UniqueConstraint("account_key", "scope_key", "version", "yyyymm", "label"),
         CheckConstraint("version IN ('forecast', 'actual')", name="ck_extra_cols_version"),
         CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_extra_cols_yyyymm_format"),
+        CheckConstraint("fmt IN ('raw', 'pct_ratio', 'pct_plain')", name="ck_extra_cols_fmt"),
         {"comment": "편성 그리드 추가 열(존재·이름·파생 여부). 원시 열의 칸 값은 cost_entry_details 참조."},
     )
 
@@ -250,62 +277,19 @@ class ExtraCol(Base):
         JSONB,
         comment='파생 열의 계산식 {"op":"sum_months","months":[7,8,9]}. 원시 열은 NULL',
     )
+    # 값이 아니라 **그리는 방법**이다. 양식 밖 열에는 비율이 연구소마다 다른 모양으로 오는데
+    # ("0.825" · "82.5"), 값만 보고는 어느 쪽인지 알 수 없어 사람이 열마다 한 번 골라 둔다.
+    # 글자 값은 어떤 형식이든 원문 그대로 그린다(형식은 숫자 칸에만 걸린다).
+    fmt: Mapped[str] = mapped_column(
+        String(16),
+        default="raw",
+        server_default=text("'raw'"),
+        comment="raw(그대로) | pct_ratio(0.825→82.5%) | pct_plain(82.5→82.5%)",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), comment="열 추가 시각"
     )
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="열을 추가한 사용자 (users.id)")
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
-    )
-    updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="마지막으로 수정한 사용자 (users.id)")
-
-
-class MemoCol(Base):
-    """편성 화면에 추가한 메모 전용 열(집계·증감분석에는 들어가지 않음)."""
-
-    __tablename__ = "memo_cols"
-    __table_args__ = (
-        UniqueConstraint("account_key", "scope_key", "version", "col_key"),
-        {"comment": "메모 전용 열(존재·이름만). 셀 내용은 memos 참조."},
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
-    scope_key: Mapped[str] = mapped_column(String(40), comment="계정 안에서의 행 단위 식별자")
-    version: Mapped[str] = mapped_column(String(10), comment="cur | prev | prior | plan")
-    col_key: Mapped[str] = mapped_column(String(40), comment='클라이언트가 생성한 열 id ("c...")')
-    label: Mapped[str] = mapped_column(String(100), default="", comment="사용자가 입력한 열 이름")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), comment="열 추가 시각"
-    )
-    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="열을 추가한 사용자 (users.id)")
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
-    )
-    updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="마지막으로 수정한 사용자 (users.id)")
-
-
-class Memo(Base):
-    """메모 셀 (행×열 교차점의 자유 텍스트). 행은 고정 계정 key 또는 사용자가 추가한 행의 키
-    (cost_entries.category_code — label이 채워진 행)."""
-
-    __tablename__ = "memos"
-    __table_args__ = (
-        UniqueConstraint("account_key", "scope_key", "version", "row_key", "col_key"),
-        {"comment": "메모 셀. 집계·증감분석 계산에는 들어가지 않는 참고용 텍스트."},
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
-    scope_key: Mapped[str] = mapped_column(String(40), comment="계정 안에서의 행 단위 식별자")
-    version: Mapped[str] = mapped_column(String(10), comment="cur | prev | prior | plan")
-    row_key: Mapped[str] = mapped_column(String(40), comment="고정 계정 key 또는 사용자 추가 행의 키(cost_entries.category_code)")
-    col_key: Mapped[str] = mapped_column(String(40), comment="memo_cols.col_key")
-    text: Mapped[str] = mapped_column(Text, comment="메모 텍스트")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), comment="최초 작성 시각"
-    )
-    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), comment="최초 작성한 사용자 (users.id)")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="마지막 갱신 시각"
     )

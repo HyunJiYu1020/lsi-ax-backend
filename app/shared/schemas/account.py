@@ -25,6 +25,7 @@ class AccountOut(BaseModel):
     color: str | None = None
     status: str  # common_codes(ACCOUNT_STATUS)의 code
     status_label: str  # 그 code의 한글명 (화면에 그대로 쓸 수 있게 서버가 풀어준다)
+    owner: str = ""  # 편성 주체(담당 조직·담당자). 빈 문자열이면 아직 안 정해진 것
     memo: str | None = None
     current_step_order: int | None = None  # 단계가 정의되지 않은 계정은 None
     steps: list[AccountStepOut] = []
@@ -36,6 +37,7 @@ class AccountUpdate(BaseModel):
     메모만 고치려고 status를 같이 보내지 않아도 기존 status가 지워지지 않게."""
 
     status: str | None = None
+    owner: str | None = None
     memo: str | None = None
 
 
@@ -43,3 +45,26 @@ class AccountStepUpdate(BaseModel):
     """계정의 현재 진행 단계 이동. /overseas/step의 StepUpdate와 같은 모양으로 맞춘다."""
 
     step: int
+
+
+class AccountSummaryIn(BaseModel):
+    """계정 하나의 전체 현황판 숫자 — 그 버전의 월별 편성액과 전년 실적 총액.
+
+    계정 전용 화면이 생기기 전에도 현황판은 숫자를 보여줘야 한다. 그 숫자가 브라우저에 있으면
+    담당자마다 다른 총액을 보고 회의에 들어온다 — 그래서 전용 화면이 없는 계정도 이 값만은
+    서버에 둔다. 저장되는 자리는 새 테이블이 아니라 공용 `cost_entries`다(scope="ALL",
+    category="total") — 계정 전용 화면이 생기면 같은 자리를 더 잘게 쓰면 된다.
+    """
+
+    yyyymm: str  # 편성 기준 연월 "YYYYMM" (= 그 버전)
+    version: str = "forecast"  # forecast | actual
+    monthly: list[float] = []  # 1~12월 편성액. 12개가 아니면 모자란 달은 0으로 채운다
+    prior_amount: float = 0  # 전년 실적 총액(비교 기준)
+
+
+class AccountSummaryOut(BaseModel):
+    key: str
+    name: str = ""
+    monthly: list[float] = []
+    total: float = 0
+    prior_amount: float = 0

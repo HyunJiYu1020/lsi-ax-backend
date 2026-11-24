@@ -48,7 +48,7 @@ uv run python -m app.db.seed_overseas_sheets
 같은 "버전"인데 테이블마다 값이 다르다 — 섞어 쓰면 조회가 비게 된다.
 
 - `cost_entries` · `extra_cols`: `forecast`(속보) | `actual`(실적) + `yyyymm`(편성 기준 연월)
-- `overseas_reason_rows` · `overseas_vendor_rows` · `uploads` · `memo_cols` · `memos` · `notes` ·
+- `overseas_reason_rows` · `overseas_vendor_rows` · `uploads` · `notes` ·
   `sheet_rows`: `cur`(당월 속보) | `prev`(전실행) | `prior`(전년 실적) | `plan`(경영계획)
 
 프론트는 화면 상태로 `cur/prev/prior/plan`을 쓰고, 비용 API를 부를 때만 `ovVerApi`/`ovYyyymmApi`로
@@ -74,12 +74,16 @@ app/
 │   │   periods values config enums storage
 │   │   anomaly(이상 감지) row_match(행 이름 매칭)
 │   │   voucher_match(전표 매핑) reason_translate(번역) chat_prompts
+│   │   guidelines(업무 지침) reference(기준정보 버전 규칙)
 │   ├── models/                 common(19계정 공유 비용·메모·업로드) generic(범용 7개:
 │   │                           row_aliases·carry_defs·anomaly_rules·variance_* 등)
 │   │                           close(실적결산) fx account plan version user system
-│   ├── schemas/                close cost fx account plan version system
+│   │                           reference(기준정보: 비용계정·자산Class·부서코드·PLM과제·제품정보
+│   │                           + 변경 이력 ref_change_logs/rows)
+│   ├── schemas/                close cost fx account plan version system reference guideline sheet
 │   ├── services/               fx_rates(적용 환율 계산)
 │   └── endpoints/              cost fx account plan version system health chat
+│                               reference(기준정보) guideline(업무 지침) sheet(구조 미정 시트)
 │
 ├── accounts/
 │   └── overseas/               해외연구소 전용
@@ -91,7 +95,7 @@ app/
 │       └── cost_groups.py      이 계정의 비용 계정 트리(집계 그룹 정의)
 │
 ├── api/v1/router.py            라우터 등록 (공통 + 계정별)
-├── db/                         session(engine·Base) seed seed_overseas_sheets
+├── db/                         session(engine·Base) seed seed_reference seed_overseas_sheets
 │                               models_registry(alembic autogenerate용 모델 일괄 import)
 ├── main.py                     FastAPI 앱, CORS, 전역 예외 핸들러(500 → error_logs)
 └── mcp_server.py               MCP 도구 세트 — 외부 MCP 클라이언트와 chat.py 양쪽에서 재사용

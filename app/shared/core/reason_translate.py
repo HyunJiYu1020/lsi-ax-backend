@@ -103,9 +103,17 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def _prompt(texts: list[str]) -> str:
+def _prompt(texts: list[str], guidelines: str = "") -> str:
     listed = "\n".join(f"{i}. {t}" for i, t in enumerate(texts))
-    return f"{_RULES}\n\n{_OUTPUT_RULE}\n\n번역할 원문 {len(texts)}건:\n{listed}"
+    # 지침은 용어표(GLOSSARY) 뒤에 둔다 — 용어표는 "같은 뜻이면 매달 같은 단어"를 지키는 장치라
+    # 담당자 지침이 그걸 덮어쓸 수 있어야 한다(담당자가 "Headcount는 인원으로 써"라고 정하면
+    # 그게 최신 약속이다). 대신 규칙 1~8(지어내지 마라, 숫자를 바꾸지 마라)보다는 뒤다.
+    extra = (
+        f"\n담당자가 등록한 번역 지침(위 용어표보다 우선한다):\n{guidelines}\n" if guidelines else ""
+        )
+    return (
+        f"{_RULES}\n\n{_OUTPUT_RULE}\n{extra}\n번역할 원문 {len(texts)}건:\n{listed}"
+        )
 
 
 def _parse(raw: str, count: int) -> list[str | None]:
@@ -122,11 +130,16 @@ def _parse(raw: str, count: int) -> list[str | None]:
         return out
     if not isinstance(items, list):
         return out
-    for pos, item in enumerate(items):
+    for item in items:
         if not isinstance(item, dict):
             continue
         idx = item.get("i")
-        idx = pos if not isinstance(idx, int) else idx
+        if not isinstance(idx, int):
+            # i가 없으면 그 건은 버린다. 배열 순서(pos)로 때우면 모델이 순서까지 섞었을 때 A연구소
+            # 사유가 B연구소 칸에 들어가는데, 번역문 자체는 멀쩡해서 담당자가 읽어도 알 수 없다 —
+            # 아무 흔적도 남지 않는 유일한 오류 경로다. 빠진 건 None으로 남고 다음 호출에서 다시
+            # 물어본다(위 docstring의 설계 그대로).
+            continue
         ko = item.get("ko")
         if 0 <= idx < count and isinstance(ko, str) and ko.strip():
             out[idx] = normalize(ko)
@@ -143,7 +156,7 @@ def resolve_provider(provider: str | None) -> str:
 def engine_label(provider: str) -> str:
     """어느 모델이 번역했는지 행마다 남긴다 — 모델을 바꾼 뒤 '예전 번역이 왜 이 말투인지'를
     되짚을 때, 그리고 특정 모델이 낸 번역만 골라 다시 돌릴 때 필요하다."""
-    # 2026-11-16: Gemini 하나만 쓴다(PLAN.md 질문 6). 되살릴 때 주석을 같이 푼다.
+    # Gemini 하나만 쓴다. 되살릴 때 주석을 같이 푼다.
     model = {
         # "anthropic": settings.anthropic_model,
         "gemini": settings.gemini_model,
@@ -152,7 +165,7 @@ def engine_label(provider: str) -> str:
     return f"{provider}:{model}"[:40]
 
 
-# Anthropic 호출 — 2026-11-16 주석 처리(공급자를 Gemini 하나로, PLAN.md 질문 6).
+# Anthropic 호출주석 처리(공급자를 Gemini 하나로.
 # async def _call_anthropic(prompt: str) -> str:
 #     if not settings.anthropic_api_key:
 #         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY가 설정되지 않았습니다. backend/.env에 넣어주세요.")
@@ -191,7 +204,7 @@ async def _call_gemini(prompt: str) -> str:
     return "".join(p.text for p in parts if p.text and not p.thought)
 
 
-# Ollama 호출 — 2026-11-16 주석 처리(공급자를 Gemini 하나로, PLAN.md 질문 6).
+# Ollama 호출주석 처리(공급자를 Gemini 하나로.
 # async def _call_ollama(prompt: str) -> str:
 #     try:
 #         async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=180.0) as client:
@@ -214,16 +227,24 @@ async def _call_gemini(prompt: str) -> str:
 #     return (data.get("message") or {}).get("content") or ""
 #
 #
-async def translate_batch(texts: list[str], provider: str | None = None) -> list[str | None]:
+async def translate_batch(
+    texts: list[str], provider: str | None = None, guidelines: str = ""
+) -> list[str | None]:
     """정규화된 원문 리스트 → 같은 순서의 번역문 리스트(번역 못 한 건은 None).
 
     공급자 오류는 HTTPException으로 올려보낸다 — 번역이 안 되는 이유(키 없음·크레딧·연결 실패)를
     화면이 "번역 실패"로 뭉개면 담당자가 손쓸 수가 없다. 대신 호출부(엔드포인트)가 이걸 잡아서
-    화면 전체를 죽이지 않고 원문을 그대로 보여주는 쪽으로 처리한다."""
+    화면 전체를 죽이지 않고 원문을 그대로 보여주는 쪽으로 처리한다.
+
+    guidelines는 담당자가 등록한 번역 지침이다(AI-18). 호출부가 DB에서 읽어 넘긴다.
+
+    주의: 지침이 걸린 뒤에는 번역 캐시(text_translations)에 이미 들어간 옛 번역이 새 지침을
+    안 따른다 — 캐시는 원문 해시로만 찾으니 지침이 바뀐 걸 모른다. 지침을 바꿨으면 그 원문을
+    다시 번역해 캐시를 덮어써야 한다(engine 컬럼이 그 재번역 대상을 가리는 용도다)."""
     if not texts:
         return []
     p = resolve_provider(provider)
-    prompt = _prompt(texts)
+    prompt = _prompt(texts, guidelines)
     raw = await _call_gemini(prompt)
     return _parse(raw, len(texts))
 
@@ -268,10 +289,36 @@ def _amount_text(diff: float | None, diff_pct: float | None) -> str:
     return " · ".join(parts)
 
 
-def _draft_prompt(source_ko: str, source_text: str, diff: float | None, diff_pct: float | None) -> str:
+def _draft_prompt(
+    source_ko: str,
+    source_text: str,
+    diff: float | None,
+    diff_pct: float | None,
+    guidelines: str = "",
+    examples: list[tuple[str, str]] | None = None,
+) -> str:
     body = source_ko or source_text or ""
+    # 지침과 예시를 규칙 뒤·자료 앞에 둔다. 규칙(숫자를 바꾸지 마라)이 먼저 와야 담당자 지침이
+    # 안전 규칙을 덮어쓰지 않고, 자료보다는 앞에 와야 "이렇게 써라"로 읽힌다.
+    extra = ""
+    if guidelines:
+        extra += (
+            "\n담당자가 등록한 작성 지침(위 규칙과 어긋나지 않는 범위에서 반드시 따라라):\n"
+            f"{guidelines}\n"
+            )
+        if examples:
+            # 담당자가 AI 초안을 실제로 어떻게 고쳐 썼는지 보여준다(AI-18 수정 반영). 말로 등록한
+            # 지침으로는 안 잡히는 말투·생략 습관이 여기서 전해진다 — "지침을 쓰진 않았지만 매번
+            # 같은 식으로 고치는" 부분이 그렇다.
+            pairs = "\n".join(f"- 초안: {d}\n 담당자 확정: {f}" for d, f in examples)
+            extra += (
+                "\n담당자가 지난번 초안을 고쳐 쓴 사례(말투·표현을 여기에 맞춰라. "
+                "내용·숫자는 가져오지 마라 — 다른 달의 다른 계정 사례다):\n"
+                f"{pairs}\n"
+                )
     return (
-        f"{_DRAFT_RULES}\n\n{_DRAFT_OUTPUT_RULE}\n\n"
+        f"{_DRAFT_RULES}\n\n{_DRAFT_OUTPUT_RULE}\n"
+        f"{extra}\n"
         f"회신 원문(번역): {body or '(없음)'}\n"
         f"회신 원문(원본): {source_text or '(없음)'}\n"
         f"{_amount_text(diff, diff_pct)}"
@@ -298,16 +345,21 @@ async def draft_reason(
     diff: float | None = None,
     diff_pct: float | None = None,
     provider: str | None = None,
+    guidelines: str = "",
+    examples: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """번역문 + 증감 숫자 → 보고용 사유 초안 한 줄(만들 수 없으면 None).
 
     초안은 캐시하지 않는다 — 같은 회신 원문이어도 증감액이 달라지면 문장이 달라져야 하고(재업로드로
     금액이 바뀌는 게 바로 그 경우다), 애초에 담당자가 고쳐서 쓰는 출발점이라 매번 같을 필요가 없다.
-    번역(translate_batch)만 캐시하는 것과 구분해야 한다."""
+    번역(translate_batch)만 캐시하는 것과 구분해야 한다.
+
+    guidelines·examples는 담당자가 등록한 작성 지침과 지난 수정 사례다(AI-18). 호출부가 DB에서
+    읽어 넘긴다 — 이 모듈은 DB를 모른다."""
     if not (source_ko or source_text):
         return None
     p = resolve_provider(provider)
-    prompt = _draft_prompt(source_ko, source_text, diff, diff_pct)
+    prompt = _draft_prompt(source_ko, source_text, diff, diff_pct, guidelines, examples)
     raw = await _call_gemini(prompt)
     return _parse_draft(raw)
 

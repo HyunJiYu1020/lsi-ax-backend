@@ -6,6 +6,10 @@ from pydantic import BaseModel
 class FileInfo(BaseModel):
     file: str
     at: str
+    # 이 파일이 속한 기준연월 "YYYYMM". 화면이 자리(cur·prev…)별 묶음으로 보내더라도 달은 파일마다
+    # 명시한다 — 자리는 보는 달에 따라 달라지는 값이라 저장 키로 쓸 수 없다(models.Upload 주석).
+    # 비워 보내면 서버가 그 자리가 가리키는 달로 채운다.
+    yyyymm: str = ""
 
 
 class VersionData(BaseModel):
@@ -15,6 +19,9 @@ class VersionData(BaseModel):
 
     d: dict[str, dict[str, list[float | None]]]  # pk -> category_key -> [12 months]
     etc: list[float | None]  # 원화 기타, 12개월
+    # 저장돼 있는 1Q~4Q · 연간 다섯 칸. pk -> category_key -> [q1,q2,q3,q4,year]. **읽기 전용**이다 —
+    # 화면이 그대로 그리라고 내려주는 값이고, 여기로 다시 받지는 않는다(쓰기는 cost_periods).
+    per: dict[str, dict[str, list[float | None]]] = {}
 
 
 class ActualSnapshot(BaseModel):
@@ -31,7 +38,9 @@ class ReasonRow(BaseModel):
     lab_code는 파트 없는 연구소 코드(SARC는 CPU+GPU 합계 기준)."""
 
     lab_code: str
-    version: str
+    version: str = "forecast"  # forecast(속보) | actual(실적) — cost_entries.version과 같은 값
+    slot: str = ""  # 응답에만 담는 자리(cur · prev · prior · plan). 저장되는 값이 아니다
+    yyyymm: str = ""
     category_key: str
     block: str  # "y"(연간) | "m"(월별)
     mon_label: str = ""
@@ -54,7 +63,9 @@ class VendorRow(BaseModel):
     외주용역 시트도 SARC는 CPU+GPU를 합쳐 연구소 단위로만 올라온다."""
 
     lab_code: str
-    version: str
+    version: str = "forecast"
+    slot: str = ""
+    yyyymm: str = ""
     row_no: int  # 업로드한 시트 안에서의 행 순서(1부터)
     category: str = ""  # Category
     project: str = ""  # Project name
@@ -65,16 +76,17 @@ class VendorRow(BaseModel):
 
 
 class VendorRowsIn(BaseModel):
-    """외주용역 전용 저장 요청(PUT /overseas/vendor-rows). PLAN.md Phase 5.
+    """외주용역 전용 저장 요청(PUT /overseas/vendor-rows). .
 
     rows에 들어온 (연구소, 버전) 조합만 통째로 바뀐다 — 보내지 않은 조합은 건드리지 않는다.
     빈 rows로 한 조합을 비울 수는 없다(무엇을 비울지 알 수 없으므로). 그건 행 삭제 API의 일이다.
     """
 
     basis_year: int  # 월 금액을 어느 해 디테일로 저장할지
+    basis_month: int = 0  # 행에 yyyymm이 없을 때 쓸 기준월(ReasonRowsIn과 같다)
     rows: list[VendorRow]
     # 동시 편집 보호 — /overseas/state와 같은 지문을 쓴다(한 화면의 자료라 충돌 판정도 같아야 한다).
-    # 빈 문자열이면 검사하지 않는다(토큰을 모르는 클라이언트 호환).
+    # 빈 문자열이면 검사하지 않는다.
     state_token: str = ""
 
 
@@ -99,18 +111,21 @@ class CpRow(BaseModel):
 
 
 class ReasonRowsIn(BaseModel):
-    """증감사유 전용 저장 요청(PUT /overseas/reason-rows). PLAN.md Phase 5.
+    """증감사유 전용 저장 요청(PUT /overseas/reason-rows). .
 
     외주용역·CP와 달리 **전체 교체가 아니라 보낸 것만 누적 반영**이다 — 연구소 회신을 항목별로
     쌓아 가는 자료라, 한 시트를 올렸을 때 다른 항목의 사유가 사라지면 안 된다.
     """
 
     rows: list[ReasonRow]
+    # 행에 yyyymm이 없을 때 쓸 기준월. 둘 다 없으면 400이다 — 월을 모르는 채로는 넣지 않는다.
+    basis_year: int = 0
+    basis_month: int = 0
     state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
 
 
 class CpRowsIn(BaseModel):
-    """CP 계약 전용 저장 요청(PUT /overseas/cp-rows). PLAN.md Phase 5.
+    """CP 계약 전용 저장 요청(PUT /overseas/cp-rows). .
 
     rows에 들어온 연도만 통째로 바뀐다 — 연 1회 올리는 파일이라 사라진 POC·직급은 지워야 한다.
     보내지 않은 연도는 건드리지 않는다.
@@ -118,6 +133,11 @@ class CpRowsIn(BaseModel):
 
     rows: list[CpRow]
     state_token: str = ""  # /overseas/state와 같은 지문. 빈 문자열이면 검사하지 않는다
+    # 올라와 있는 계약을 **줄이는** 교체(POC 수 · 직급 행 수 · 총 계약금 중 하나라도 감소)를
+    # 허용할지. 기본은 거부(400)다 — CP는 연도 단위 전체 교체라, 파싱이 깨진 업로드 한 번이
+    # 그 해 계약을 통째로 지운다.
+    # 화면이 "POC 3개 → 1개로 바뀝니다. 계속할까요?"를 물어 "예"를 받았을 때만 true로 보낸다.
+    confirm_shrink: bool = False
     # 이 계약이 적용되기 시작하는 편성 기준연월 "YYYY-MM". 연구소 기준정보(LabIn)와 같은 규칙이다 —
     # 이 달보다 이전 버전은 바뀌기 전 계약으로 분기 정산액이 계속 계산된다. 안 주면 지금 편성 중인
     # 기준월(= "이 버전부터"). 과거 계약을 고쳐야 하는 경우에만 직접 준다.
@@ -135,14 +155,30 @@ class OverseasState(BaseModel):
     reason: list[ReasonRow] = []  # 증감사유 업로드 (연구소×버전×항목×구간 키로 upsert, cost처럼 누적)
     vendor: list[VendorRow] = []  # 외주용역 상세 (연구소×버전 단위로 전체 교체 — 업로드마다 행 수가 달라짐)
     cp: list[CpRow] = []  # CP 계약 업로드 (연도 단위로 전체 교체 — 연 1회 올리는 파일)
+    # CpRowsIn.confirm_shrink와 같다 — 일괄 저장으로 CP를 보낼 때도 줄이는 교체는 확인이 필요하다.
+    # 전용 API(PUT /overseas/cp-rows)를 쓰는 지금 화면은 cp를 빈 배열로 보내므로 해당되지 않는다.
+    confirm_cp_shrink: bool = False
+    # **이번 업로드로 들어온** 1Q~4Q · 연간. pk -> category_key -> [q1,q2,q3,q4,year] (당월 속보만).
+    # 연구소가 파일에 적어 보낸 숫자를 월 합으로 고치지 않고 그대로 저장한다 — 연구소 보고서와
+    # 글자 단위로 같아야 하고, 월 합과 다르면 그 차이는 "기간 합 불일치"로 따로 알린다.
+    #
+    # V["cur"].per(읽기)와 **일부러 다른 필드**다. GET이 준 상태를 그대로 PUT으로 돌려보내는 저장이
+    # 많은데, 읽은 per를 그대로 쓰기로 받으면 월을 고쳐 저장해도 지난 분기 값이 그대로 다시 박혀서
+    # 분기·연간이 월과 어긋난 채 멈춘다. 업로드를 반영하는 그 순간에만 이 필드가 채워져 온다.
+    cost_periods: dict[str, dict[str, list[float | None]]] = {}
     # 경영계획 차수. GET에서는 V["plan"]이 **어느 차수인지**(적용 차수 — ★ → 확정 최신 → 최신),
     # PUT에서는 V["plan"]을 **어느 차수에 쓸지**다. PUT에서 비워 보내면 확정되지 않은 최신 차수에
     # 쓰고, 확정된 차수는 덮지 않는다(확정을 화면 저장이 덮으면 지난 보고가 소급해서 바뀐다).
     plan_no: str = ""
-    # 동시 편집 보호(PLAN.md P1-2). GET이 "지금 상태의 지문"을 담아 내려주고, PUT은 그걸 그대로
+    # 각 자리가 가리키는 버전. "202608|actual"처럼 기준연월|종류이고, 경영계획은 "2026|P02"다.
+    # 전실행이 어느 달인지는 서버만 아는 규칙이라(속보 M → 실적 M-1, 실적 M → 같은 달 속보 M)
+    # 받는 쪽이 다시 계산하지 않게 답을 같이 내려준다.
+    slots: dict[str, str] = {}
+    # 늘 basis_month와 같은 값이다 — 응답에만 담고, 받는 쪽이 따로 쓸 일은 없다.
+    monthless_month: int = 0
+    # 동시 편집 보호. GET이 "지금 상태의 지문"을 담아 내려주고, PUT은 그걸 그대로
     # 돌려보낸다. 그 사이 다른 세션이 저장했으면 지문이 달라져 있어 409로 막는다.
-    # 빈 문자열이면 검사하지 않는다 — 토큰을 모르는 기존 클라이언트를 깨지 않기 위함이고,
-    # 서버 쪽에서 검증만 끄면 롤백도 된다(PLAN Phase 2의 롤백 조건).
+    # 빈 문자열이면 검사하지 않는다.
     state_token: str = ""
 
 
@@ -240,13 +276,20 @@ class CostEntryOut(BaseModel):
 
 class UploadIn(BaseModel):
     lab_pk: str
-    version: str
+    # 그 기준월의 차수(v1 · v2 …). 비우면 서버가 그 달의 다음 차수를 매긴다 —
+    # 올리는 쪽은 "몇 번째인지"를 알 수 없으므로 세는 일은 서버가 한다.
+    version: str = ""
+    yyyymm: str = ""  # 이 파일이 속한 기준연월 "YYYYMM"
     filename: str
 
 
 class UploadOut(UploadIn):
     uploaded_at: datetime
     s3_key: str | None = None
+    # 원본 보관도 uploads 행을 추가해 지문을 움직인다 — 화면이 보낸 지문이 보관 직전과 같았을 때만
+    # 새 지문을 채워 준다(아니면 None). 409는 내지 않는다: 보관은 행 추가뿐이라 덮어쓸 것이 없고,
+    # 여기서 거부하면 "파싱 실패 파일도 보관한다"는 약속이 지문 때문에 깨진다.
+    state_token: str | None = None
 
 
 class NoteIn(BaseModel):
@@ -258,29 +301,6 @@ class NoteIn(BaseModel):
 
 
 class NoteOut(NoteIn):
-    pass
-
-
-class MemoColIn(BaseModel):
-    lab_pk: str
-    version: str
-    col_key: str
-    label: str
-
-
-class MemoColOut(MemoColIn):
-    pass
-
-
-class MemoIn(BaseModel):
-    lab_pk: str
-    version: str
-    row_key: str
-    col_key: str
-    text: str
-
-
-class MemoOut(MemoIn):
     pass
 
 
@@ -296,9 +316,28 @@ class ExtraRowIn(BaseModel):
     # 늘려 받을 때). 파생 행은 값을 저장하지 않고 formula로 매번 계산하므로 비워 보내면 된다.
     # None인 달은 미등록(빈칸)이라 저장하지 않는다 — 0으로 올라온 달과 구분된다.
     # None은 "금액은 건드리지 마라"는 뜻이다(이미 있는 행의 이름·위치만 고칠 때) — []와 구분한다.
-    # 금액을 되보내게 하면 그 왕복에서 값이 상할 수 있다: 화면이 $ 단위면 서버가 받은 금액을
-    # 1000으로 나누는데(chat.py _to_kdollar), 조회해서 받은 K$ 값을 그대로 되보내면 1000배 작아진다.
+    # 금액을 되보내게 하면 그 왕복에서 값이 상할 수 있다: 화면이 K$ 단위면 서버가 받은 금액을
+    # 1000배 하는데(chat.py _to_stored_dollar), 조회해서 받은 $ 값을 그대로 되보내면 1000배 커진다.
     v: list[float | None] | None = None
+    # 파일에 적혀 온 1Q~4Q·연간 칸 [1Q,2Q,3Q,4Q,연간] — 고정 계정(state의 cost_periods)과 같은
+    # 규칙으로, 추가 행도 연구소가 보고한 공식 분기·연간을 월 합으로 덮지
+    # 않고 그대로 보여주기 위해 받는다. None이면 "건드리지 않는다"(이름·자리만 고치는 저장),
+    # 리스트면 그 행의 분기·연간 전체 교체다 — []는 지운다는 뜻이다(분기 칸 없이 다시 올라온
+    # 파일이 지난 파일의 분기값을 남기면 안 된다. cost_headers가 전체 교체인 것과 같은 이유).
+    per: list[float | None] | None = None
+    # 동시 편집 지문(services/state.state_token) — vendor-rows·cp-rows와 같은 규칙. 보내면 낡았을 때
+    # 409로 거부하고, 응답(ExtraRowOut)에 저장 뒤의 새 지문을 실어 준다. 전용 저장도 지문을
+    # 움직이므로 화면이 새 지문으로 갈아끼우지 않으면 **다음 전체 저장이 자기 저장과 충돌**한다.
+    # 안 보내면(챗봇) 검사하지 않는다.
+    state_token: str | None = None
+    # 누가 부르는지. 화면(screen)과 챗봇(chat)에 서로 다른 검사를 걸기 위해 받는다 —
+    # anomaly_rule_logs.source · guidelines.source와 같은 값 체계다.
+    #
+    # 왜 나눠야 하나: 화면의 '+행 추가'는 사람이 표를 보면서 누르는 거라 같은 이름이 이미 있으면
+    # 눈에 보이고, 게다가 화면은 이 PUT의 실패를 무시한다(core.js의 .catch(=>{})) — 여기서 400을
+    # 주면 화면에는 행이 보이는데 서버에는 없는 상태가 조용히 생긴다. 말로 시켜서 표를 못 보는
+    # 챗봇 경로에서만 "이미 있는 행 아닌가요?"를 막는다(anchor_key 가드와 같은 이유).
+    source: str = "screen"
     # True면 실제로 수집한 비용이 아니라 다른 계정들을 조합(합산·비율 등)해 계산한 파생 행이라는 뜻.
     # 취합에서 추가한 원시 행과 집계에서 추가한 파생 행을 저장 후에도 구분하기 위해 DB에 남긴다 —
     # 삭제 권한(원시=취합에서만, 파생=집계에서만)과 표시 규칙(원시=양쪽, 파생=집계만), 그리고
@@ -328,6 +367,9 @@ class ExtraColIn(BaseModel):
     # 파생 열의 계산식. 월을 가로로 묶는다 — {"op":"sum_months","months":[7,8,9]}는 3분기 합계.
     # op: sum_months | avg_months. 원시 열은 None.
     formula: dict | None = None
+    # 칸을 그리는 형식(값은 원문 그대로 두고 표시만 바꾼다). raw(그대로) |
+    # pct_ratio(0.825 → 82.5%) | pct_plain(82.5 → 82.5%). 글자 값은 형식과 무관하게 원문 그대로다.
+    fmt: str = "raw"
 
 
 class ExtraColOut(ExtraColIn):
@@ -337,19 +379,48 @@ class ExtraColOut(ExtraColIn):
 class ExtraValueIn(BaseModel):
     """추가 열의 칸 하나(행×열) 값. row_key는 cost_entries.category_code(고정 계정 또는 사용자 추가 행의 키),
     yyyymm은 그 행이 속한 편성 기준 연월(다른 모든 행과 마찬가지로 항상 있어야 함). label 자체가 열
-    식별자라 열 이름을 바꾸는 건 지원하지 않는다 — 바꾸려면 옛 이름을 지우고 새 이름으로 다시 넣으면 된다."""
+    식별자라 열 이름을 바꾸는 건 지원하지 않는다 — 바꾸려면 옛 이름을 지우고 새 이름으로 다시 넣으면 된다.
+
+    value는 숫자와 글자를 다 받는다 — 양식 밖 열이라 금액·비율·메모가 섞여 온다. 어느 쪽으로
+    저장할지는 서버가 한 곳에서 판정한다(services/extra_rows.classify_extra_value): "1,200"처럼
+    숫자로 읽히는 글자는 숫자, 나머지는 원문 그대로 text. JSON 응답의 타입이 곧 저장된 타입이다
+    (숫자면 number, 문자열이면 text) — 받는 쪽은 typeof 분기만 하면 된다."""
 
     lab_pk: str
     version: str
     row_key: str
     yyyymm: str
     label: str
-    value: float = 0
+    value: float | str = 0
+    # 동시 편집 지문 — ExtraRowIn.state_token과 같은 규칙(낡았으면 409, 응답에 새 지문).
+    state_token: str | None = None
 
 
 class ExtraValueOut(ExtraValueIn):
     # 파생 열의 칸일 때만 채워지는 계산 근거 — "7월 100 + 8월 110 + 9월 120 = 330".
     basis: dict | None = None
+
+
+class CostHeaderIn(BaseModel):
+    """연구소 비용 시트의 기간 열 머리글 원문 한 벌(그 시트 전체). 업로드를 반영할 때 한 번 보낸다.
+
+    labels는 열 자리 → 머리글 글자다: "m1".."m12"는 월(기간을 12개월 너머로 받으면 "m13"…),
+    "q1".."q4"는 분기, "y"는 연간. 파일에 없던 열은 키 자체를 빼고 보내면 된다 — 그 열은 화면이
+    종전처럼 코드 머리글("1월")을 쓴다.
+
+    보낸 한 벌이 그 (연구소 · 버전 · 기준월)의 머리글 **전체를 교체**한다. 파일마다 열 구성이
+    달라질 수 있어서 열별 덮어쓰기로는 지난 업로드의 열이 남는다(외주용역 행과 같은 방식).
+    빈 labels를 보내면 그 시트의 머리글을 지운다(= 코드 머리글로 되돌린다)."""
+
+    lab_pk: str
+    version: str  # forecast(속보) | actual(실적)
+    yyyymm: str
+    labels: dict[str, str] = {}
+    source_file: str = ""
+
+
+class CostHeaderOut(CostHeaderIn):
+    pass
 
 
 class LaborSplitLab(BaseModel):
@@ -450,15 +521,20 @@ class OverseasSummaryLab(BaseModel):
 class OverseasSummary(BaseModel):
     """해외연구소 화면 맨 위 히어로 카드 한 장에 들어가는 값 전부.
 
-    화면(frontend-html/shared/core.js)이 ovAgg/ov17로 브라우저에서 계산하던 숫자를
-    서버에서 같은 식으로 낸 것이다 — 챗봇·MCP가 말하는 총액과 사용자가 보는 카드가 어긋나면 안 되므로
-    식을 바꿀 때는 화면 쪽(core.js)도 같이 고칠 것."""
+    화면(frontend-html/shared/core.js)이 그대로 그리는 숫자다 — 화면이
+    이 응답을 그대로 그린다 — 히어로 카드와 ③집계 KPI 카드가 모두 이 값을 쓴다."""
 
     basis_year: int
     basis_month: int
     basis_label: str  # "26.09" — 카드 제목의 "(26.09 속보 기준)"
     period: str  # y(연간) | q1~q4 | m1~m12
     version: str  # cur | prev | prior | plan
+    # 집계표와 같은 "어느 버전을 읽었는가". kind는 **읽은** 버전의 종류라 version=prev면 요청한
+    # kind가 아니라 전실행의 종류가 온다(forecast|actual|plan). version_label은 "26.08 실적"처럼
+    # 화면·챗봇이 그대로 쓰는 문장이다 — 양쪽이 따로 만들면 같은 버전을 다르게 부른다.
+    kind: str = "forecast"
+    plan_no: str = ""
+    version_label: str = ""
     step: int  # 0-based 화면 단계 인덱스 (0 취합 · 1 집계 · 2 증감분석)
     step_count: int
     total: float  # 개발비(매출) = 연구소 합계 + 원화 기타 (원)
@@ -594,6 +670,51 @@ class RowAliasOut(BaseModel):
     target_label: str = ""
 
 
+class RowMergeIn(BaseModel):
+    """이미 적재된 추가 행의 금액을 다른 행으로 합쳐 옮긴다.
+
+    별칭(RowAliasIn)과 하는 일이 다르다 — 별칭은 "앞으로 올라올 파일"의 이름을 맞추고, 이건 "이미
+    들어간 값"을 옮긴다. 담당자가 "Other랑 Misc 기타경비로 합쳐줘" 한 마디로 둘 다 원하므로 보통
+    같이 호출되지만, 별칭은 지울 수 있고 합치기는 되돌릴 수 없어서 따로 둔다."""
+
+    yyyymm: str # 합칠 칸의 편성 기준 연월 "YYYYMM"
+    version: str # forecast(속보) | actual(실적)
+    source_labels: list[str] # 합쳐 없앨 추가 행 이름들(정규화해서 찾는다 — 'Other'/'other' 같다)
+    target_kind: str # "category"(고정 계정으로) | "extra_row"(이미 있는 추가 행으로)
+    target_key: str = "" # category면 비용항목 키(misc 등), extra_row면 정식 이름의 정규화값
+    target_label: str = "" # extra_row면 합쳐 넣을 정식 이름
+    lab_pk: str = "" # 비우면 전체 연구소. 특정 연구소만 합치려면 그 pk
+    # True면 저장하지 않고 "이렇게 바뀐다"만 돌려준다. 합치기는 되돌릴 수 없어서(원본 행이 지워진다)
+    # 호출부가 먼저 이걸로 보여주고 사람 확인을 받아야 한다.
+    dry_run: bool = True
+
+
+class RowMergePreview(BaseModel):
+    """한 연구소에서 합쳐질 내용 한 건 — 무엇이 얼마로 바뀌는지."""
+
+    lab_pk: str
+    source_label: str
+    source_total: float # 합쳐 넣을 금액(연간 합, $)
+    target_before: float # 합치기 전 대상 행 금액(연간 합, $)
+    target_after: float
+
+
+class RowMergeResult(BaseModel):
+    """합치기 결과(또는 dry_run 미리보기)."""
+
+    dry_run: bool
+    yyyymm: str
+    version: str
+    target_label: str
+    merged: list[RowMergePreview] = []
+    # 합쳐 없앤(또는 없앨) 행 수. merged와 다를 수 있다 — 한 연구소가 'Other'와 'Misc'를 둘 다
+    # 쓰면 merged는 2건이지만 대상 행은 하나다.
+    removed_rows: int = 0
+    # 확정을 작성 중으로 되돌렸는지(D7). dry_run이면 항상 False.
+    unconfirmed: bool = False
+    note: str = ""
+
+
 class CarryDefIn(BaseModel):
     """집계 파생 행·열을 "다음 버전에도 유지"할지 정한다. carry=False면 저장해 둔 승인을 지운다."""
 
@@ -727,6 +848,114 @@ class LaborSplitTotals(BaseModel):
     fx_outside: float = 0  # = hc_effect + rate_effect + unsplit
 
 
+class VarianceLabCell(BaseModel):
+    """연구소 한 곳의 한 기간 증감. 금액은 전부 원이고 인원만 명이다.
+
+    화면(분석 › 증감분석 › 연구소별 증감 요약)의 한 칸이다. 환차外를 인건비 / 인건비外로 한 번 더
+    가르는 이유: 그 표가 "인건비가 늘어서인가, 그 외가 늘어서인가"를 묻는 표이기 때문이다.
+    인건비 분해(인원 효과 · 단가 효과)는 그 칸을 우클릭해 펼칠 때 쓰고, 인력이 없는 연구소는
+    나눌 수 없어 unsplit에 남는다(services/labor_split.py)."""
+
+    base: float = 0 # 비교 기준 금액
+    cur: float = 0 # 지금 보고 있는 버전 금액
+    diff: float = 0 # cur - base
+    fx: float = 0 # 환차 계 = fx_local + fx_usd
+    fx_local: float = 0 # 환차 현지→$ (USD 연구소는 0)
+    fx_usd: float = 0 # 환차 $→원
+    fx_outside: float = 0 # 환차外 계 = labor_outside + non_labor_outside
+    labor_outside: float = 0 # 환차外 · 인건비
+    non_labor_outside: float = 0 # 환차外 · 인건비外
+    # 인건비 분해 — 경영계획 대비처럼 환율 기준이 없어 분해할 수 없으면 전부 0이고 splittable=false다
+    # (0을 "분해했더니 0"으로 읽지 않도록 플래그를 같이 준다).
+    splittable: bool = False
+    hc_base: float = 0
+    hc_cur: float = 0
+    per_head_base: float = 0
+    per_head_cur: float = 0
+    hc_effect: float = 0
+    rate_effect: float = 0
+    unsplit: float = 0
+
+
+class VarianceLabRow(BaseModel):
+    """연구소 한 줄(= 표의 한 행). cells의 키는 기간 코드(y · q1~q4 · m1~m12)다."""
+
+    lab_code: str
+    lab_name: str
+    is_total: bool = False # 맨 윗줄 "전체 연구소" 합계행
+    cells: dict[str, VarianceLabCell]
+    # 증감사유 칸에 처음 들어가 있는 [분석 초안] 블록(연간 기준). 위 cells를 만든 값 그대로 쓴
+    # 문장이라 표 숫자와 어긋나지 않는다 — 문구 규칙은 services/reason_draft.py에 있다.
+    # 합계행(is_total)은 빈 문자열이다: 화면의 그 줄에는 사유 칸이 없다.
+    reason_draft: str = ""
+
+
+class VarianceLabsResult(BaseModel):
+    """증감분석 **연구소별** 요약 표 — 17기간 × 연구소. 계정별 표(VarianceTable)의 짝이다.
+
+    왜 따로 두나: 계정별 표는 "한 연구소(또는 전체)의 계정들"이고 이 표는 "한 계정 묶음(개발비
+    매출)의 연구소들"이라, 축이 반대다. 화면이 두 축을 모두 서버에서 받아야 위·아래 표가 같은
+    숫자를 보여준다 — 이 표만 브라우저가 계산하던 동안 두 표가 25억까지 벌어졌다.
+    """
+
+    basis_year: int
+    basis_month: int
+    kind: str
+    stage: str = ""
+    base_version: str
+    base_label: str
+    plan_no: str = ""
+    labs: list[VarianceLabRow]
+    fallback_note: str = ""
+    note: str = ""
+
+
+class VarianceExtraCell(BaseModel):
+    """추가 행 한 칸(기간 하나)의 증감. 뜻과 계산식은 고정 계정 행(VarianceRow)의 금액 칸과 같다 —
+    추가 행은 인력·비율 같은 단위 구분이 없어 항상 금액(원)이다."""
+
+    base: float = 0
+    cur: float = 0
+    diff: float = 0
+    fx: float = 0
+    fx_local: float = 0
+    fx_usd: float = 0
+    fx_outside: float = 0
+
+
+class VarianceExtraRow(BaseModel):
+    """연구소가 직접 추가한 행 한 줄의 증감(17기간).
+
+    고정 45행에는 이 행의 이름이 없다 — 금액은 anchor_key로 지정한 계정 합계에 녹아 들어간다.
+    그래서 당월에만 생긴 행이 있어도 표에서는 "기타경비가 늘었다"까지만 보이고 **무엇이 늘었는지**가
+    안 보인다. 이 목록이 그 줄을 이름째로 준다: 비교 기준에 없던 행은 base가 0이고 증감이 전액이다.
+
+    **줄은 (얹힌 계정, 이름)으로 묶는다.** 집계표 ① 전체 계정 탭과 같은 규칙이다(core.js의
+    byLabel) — 한 연구소가 '클라우드 사용료'를 추가하면 연구소마다 자기 줄이 따로 서는 게 아니라
+    어느 범위로 보든 같은 한 줄이고, 그 줄에 더해지는 금액만 범위에 따라 달라진다. 그래서 행 목록은
+    **전체 연구소**에서 모으고(그 연구소에 없으면 0원 줄로 선다), 금액만 조회 범위로 더한다.
+    이름이 같아도 얹힌 계정이 다르면 다른 줄이다 — 그래야 각 줄이 자기 계정 합계와 맞는다.
+
+    기간별로 쪼개지 않고 한 줄이 17칸을 들고 있는 이유: 줄의 정체(이름 · 얹힌 계정)는 기간과
+    무관한데, 기간으로 쪼개면 같은 정체를 17번 되풀이해 보내게 된다.
+    """
+
+    label: str
+    label_en: str = ""
+    # 얹힌 계정 키와 그 이름. 합산 제외 행("__none__")은 어느 계정 합계에도 안 들어간다.
+    anchor_key: str = ""
+    anchor_label: str = ""
+    # 얹힌 계정 합계(= 고정 45행)에 이 금액이 들어가 있는가. False면 표의 어느 줄에도 없는 행이라
+    # 받는 쪽이 "이 줄을 더하면 합계가 두 번 세어지는가"를 판단할 수 있다.
+    in_total: bool = True
+    # 이 줄에 실제로 값이 있는 연구소 pk들(조회 범위 안에서). 빈 목록이면 이 범위에서는 0원 줄이다 —
+    # 다른 연구소가 추가해서 목록에만 서 있는 줄인지, 이 연구소가 추가한 줄인지 가를 수 있다.
+    labs: list[str] = []
+    # 합쳐진 원본 행 키들(연구소마다 row_key가 다르다 — 'ux_cloudfee' · 'cloud_fee_dsra').
+    row_keys: list[str] = []
+    cells: dict[str, VarianceExtraCell] = {}
+
+
 class VarianceTable(BaseModel):
     """증감분석 화면 표 한 장 전체 — 17기간 × 계정. periods의 키는 조회 파라미터와 같은 기간 코드
     (y · q1~q4 · m1~m12)이고, 값은 그 기간의 계정 행 목록이다.
@@ -749,6 +978,9 @@ class VarianceTable(BaseModel):
     # 같은 응답에 담는 이유: 기간마다 따로 부르면 17번, 연구소까지 더하면 수십 번이 된다.
     # 경영계획 대비는 환율 기준이 없어 분해할 수 없으므로 빈 dict가 온다(화면도 같은 제약).
     labor_split: dict[str, LaborSplitTotals] = {}
+    # 연구소가 직접 추가한 행들(이름 있는 행). 고정 45행에는 이름이 없고 얹힌 계정에 녹아 있어서,
+    # 그 줄을 따로 보여줘야 "당월에만 생긴 행 때문에 늘었다"가 드러난다.
+    extras: list[VarianceExtraRow] = []
     fallback_note: str = ""
     note: str = ""
 
@@ -839,6 +1071,9 @@ class VarianceReasonCheck(BaseModel):
     무엇을 알고도 확정하는지 화면이 보여줄 수 있게 목록과 문장을 돌려준다."""
 
     threshold_pct: float
+    # 적용한 금액 기준(원). 0이면 금액으로는 걸러내지 않았다는 뜻 — 화면·챗봇이 어떤 기준의
+    # 결과인지 밝힐 수 있어야 한다("사유 다 썼다"를 전체 기준으로 읽으면 안 된다).
+    threshold_amount: float = 0.0
     missing: list[VarianceReasonGap] = []  # 사유가 비어 있는 칸
     stale: list[VarianceReasonGap] = []  # 사유는 있지만 금액이 바뀌어 재확인이 필요한 칸
     note: str = ""
@@ -900,7 +1135,7 @@ class ActualFirstRow(BaseModel):
     lab_name: str = ""
     currency: str = "USD"
     local_amount: float = 0  # 현지통화 총액 (그 달)
-    usd_amount: float = 0  # $ 환산 (K$)
+    usd_amount: float = 0 # $ 환산($ — 저장 단위와 같다)
     krw_amount: float = 0  # 원화 환산 (원)
     base_krw: float = 0  # 비교 기준 금액 (원)
     diff: float = 0
@@ -1000,9 +1235,26 @@ class AggregateRow(BaseModel):
     label: str
     label_en: str = ""
     level: int = 0  # 손익계산서형 들여쓰기 단계
-    format: str = "krw"  # krw(금액) | usd(K$) | hc(명) | pct(%)
+    format: str = "krw" # krw(금액) | usd($ — 화면이 K$로 나눠 보여준다) | hc(명) | pct(%)
     memo: bool = False  # 참고 행(IT 관련 비용·외주용역비) — 개발비 합계에 들어가지 않는다
     values: list[float | None]
+
+
+class AggregateDerivedCol(BaseModel):
+    """집계 ① 표의 파생 열(계산 열) 하나. 화면에서 [+ 열 추가]로 만든 "3분기 합계" 같은 열이다.
+
+    칸 값은 저장하지 않는다 — 계산식만 저장하고 볼 때마다 계산한다. 그 계산을
+    서버가 한다. values의 키는 행을 가리키고 세 종류가 있다:
+    - "k:<계정키>" 고정 45행 (예: "k:sal")
+    - "l:<라벨>" 취합에서 연구소가 추가한 원시 행 — 집계표에서는 **라벨로 합쳐진** 한 줄이다
+    - "d:<행키>" 집계에서 추가한 파생 행
+    값이 null인 칸은 "그 행은 이 열로 묶을 수 없다"는 뜻이다(비율·환율 행) — 0이 아니다.
+    """
+
+    label: str
+    op: str # sum_months | avg_months
+    months: list[int] # 1~12
+    values: dict[str, float | None]
 
 
 class AggregateTable(BaseModel):
@@ -1021,6 +1273,12 @@ class AggregateTable(BaseModel):
     caption: str
     note: str
     rows: list[AggregateRow]
+    # 화면에서 [+ 열 추가]로 만든 파생 열의 값. 열이 없으면 빈 목록이다.
+    derived_cols: list[AggregateDerivedCol] = []
+    # 화면에서 [+ 행 추가]로 만든 파생 행(계산 행). **이 표의 단위로 계산해서** 준다 — 원화 표면
+    # 재료를 환산한 뒤 계산식을 평가한 값이라 금액 행은 원화고 비율 행은 그대로다. 45행 사이
+    # 어디에 끼워 넣을지(anchor_key)는 화면이 정하므로 rows와 따로 보낸다.
+    derived_rows: list[ExtraRowOut] = []
 
 
 class LabTableRow(BaseModel):
@@ -1032,8 +1290,12 @@ class LabTableRow(BaseModel):
     """
 
     label: str
+    # 연구소 줄의 식별자(연구소 코드, 하위 파트 줄은 pk). 합계·소계·환율·인당 줄은 빈 문자열이다.
+    # 화면이 같은 표를 두 버전(당월 · 전실행) 받아 짝지을 때 쓴다 — 라벨은 표마다 달라서
+    # 짝짓기에 쓸 수 없다(② 달러 표 "SRCX(APJT포함)" vs 원화 표 "SRCX").
+    key: str = ""
     level: int = 0  # 들여쓰기 단계(0 = 합계·소계, 1 = 연구소, 2 = 연구소 하위 파트)
-    format: str = "krw"  # krw(억원) | usd(K$) | rate(원/$)
+    format: str = "krw" # krw(원) | usd($ — 화면이 K$로 나눠 보여준다) | rate(원/$)
     total: bool = False  # 표 맨 위 합계줄
     bold: bool = False  # 소계줄(예: 개발비(A,CP제외))
     muted: bool = False  # 참고줄(하위 파트 · 적용 환율)
@@ -1041,7 +1303,7 @@ class LabTableRow(BaseModel):
 
 
 class LabTable(BaseModel):
-    """집계 ②③④ 탭 한 장."""
+    """집계 화면 연구소별 표 한 장(탭 ①②③)."""
 
     caption: str
     note: str
@@ -1049,12 +1311,15 @@ class LabTable(BaseModel):
 
 
 class LabTablesOut(BaseModel):
-    """집계 ②③④ 탭을 한 번에. 탭을 누를 때마다 따로 받지 않는 이유: 비싼 건 표 조립이 아니라
-    화면 상태를 읽는 일이고 그건 여섯 표가 같이 쓴다 — 여섯 번 부르면 같은 읽기를 여섯 번 한다.
+    """집계 화면 탭 ①②③의 표를 한 번에. 탭을 누를 때마다 따로 받지 않는 이유: 비싼 건 표 조립이
+    아니라 화면 상태를 읽는 일이고 그건 모든 표가 같이 쓴다 — 열 번 부르면 같은 읽기를 열 번 한다.
 
-    tables의 키는 화면 탭 키와 같다: t2u · t2k(② 개발비 달러·원화), t3 · t4(③ 인건비 달러·원화),
-    t5 · t6(④ CP 보정 인건비·인건비외). 환율이 없으면 원화 표가, CP 계약이 없으면 ④가 빠진다 —
-    재료 없이 만든 0원 표를 내려보내지 않으려는 것이다.
+    tables의 키(화면도 같은 키로 표를 집는다):
+    ① 개발비 — t2u · t2k(총계 달러·원화) · t5u · t5(인건비) · t6u · t6(인건비외) · CP 분기 정산
+    ② 개발비(CP_PL) — t7u · t7k
+    ③ 인건비(CP_PL) — t3 · t4
+    환율이 없으면 원화 표가, CP 계약이 없으면 ① 전체가 빠진다 — 재료 없이 만든 0원 표를
+    내려보내지 않으려는 것이다(④ 전체 계정은 이 응답이 아니라 AggregateTable이다).
     """
 
     basis_year: int
@@ -1104,8 +1369,8 @@ class CpContractAmountIn(BaseModel):
     5.2M$로 바꿔줘"처럼 **금액 하나만** 고치는 경로다. 직급 행·인원·맨먼스는 그대로 두고 금액
     항목만 같은 비율로 움직인다(services/cp.rescale_rows).
 
-    금액 단위는 저장값과 같은 **$**다(K$가 아니다) — 5.2M$는 5200000이다. 집계 표가 K$로 보여주는
-    건 그쪽이 1000으로 나누기 때문이고, 여기 들어오는 값은 계약서 금액 그대로다.
+    금액 단위는 저장값과 같은 **$**다 — 5.2M$는 5200000이다. 집계 표가 K$로 보여주는 건 화면이
+    1000으로 나누기 때문이고, 여기 들어오는 값은 계약서 금액 그대로다.
 
     두 가지 중 하나만 쓴다:
     - year_total: 그 해 연 계약 총액을 이 값으로($). POC가 여러 개면 **지금 비중대로** 나눠 가진다.
@@ -1204,7 +1469,7 @@ class AnomalyRuleOut(BaseModel):
     label: str
     enabled: bool = True
     pct: float | None = None
-    amount: float | None = None  # K$
+    amount: float | None = None # $(저장 단위)
     ratio: float | None = None
     desc: str = ""
 
@@ -1233,6 +1498,14 @@ class AnomalyRuleLogOut(BaseModel):
     changed_at: datetime
 
 
+class OutsRowIn(BaseModel):
+    """외주용역 목록 한 줄 — 기간 합 대조에만 쓴다(저장 경로와 무관)."""
+
+    label: str = ""
+    months: list[float | None] = []
+    periods: list[float | None] = []
+
+
 class AnomalyFinding(BaseModel):
     """이상 감지 1건. category_key·month로 화면이 어느 칸을 표시할지 정한다(month=null이면 행 전체)."""
 
@@ -1241,10 +1514,20 @@ class AnomalyFinding(BaseModel):
     category_key: str
     category_label: str
     month: int | None = None
+    # 칸이 여럿인 기준(빈칸 등)은 months로 묶어서 돌려준다 — 계정당 한 줄로 보여주고 칸은 전부
+    # 표시한다. month·months 모두 1~12는 달, 13~16은 1Q~4Q, 17은 연간이다(화면 17칸 표와 같은 순서).
+    months: list[int] = []
     message: str
     value: float | None = None
     base: float | None = None
     rate: float | None = None
+    # 외주용역처럼 계정이 아니라 행 이름으로 가리키는 경우의 그 행 이름.
+    row_label: str = ""
+    # 증감분석에서 어느 블록인지("y"=연간 · "m"=당월). 화면이 그 블록 칸만 표시한다.
+    block: str = ""
+    # 그 블록에서 문제가 있는 칸 이름("plan" · "prev" · "cur"). 블록 전체를 칠하지 않고 이 칸만
+    # 표시한다 — 세 칸 중 하나가 비었는데 셋을 다 칠하면 어디를 고쳐야 하는지가 가려진다.
+    fields: list[str] = []
 
 
 class AnomalyScanIn(BaseModel):
@@ -1264,6 +1547,25 @@ class AnomalyScanIn(BaseModel):
     reasons: dict[str, str] | None = None
     base_yyyymm: str | None = None
     base_version: str | None = None
+    # 전실행을 **연구소 단위**(같은 lab_code의 파트 합)로 읽는다. 증감분석·외주용역은 연구소가
+    # 연구소 전체로 보내는 시트라(SARC = CPU+GPU 합), 파트 하나의 전실행과 비교하면 SARC는
+    # 항상 어긋나 보인다. 비용 시트는 파트별로 오므로 이 값을 켜지 않는다.
+    base_lab_wide: bool = False
+    # 파일에 적혀 온 분기·연간 칸(계정 키 → [1Q,2Q,3Q,4Q,연간]). 월 합과 대조한다.
+    # 빈칸은 null로 보낸다 — 0으로 바꿔 보내면 "0이라고 적어 보냈다"가 되어 전부 불일치로 걸린다.
+    periods: dict[str, list[float | None]] | None = None
+    # 외주용역 목록의 업체 행(월 12칸 + 분기·연간 칸). 계정이 아니라 행 이름으로 가리킨다.
+    outs_rows: list[OutsRowIn] | None = None
+    # 증감분석 시트 값(계정 키 → {"y": 연간 블록, "m": 당월 블록} → {plan, prev, cur}).
+    # 업로드 파싱 결과(core.js ovParseRsn)와 같은 모양으로 받는다 — 옮겨 적으면 어긋난다.
+    analysis: dict[str, dict[str, dict[str, float | None]]] | None = None
+    # 파일에 **실제로 있던** 기간 열의 자리 키("m1".."m12" · "q1".."q4" · "y").
+    # 열 누락 검사가 이걸 양식과 대조한다 — overseas_cost_headers.col_key와 같은 키 규칙이고,
+    # 화면은 업로드 파싱이 읽어 둔 머리글(core.js ovParse의 hdr)의 키를 그대로 보낸다.
+    # 안 보내면 그 검사를 건너뛴다(열 목록을 모르는 호출에서 "열이 다 없다"가 되면 안 된다).
+    cols: list[str] | None = None
+    # 당월이 몇 월인지(메시지에만 쓴다). 안 주면 "당월"로 적는다.
+    basis_month: int | None = None
     # 이번 검사에만 적용할 임시 기준("이번만 50%로 봐줘") — 저장하지 않는다.
     overrides: dict[str, dict] | None = None
 
@@ -1277,3 +1579,65 @@ class AnomalyScanResult(BaseModel):
     # 검사하지 못한 기준과 그 이유(비교할 전실행이 없을 때 등). 빈칸으로 두면 "이상 없음"으로
     # 읽히기 때문에 못 한 검사는 분명히 돌려준다.
     skipped: list[str] = []
+
+
+class LaborRatioBlock(BaseModel):
+    """인건비율 팝업의 한 블록(전체 · 연구소 · 파트). 세 배열 모두 17칸이다(월 12 + 분기 4 + 연간).
+
+    `/overseas/labor-ratio`와 **다른 표**다 — 그쪽은 원화 · CP 분기 정산 · 한 기간 한 줄이고,
+    이 팝업은 달러($ 저장 단위, 화면이 K$로 나눠 보여준다) · CP는 올라온 PL 그대로 · 17칸 · 파트까지 내려간다. 팝업이 "환율과 상관
+    없이 비율만 본다"는 화면이라 단위가 다르다.
+
+    ratio는 기간 **합계끼리** 나눈 값이다 — 월별 비율의 평균으로 내면 금액이 작은 달의 비율이
+    왜곡되게 끼어든다. 분모가 0이거나 미등록이면 null이고, 그때 화면은 "–"를 그린다(0%가 아니다).
+    """
+
+    key: str # ALL | 연구소 코드 | 파트 pk
+    label: str
+    level: int # 0 전체 · 1 연구소 · 2 파트
+    labor: list[float | None]
+    dev: list[float | None]
+    ratio: list[float | None]
+
+
+class LaborRatioTable(BaseModel):
+    """집계 화면 인건비율 팝업 전체. 블록 순서가 그대로 화면 줄 순서다."""
+
+    basis_year: int
+    basis_month: int
+    version: str
+    kind: str = "forecast"
+    plan_no: str = ""
+    version_label: str = ""
+    unit: str = "K$" # 화면에 쓰는 표시 단위 이름. 값 자체는 $다(화면이 1000으로 나눈다)
+    blocks: list[LaborRatioBlock]
+    note: str = ""
+
+
+class LabMonthlyRow(BaseModel):
+    """연구소 **파트** 한 줄의 월별 원화. 마감 전표 매핑 단위가 파트라서 연구소 묶음이 아니다."""
+
+    pk: str
+    lab_code: str
+    label: str
+    months: list[float | None] # 12칸, 원
+
+
+class LabMonthlyOut(BaseModel):
+    """마감 2단계가 쓰는 연구소별 월별 원화 금액(개발비(매출) · CP 분기 보정 반영).
+
+    왜 따로 있나: 마감 화면은 "그 달 전표를 어느 연구소에 붙일까"의 타깃 금액과, 비교 기준이 되는
+    12개월 금액이 필요하다. 집계표(②)는 연구소 묶음 단위라 파트가 없고, 히어로(summary)는 합계
+    하나뿐이다. 둘 다 이 화면이 쓸 모양이 아니라서 pk 단위로 따로 내려준다.
+    """
+
+    basis_year: int
+    basis_month: int
+    version: str
+    kind: str = "forecast"
+    plan_no: str = ""
+    version_label: str = ""
+    unit: str = "원"
+    rows: list[LabMonthlyRow]
+    total: list[float | None] # 12칸, 원 — 연구소 전체 합계
+    note: str = ""

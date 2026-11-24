@@ -44,6 +44,12 @@ class Account(Base):
         comment="편성 진행 상태. common_codes(group_code='ACCOUNT_STATUS')의 code 값 "
         "(drafting|drafted|not_submitted|submitted|reviewed|rejected)",
     )
+    owner: Mapped[str] = mapped_column(
+        String(60),
+        default="",
+        comment="편성 주체(담당 조직·담당자). 전체 현황판에서 '누가 편성하는 계정인가'를 보여주는 값이라 "
+        "브라우저에 두면 사람마다 다르게 보인다. 빈 문자열이면 아직 안 정해진 것",
+    )
     memo: Mapped[str | None] = mapped_column(Text, comment="비고 메모")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="status · memo 마지막 수정 시각"

@@ -64,11 +64,12 @@ def test_all_none_row_stores_header_only(db):
 def test_krw_months_adds_only_present_values():
     # 합계는 있는 값만 더해 진행한다 — 미등록 달이 섞여도 나머지 달은 그대로 계산된다.
     rate = [1000.0] * 12
+    # 저장값은 $다(2026-11-18 단위 전환) — 원화는 `값 × 환율`이고 ×1000이 더 붙지 않는다.
     cats = {"sal": [1.0, None, 2.0] + [None] * 9}
     got = krw_months(cats, {}, {"sal"}, rate)
-    assert got[0] == 1.0 * 1000 * 1000
+    assert got[0] == 1.0 * 1000
     assert got[1] == 0.0  # 미등록 달은 더할 값이 없어 0
-    assert got[2] == 2.0 * 1000 * 1000
+    assert got[2] == 2.0 * 1000
 
 
 def test_n_helper_keeps_zero_distinct_from_none():

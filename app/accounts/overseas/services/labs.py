@@ -1,8 +1,6 @@
 """해외연구소 기준정보(연구소 목록·시점 이력) 조회.
 
-왜 여기로 옮겼나: 원래 overseas.py의 `_labs` · `_lab_views` · `LabView` · `_overseas_account`였고
-증감분석·집계 엔드포인트가 그 밑줄 이름을 직접 import해서 썼다(PLAN.md P1-1). 연구소 목록과
-"그 버전 시점의 통화"는 네 화면이 똑같이 읽어야 하는 공용 기준정보라 services로 올렸다.
+연구소 목록과 "그 버전 시점의 통화"는 네 화면이 똑같이 읽어야 하는 공용 기준정보다.
 
 ACCOUNT_KEY도 같이 둔다 — cost_entries 같은 공용 테이블의 계정 구분 값이고, 네 엔드포인트가
 전부 쓰는 상수다.
@@ -109,6 +107,19 @@ def lab_views(db: Session, as_of: str | None = None) -> list[LabView]:
             )
         )
     return out
+
+
+def is_summable(lab: LabView) -> bool:
+    """합산에 넣는 연구소인가. 합계 시트(part_code="TOTAL")와 원화 기타(_ETC)는 다른 행을 더해
+    만든 값이라 뺀다 — 넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다
+    (tests/overseas/test_total_slot.py). 집계표(versions.active_labs)와 파생 행의 재료
+    (extra_rows.months_by_category)가 같은 판정을 써야 두 숫자가 어긋나지 않는다."""
+    return bool(lab.is_active) and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+
+
+def summable_pks(db: Session, as_of: str | None = None) -> list[str]:
+    """그 시점에 합산에 넣을 연구소 pk 목록(is_summable 기준)."""
+    return sorted(lab.pk for lab in lab_views(db, as_of) if is_summable(lab))
 
 
 # ---------- 기준정보 변경(연구소 편집 화면·단건 API)이 쓰는 헬퍼 ----------

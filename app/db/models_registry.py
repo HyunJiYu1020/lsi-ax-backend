@@ -12,6 +12,7 @@ from app.shared.models import common as _common  # noqa: F401
 from app.shared.models import fx as _fx  # noqa: F401
 from app.shared.models import generic as _generic  # noqa: F401
 from app.shared.models import plan as _plan  # noqa: F401
+from app.shared.models import reference as _reference  # noqa: F401
 from app.shared.models import system as _system  # noqa: F401
 from app.shared.models import user as _user  # noqa: F401
 from app.shared.models import version as _version  # noqa: F401

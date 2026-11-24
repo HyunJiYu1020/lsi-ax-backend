@@ -1,12 +1,9 @@
 """인건비 증감을 인원 효과 · 단가 효과로 나눈다 — 화면 core.js의 ovLaborSplit과 같은 식.
 
-왜 서비스로 뺐나 (PLAN.md Phase 6): 이 계산이 `GET /overseas/labor-split` 엔드포인트 본문에만
-있어서, 증감분석 화면이 17기간 분해를 받으려면 17번 호출해야 했다 — 그게 화면이 브라우저에서
-직접 계산하고 있던 이유다. 준비(`prepare`)와 기간별 계산(`split_for`)을 갈라 두면 엔드포인트는
-한 기간만, 증감분석 표는 준비를 한 번만 하고 17기간을 돌 수 있다.
+준비(`prepare`)와 기간별 계산(`split_for`)이 갈라져 있다 — `GET /overseas/labor-split`은 한
+기간만 쓰고, 증감분석 표는 준비를 한 번만 하고 17기간을 돈다.
 
-**두 경로가 같은 함수를 쓰는 게 핵심이다.** 식이 두 벌이 되면 화면과 챗봇이 다른 답을 하고,
-그건 PLAN P1-3에서 이미 겪은 사고다.
+**두 경로가 같은 함수를 쓰는 게 핵심이다.** 식이 두 벌이 되면 화면과 챗봇이 다른 답을 한다.
 
 식:
   환차外 = 당월인건비@비교환율 − 비교인건비@비교환율
@@ -21,6 +18,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.accounts.overseas.cost_groups import resolve_leaves
 from app.accounts.overseas.schemas import LaborSplitLab, LaborSplitResult
 from app.accounts.overseas.services.entries import current_basis_month
 from app.accounts.overseas.services.fxcalc import rate_arrays
@@ -33,8 +31,11 @@ from app.accounts.overseas.services.versions import (
 )
 from app.shared.core.values import n
 
-# 인건비 리프. GROUP_CALC의 labor와 같아야 한다 — 다르면 화면 인건비 행과 분해 합이 안 맞는다.
-LABOR_LEAVES = ("sal", "bonus", "welf")
+# 인건비 리프 — 공통코드(OVERSEAS_CATEGORY)에서 labor의 하위를 그때그때 펼친다.
+# 손으로 적어 두면 공통코드에 인건비 하위 계정(예: 퇴직급여)이 하나 늘었을 때 집계의 인건비 행은
+# 그걸 더하는데 이 분해(환차/환차外)는 빼놓아서, 두 숫자가 경고도 없이 어긋난다.
+def labor_leaves() -> list[str]:
+    return resolve_leaves("labor")
 
 BASE_LABELS = {"prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}
 
@@ -65,11 +66,10 @@ def prepare(
     kind: str = "forecast",
     plan_no: str | None = None,
 ) -> LaborSplitInputs:
-    """기간과 무관한 준비물. basis_month · kind가 "어느 버전을 보고 있는가"다(2026-11-17).
+    """기간과 무관한 준비물. basis_month · kind가 "어느 버전을 보고 있는가"다.
 
-    전에는 build_state를 불러서 기준월을 "DB에 들어 있는 가장 최근 속보"로 삼았다 — 그래서 과거
-    버전을 띄워도 분해만 최신 속보 기준으로 계산됐다. 버전 해석은 집계·증감과 같은 층
-    (services/versions.py)을 쓴다. 안 주면 종전과 같이 최신 속보로 떨어진다(기존 호출 호환).
+    버전 해석은 집계·증감과 같은 층(services/versions.py)을 쓴다 — 안 주면 최신 속보로 떨어진다.
+    여기서 따로 고르면 과거 버전을 띄웠을 때 분해만 최신 속보 기준이 된다.
     """
     if base_version not in BASE_LABELS:
         raise HTTPException(400, "base_version은 prev(전실행) | prior(전년 실적) | plan(경영계획)만 쓸 수 있다.")
@@ -136,6 +136,7 @@ def split_for(db: Session, inp: LaborSplitInputs, period: str, ix: tuple[int, ..
     """한 기간의 분해. 환율은 기간에 드는 달만 보므로 기간마다 다시 읽는다."""
     rate_cur = rate_arrays(db, *inp.cur_spec, inp.local_curs, ix)
     rate_base = rate_arrays(db, *inp.base_spec, inp.local_curs, ix)
+    leaves = labor_leaves()
 
     rows: list[LaborSplitLab] = []
     tot = {"hc_cur": 0.0, "hc_base": 0.0, "amt_cur": 0.0, "amt_base": 0.0, "unsplit": 0.0}
@@ -145,17 +146,17 @@ def split_for(db: Session, inp: LaborSplitInputs, period: str, ix: tuple[int, ..
         lc = lab.currency if lab.currency and lab.currency != "USD" else None
         amt_cur = amt_base = hc_cur = hc_base = 0.0
         for j in ix:
-            k_cur = sum(n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in LABOR_LEAVES)
-            k_base = sum(n(cats_base.get(leaf, [None] * 12)[j]) for leaf in LABOR_LEAVES)
+            k_cur = sum(n(cats_cur.get(leaf, [None] * 12)[j]) for leaf in leaves)
+            k_base = sum(n(cats_base.get(leaf, [None] * 12)[j]) for leaf in leaves)
             rb = rate_base["USD"][j]
             lrc = rate_cur.get(lc, [0.0] * 12)[j] if lc else 0.0
             lrb = rate_base.get(lc, [0.0] * 12)[j] if lc else 0.0
             # 비교 버전 환율로 환산해야 환율이 움직인 몫이 빠진다(= 환차外 기준).
             if lc and lrc > 0 and lrb > 0:
-                amt_cur += k_cur * lrc / lrb * rb * 1000
+                amt_cur += k_cur * lrc / lrb * rb
             else:
-                amt_cur += k_cur * rb * 1000
-            amt_base += k_base * rb * 1000
+                amt_cur += k_cur * rb
+            amt_base += k_base * rb
             hc_cur += n(cats_cur.get("hc", [None] * 12)[j]) / len(ix)
             hc_base += n(cats_base.get("hc", [None] * 12)[j]) / len(ix)
         splittable = hc_cur > 0 and hc_base > 0

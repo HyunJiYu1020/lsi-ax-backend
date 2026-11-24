@@ -10,7 +10,20 @@ from app.accounts.overseas.endpoints import aggregate as overseas_aggregate
 from app.accounts.overseas.endpoints import close as overseas_close
 from app.accounts.overseas.endpoints import collect as overseas_collect
 from app.accounts.overseas.endpoints import variance as overseas_variance
-from app.shared.endpoints import account, chat, cost, fx, health, plan, system, version
+from app.shared.endpoints import (
+    account,
+    chat,
+    cost,
+    fx,
+    guideline,
+    health,
+    plan,
+    reason,
+    reference,
+    sheet,
+    system,
+    version,
+)
 
 api_router = APIRouter()
 
@@ -20,8 +33,12 @@ api_router.include_router(account.router, tags=["accounts"])
 api_router.include_router(fx.router, tags=["fx"])
 api_router.include_router(plan.router, tags=["management-plan"])
 api_router.include_router(version.router, tags=["version"])
+api_router.include_router(reference.router, tags=["reference"])
+api_router.include_router(sheet.router, tags=["sheet-rows"])
+api_router.include_router(reason.router, tags=["variance-reasons"])
 api_router.include_router(cost.router, tags=["cost-entries"])
 api_router.include_router(system.router, tags=["system"])
+api_router.include_router(guideline.router, tags=["guidelines"])
 api_router.include_router(chat.router, tags=["chat"])
 
 # ---------- 해외연구소 계정 ----------

@@ -16,13 +16,24 @@ from typing import Any
 # Anthropic 주석 처리로 안 쓴다 — 되살릴 때 같이 푼다.
 # import anthropic
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from app.db.session import get_db
 from app.shared.core.chat_prompts import build_system_prompt
 from app.shared.core.config import settings
+from app.shared.core.guidelines import (
+    APPLIES_TO,
+    SCOPE_LABELS,
+    duplicate_hint,
+    guidelines_text,
+    similar_guidelines,
+)
+from app.accounts.overseas.cost_groups import GROUP_CALC, resolve_leaves
+from app.accounts.overseas.services.aggregate import NO_ANCHOR
 from app.mcp_server import ANCHOR_KEYS, ANCHOR_REF_ONLY, CATEGORY_LABELS, mcp
 
 router = APIRouter()
@@ -30,16 +41,24 @@ router = APIRouter()
 READ_PREFIXES = ("list_", "get_")
 # list_*/get_* 패턴을 안 따르지만 부작용이 없는(데이터를 바꾸지 않는) 도구 — calculate는 순수 산술이라
 # list_cost_entries 조회 결과를 넘겨서 바로 계산해야 하는데, 승인 팝업이 뜨면 그 흐름이 끊긴다.
-# set_display_unit·set_labor_split은 이름이 set_*이지만 저장된 데이터를 전혀 건드리지 않는다 —
-# 화면의 표시 단위(K$ vs $)나 인건비 분해 줄의 펼침 여부만 바꾸는 도구라 승인 팝업 없이 바로
-# 실행한다(보는 방식을 바꾸는 데 매번 승인을 받으면, 숫자를 눈으로 비교하려는 흐름이 그때마다 끊긴다).
+# set_display_unit은 이름이 set_*이지만 저장된 데이터를 전혀 건드리지 않는다 — 화면의 표시
+# 단위(K$ vs $)만 바꾸는 도구라 승인 팝업 없이 바로 실행한다(보는 방식을 바꾸는 데 매번 승인을
+# 받으면, 숫자를 눈으로 비교하려는 흐름이 그때마다 끊긴다).
 # translate_reasons도 이름이 list_/get_이 아니지만 승인 없이 바로 실행한다 — 연구소가 보낸 사유를
 # 한국어로 읽어주는 것뿐이고, 편성 값이나 사유 원문을 바꾸지 않는다(번역문을 캐시 테이블에 쌓을
 # 뿐이다). "이 사유 뭐라고 쓴 거야"에 매번 승인 팝업이 뜨면 읽는 흐름이 끊긴다.
 # match_row_labels도 저장하지 않는다 — 비슷한 이름 후보만 돌려준다(합치는 건 사용자가 답한 뒤
 # upsert_row_alias, 그건 승인 대상이다). 후보를 보려는 것뿐인데 승인을 받으면 질문이 두 번이 된다.
 SAFE_NON_PREFIXED_TOOLS = {
-    "calculate", "combine_series", "set_display_unit", "set_labor_split", "translate_reasons", "match_row_labels",
+    "calculate", "combine_series", "set_display_unit", "translate_reasons", "match_row_labels",
+    # set_variance_filter도 저장된 값을 안 건드린다 — 증감분석 표에서 작은 변동을 **숨길 뿐**이다.
+    # "10% 넘는 것만 보여줘"에 승인 팝업이 뜨면 숫자를 훑어보려는 흐름이 그때마다 끊긴다.
+    "set_variance_filter",
+    # pin_fx_currency도 화면에 무엇을 보여줄지만 고른다 — 환율 값·환산 결과를 건드리지 않는다.
+    "pin_fx_currency",
+    # set_row_visibility도 보기에서 행을 뺄 뿐이다 — 저장된 금액도 합계도 그대로고, 보는 사람
+    # 화면에만 남는다. "복리후생 숨겨줘"에 승인 팝업이 뜨면 표를 정리해 보려는 흐름이 끊긴다.
+    "set_row_visibility",
     # scan_anomalies도 저장하지 않는다 — 기준에 걸어 본 결과만 돌려준다(기준을 바꾸는 건
     # set_anomaly_rule이고 그건 승인 대상이다). 결과를 보려는 것뿐인데 승인을 받으면 흐름이 끊긴다.
     "scan_anomalies",
@@ -95,7 +114,15 @@ class ProviderInfo(BaseModel):
     gemini_available: bool
 
 
-def _is_write_tool(name: str) -> bool:
+# dry_run=true로 부르면 저장하지 않고 "이렇게 바뀐다"만 돌려주는 도구들. 미리보기를 보려는 것뿐인데
+# 승인 팝업이 뜨면 사용자가 두 번 승인하게 된다(미리보기 승인 → 실제 실행 승인). 미리보기는 바로
+# 실행하고, dry_run을 끈 실제 실행만 승인을 받는다.
+DRY_RUN_TOOLS = {"merge_rows"}
+
+
+def _is_write_tool(name: str, args: dict[str, Any] | None = None) -> bool:
+    if name in DRY_RUN_TOOLS and (args or {}).get("dry_run"):
+        return False
     return not name.startswith(READ_PREFIXES) and name not in SAFE_NON_PREFIXED_TOOLS
 
 
@@ -215,16 +242,84 @@ def _anchor_missing_hint(name: str, args: dict[str, Any]) -> str | None:
         "합계에도 잡혀야 하는 금액이면 실제 비용 분류(전산비 등)를 골라야 한다.\n"
         "사용자가 '아무 데나'·'맨 끝에'라고 답하면 그때 anchor_key='misc'(기타경비)로 넣고, "
         "집계에서 기타경비로 잡힌다는 점을 같이 알려라. 어느 중분류에도 넣지 않고 개발비 바로 "
-        "아래에 두길 원하면 anchor_key='A'(개발비)다 — 그러면 총계에는 들어가고 중분류에는 안 든다."
+        "아래에 두길 원하면 anchor_key='A'(개발비)다 — 그러면 총계에는 들어가고 중분류에는 안 든다.\n"
+        f"사용자가 '어느 합계에도 넣지 마라'·'참고로만 둬라'라고 하면 anchor_key='{NO_ANCHOR}'다 — "
+        "표에는 '참고'로 그려지고 개발비 합계에도, 어느 소계에도 안 들어간다. 금액이 합계에서 빠지는 "
+        "자리라 사용자가 그렇게 말했을 때만 쓰고, 넣을 때 '이 행은 어느 합계에도 안 잡힌다'고 알려라."
     )
 
 
-def _write_block_hint(name: str, args: dict[str, Any], context: dict[str, Any]) -> str | None:
+def _guideline_dup_hint(name: str, args: dict[str, Any], db: Session) -> str | None:
+    """뜻이 겹치는 지침이 이미 있으면 **승인 카드를 띄우기 전에** 되묻게 한다.
+
+    PUT /guidelines도 같은 검사를 하지만(409) 그건 승인 **뒤에** 걸린다 — 사용자가 승인 버튼을
+    누르고 나서 "실은 비슷한 게 있는데요"를 듣고, 답한 뒤 또 승인하게 된다. 두 번 승인하게 만드는
+    건 이 파일이 DRY_RUN_TOOLS에서 이미 피하려던 모양이다. 그래서 묻는 건 여기서 먼저 하고,
+    엔드포인트의 409는 다른 경로(MCP 직접 호출 등)를 지키는 backstop으로 남긴다.
+
+    confirm_new_topic이 이미 켜져 있으면 통과시킨다 — 사용자가 "둘 다 필요하다"고 답한 뒤 모델이
+    다시 부른 호출이라, 여기서 또 막으면 영원히 저장되지 않는다."""
+    if name != "upsert_guideline" or args.get("confirm_new_topic"):
+        return None
+    topic, text = str(args.get("topic") or "").strip(), str(args.get("text") or "").strip()
+    if not topic or not text:
+        return None  # 빈 입력은 엔드포인트가 400으로 거른다 — 여기서 중복을 볼 값이 없다
+    account_key, applies_to = str(args.get("account_key") or ""), str(args.get("applies_to") or "all")
+    if applies_to not in APPLIES_TO:
+        return None
+    dups = similar_guidelines(db, account_key, applies_to, topic, text)
+    if not dups:
+        return None
+    # 같은 주제로 들어온 건 교체라 중복이 아니다 — similar_guidelines가 이미 빼고 준다.
+    return duplicate_hint(dups, topic)
+
+
+# 금액을 저장하는 도구 — 이 도구들의 category_key는 **저장되는 리프 계정**이어야 한다.
+_AMOUNT_TOOLS = {"upsert_cost_entry"}
+
+
+def _group_category_hint(name: str, args: dict[str, Any]) -> str | None:
+    """계산되는 상위 분류(인건비·개발비 등)에 금액을 꽂으려 할 때 막는다.
+
+    왜 막나: `labor`(인건비)는 급여+상여+복리후생을 더해 만드는 줄이다(GROUP_CALC). 거기에 값을
+    저장하면 화면·집계는 여전히 리프 합으로 그리니까 **입력한 숫자가 어디에도 안 보이거나**, 보이는
+    자리에서는 리프 합과 겹쳐 두 번 세어진다. 금액이 틀리는 게 아니라 **자리가 틀리는** 형태라
+    숫자만 봐서는 못 알아챈다 — `_anchor_missing_hint`가 막는 것과 같은 종류의 사고다.
+
+    프롬프트에 적어 두는 것으로 안 되는 이유: 같은 말("인건비 3월에 2000 넣어줘")에 모델이 어떤
+    때는 되묻고 어떤 때는 `category_key='labor'`로 저장을 시도한다(tests/eval에서 재현). 사람이
+    자리를 못 보는 경로에서 '가끔 맞는 것'은 막는 것과 다르다 — 그래서 코드에서 못을 박는다.
+
+    row_match.py가 같은 판단을 이미 하고 있다: 행 이름 후보에서 집계로 계산되는 그룹 행을 빼면서
+    "거기엔 업로드 값을 꽂을 수 없다"고 적혀 있다.
+    """
+    if name not in _AMOUNT_TOOLS:
+        return None
+    key = str(args.get("category_key") or "").strip()
+    if key not in GROUP_CALC:
+        return None
+    leaves = " · ".join(f"{k}({CATEGORY_LABELS.get(k, k)})" for k in resolve_leaves(key))
+    return (
+        f"도구 실행 실패: '{CATEGORY_LABELS.get(key, key)}'({key})는 하위 항목을 더해 만드는 "
+        f"분류라서 금액을 직접 저장할 수 없다. 재시도하지 말고 사용자에게 어느 항목에 넣을지 "
+        f"물어라 — 하위 항목: {leaves}. 사용자가 말한 금액을 그 항목에 넣으면 분류 금액은 "
+        "자동으로 따라 올라간다는 점도 같이 알려라."
+    )
+
+
+def _write_block_hint(
+    name: str, args: dict[str, Any], context: dict[str, Any], db: Session
+) -> str | None:
     """쓰기 도구를 실행하기 전에 서버가 막아야 하는 것 전부. 하나라도 걸리면 그 사유를 돌려준다.
 
     공급자별 턴 루프가 각자 이 검사를 호출하므로 입구를 하나로 모은다 — 검사를 하나 더 만들 때
     루프마다 끼워 넣게 두면, 한 공급자만 고치고 다른 쪽을 빼먹는다."""
-    return _derived_row_block_hint(name, args, context) or _anchor_missing_hint(name, args)
+    return (
+        _derived_row_block_hint(name, args, context)
+        or _anchor_missing_hint(name, args)
+        or _group_category_hint(name, args)
+        or _guideline_dup_hint(name, args, db)
+    )
 
 
 # 집계의 파생 행/열이 붙는 범위 — 연구소 하나가 아니라 "전체 연구소 합산"이다
@@ -266,20 +361,22 @@ def _is_empty_list_result(text: str) -> bool:
         return False
 
 
-# 화면이 $ 단위로 보고 있을 때(context["usd_unit"] == "dollar") 금액을 받는 쓰기 도구들 — 그 금액은
-# 사용자가 화면에서 읽은 $ 값이라 1000으로 나눠 K$로 바꿔 저장해야 한다. 어느 인자가 금액인지만
+# 금액을 받는 쓰기 도구들. 저장 단위는 $이고 화면 기본 표시는 K$라, 사용자가 K$ 화면을 보며 말한
+# 숫자는 1000배 해서 저장해야 한다($ 모드로 보고 있으면 그대로 저장). 어느 인자가 금액인지만
 # 적어둔다(upsert_cost_extra의 value는 제외 — 추가 열은 사용자가 이름을 직접 붙이는 자유 칸이라
-# 금액이 아닐 수도 있고, 화면 입력칸도 K$ 환산 없이 그대로 쓴다).
+# 금액이 아닐 수도 있고, 화면 입력칸도 환산 없이 그대로 쓴다).
 _USD_AMOUNT_ARGS = {"upsert_cost_entry": ("amount",), "upsert_extra_row": ("v",)}
 
 
-def _to_kdollar(name: str, args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    """$ 단위로 보고 있는 화면에서 들어온 금액을 K$로 환산한다. 이 환산을 모델에게 맡기지 않고
-    코드에서 하는 이유: 모델이 나눗셈을 빼먹으면 1000배 큰 금액이 그대로 저장되고(되돌리려면 원래
-    값을 알아야 한다), 가벼운 모델일수록 '말한 숫자를 그대로 넘기기'보다 '나눠서 넘기기'를 더 자주
-    틀린다. 그래서 시스템 프롬프트는 '사용자가 말한 숫자를 그대로 넣어라'로 고정하고(규칙 9-1),
-    실제 환산은 여기서만 한다."""
-    if context.get("usd_unit") != "dollar":
+def _to_stored_dollar(name: str, args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """사용자가 화면에서 읽은 단위로 말한 금액을 저장 단위($)로 환산한다. 화면 기본은 K$라 ×1000이고,
+    "$로 보여줘" 상태($ 모드)면 화면 숫자가 이미 $라서 그대로 둔다.
+
+    이 환산을 모델에게 맡기지 않고 코드에서 하는 이유: 모델이 곱셈을 빼먹으면 1000배 작은 금액이
+    저장되고(되돌리려면 원래 값을 알아야 한다), 가벼운 모델일수록 '말한 숫자를 그대로 넘기기'보다
+    '환산해서 넘기기'를 더 자주 틀린다. 그래서 시스템 프롬프트는 '사용자가 말한 숫자를 그대로
+    넣어라'로 고정하고(규칙 9-1), 실제 환산은 여기서만 한다."""
+    if context.get("usd_unit") == "dollar":
         return args
     keys = _USD_AMOUNT_ARGS.get(name)
     if not keys:
@@ -288,14 +385,14 @@ def _to_kdollar(name: str, args: dict[str, Any], context: dict[str, Any]) -> dic
     for k in keys:
         v = out.get(k)
         if isinstance(v, list):
-            out[k] = [(x / 1000 if isinstance(x, (int, float)) else x) for x in v]
+            out[k] = [(x * 1000 if isinstance(x, (int, float)) else x) for x in v]
         elif isinstance(v, (int, float)):
-            out[k] = v / 1000
+            out[k] = v * 1000
     return out
 
 
 async def _tool_result_text(name: str, args: dict[str, Any], context: dict[str, Any]) -> tuple[str, bool]:
-    args = _force_all_scope(name, _to_kdollar(name, _inject_step(name, args, context), context))
+    args = _force_all_scope(name, _to_stored_dollar(name, _inject_step(name, args, context), context))
     try:
         result = await mcp.call_tool(name, args)
     except Exception as exc:
@@ -320,9 +417,13 @@ async def _tool_result_text(name: str, args: dict[str, Any], context: dict[str, 
     return text, bool(result.is_error)
 
 
-# list_memo_cols 등 화면 코드(cur/prev/prior/plan)와 list_cost_entries 등 API 코드(forecast/actual)를
+# list_uploads 등 화면 코드(cur/prev/prior/plan)와 list_cost_entries 등 API 코드(forecast/actual)를
 # 섞어 쓰는 쓰기 도구들이 있어, 사람이 보는 설명 문장에서는 둘 다 알아듣게 라벨을 붙인다.
 _VERSION_LABELS = {"forecast": "속보", "actual": "실적", "cur": "당월 속보", "prev": "전실행", "prior": "전년 실적", "plan": "경영계획"}
+_MATCH_FIELDS = {
+    "vendor": "거래처", "text": "적요", "cost_center": "코스트센터",
+    "project": "과제코드", "assignment": "지정(Assignment)",
+}
 
 
 def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
@@ -369,12 +470,6 @@ def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
     if name == "upsert_note":
         category = CATEGORY_LABELS.get(g("category_key"), g("category_key"))
         return f"{g('lab_scope')}의 {category} 증감분석 비고를 저장합니다: \"{g('note_text')}\""
-    if name == "upsert_memo_col":
-        return f"{g('lab_pk')} 연구소의 {v} 기준에 메모 열 '{g('label')}'을 추가/수정합니다."
-    if name == "delete_memo_col":
-        return f"{g('lab_pk')} 연구소의 {v} 기준 메모 열을 삭제합니다."
-    if name == "upsert_memo":
-        return f"{g('lab_pk')} 연구소의 {v} 기준 메모를 저장합니다: \"{g('text')}\""
     if name == "upsert_sheet_row":
         return f"{g('lab_pk')} 연구소의 {v} 기준 시트 행을 추가/수정합니다."
     if name == "delete_sheet_row":
@@ -393,6 +488,46 @@ def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
         kind = _VERSION_LABELS.get(g("kind"), g("kind"))
         what = "완료(확정)로" if g("status") == "done" else "작성중으로(완료 취소)"
         return f"{g('year')}년 {g('month')}월 {kind} 버전을 {what} 바꿉니다."
+    if name == "upsert_guideline":
+        # 지침은 범위가 보이지 않으면 뭘 승인하는지 모른다 — "금액은 억원"이 해외연구소에만 걸리는지
+        # 전 계정에 걸리는지, 대화 답변만인지 사유 초안까지인지가 승인 전에 보여야 한다.
+        where = "전 계정" if not g("account_key") else f"{g('account_key')} 계정"
+        scope = SCOPE_LABELS.get(g("applies_to"), g("applies_to"))
+        return f"업무 지침을 등록합니다 — {where} · {scope}, [{g('topic')}] \"{g('text')}\""
+    if name == "delete_guideline":
+        where = "전 계정" if not g("account_key") else f"{g('account_key')} 계정"
+        scope = SCOPE_LABELS.get(g("applies_to"), g("applies_to"))
+        return f"업무 지침 [{g('topic')}]을 삭제합니다 — {where} · {scope}. 다음 요청부터 적용되지 않습니다."
+    if name == "merge_rows":
+        # 되돌릴 수 없는 작업이라 승인 카드에 "무엇이 사라지는지"가 반드시 보여야 한다.
+        where = g("lab_pk") or "전체 연구소"
+        target = (
+            CATEGORY_LABELS.get(g("target_key"), g("target_key"))
+            if g("target_kind") == "category"
+            else g("target_label")
+        )
+        names = " · ".join(f"'{x}'" for x in (g("source_labels") or []))
+        if g("dry_run"):
+            return f"{where}의 {v} 기준({g('yyyymm')}) {names} 행이 '{target}'에 합쳐지면 어떻게 되는지 미리 봅니다(저장하지 않습니다)."
+        return (
+            f"{where}의 {v} 기준({g('yyyymm')}) {names} 행을 '{target}'에 합쳐 넣고 원본 행을 "
+            "삭제합니다 — 되돌릴 수 없습니다. 확정 상태면 작성 중으로 되돌립니다."
+        )
+    if name == "upsert_match_rule":
+        # 규칙은 다음 달에도 자동 적용되니 "무엇을 어떤 방식으로 보는지"가 승인 전에 보여야 한다 —
+        # 'CP-'를 starts_with로 걸었는지 equals로 걸었는지에 따라 다음 달 결과가 완전히 달라진다.
+        ops = {"equals": "같음", "contains": "포함", "starts_with": "~로 시작"}
+        how = ops.get(g("match_op") or "", "포함" if g("match_field") == "text" else "같음")
+        where = "제외(해외연구소 실적 아님)" if g("excluded") else g("scope_key")
+        when = (
+            f" {g('apply_basis_year')}년 {g('apply_basis_month')}월 AI 추천에 바로 적용하고,"
+            if g("apply_basis_year")
+            else " 다음 매칭부터 적용하고,"
+        )
+        return (
+            f"전표 매칭 규칙을 등록합니다 — {_MATCH_FIELDS.get(g('match_field'), g('match_field'))}"
+            f"가 '{g('match_value')}'와 {how}이면 {where}로 붙입니다.{when} 담당자가 직접 고친 전표는 그대로 둡니다."
+        )
     if name == "delete_sheet_rows_all":
         v = _VERSION_LABELS.get(g("version"), g("version"))
         return f"{g('lab_pk')} 연구소의 {v} 기준 '{g('sheet_key')}' 시트 행을 전부 삭제합니다."
@@ -400,7 +535,7 @@ def _default_write_note(name: str, args: dict[str, Any]) -> str | None:
 
 
 def _tool_result_message(provider: str, tool_use_id: str, text: str, is_error: bool) -> dict[str, Any]:
-    # 2026-11-16: Gemini 하나만 쓴다(PLAN.md 질문 6). provider 인자는 남겨 뒀다 —
+    # Gemini 하나만 쓴다. provider 인자는 남겨 뒀다 —
     # 호출부가 전부 넘기고 있고, 공급자를 다시 늘릴 때 분기 자리가 그대로 필요하다.
     # if provider == "ollama":
     #     return {"role": "tool", "tool_call_id": tool_use_id, "content": text}
@@ -427,17 +562,22 @@ def _resolve_provider(provider: str | None) -> str:
 
 
 async def _run_turn(
-    messages: list[dict[str, Any]], context: dict[str, Any], provider: str | None = None, depth: int = 0
+    messages: list[dict[str, Any]],
+    context: dict[str, Any],
+    provider: str | None = None,
+    depth: int = 0,
+    guidelines: str = "",
+    db: Session | None = None,
 ) -> ChatResponse:
     _resolve_provider(provider)   # gemini만 통과한다
     # if resolved == "ollama":
     #     return await _run_turn_ollama(messages, context, depth)
     # return await _run_turn_anthropic(messages, context, depth)
-    return await _run_turn_gemini(messages, context, depth)
+    return await _run_turn_gemini(messages, context, depth, guidelines, db)
 
 
-# ---------- Anthropic · Ollama — 2026-11-16 주석 처리 ----------
-# 챗봇 공급자를 Gemini 하나로 줄였다(PLAN.md 질문 6). 모델과 왕복하는 턴 루프가 공급자마다
+# ---------- Anthropic · Ollama주석 처리 ----------
+# 챗봇 공급자를 Gemini 하나로 줄였다. 모델과 왕복하는 턴 루프가 공급자마다
 # 한 벌씩 있어서, 도구를 하나 추가하면 세 곳을 고쳐야 했다 — 그게 이 파일이 길어진 이유다.
 #
 # 지우지 않고 남겨 두는 이유: Anthropic은 도구 호출이 가장 안정적이고 Ollama는 키 없이 로컬에서
@@ -560,7 +700,7 @@ async def _run_turn(
 #     call_id = call.get("id") or name
 #
 #     if _is_write_tool(name):
-#         block_hint = _write_block_hint(name, args, context)
+#         block_hint = _write_block_hint(name, args, context, db) if db is not None else None
 #         if block_hint is not None:
 #             if depth >= MAX_TURNS:
 #                 return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
@@ -642,14 +782,22 @@ def _messages_to_gemini_contents(messages: list[dict[str, Any]]) -> list[genai_t
     return out
 
 
-async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, Any], depth: int = 0) -> ChatResponse:
+async def _run_turn_gemini(
+    messages: list[dict[str, Any]],
+    context: dict[str, Any],
+    depth: int = 0,
+    guidelines: str = "",
+    # 쓰기 전 검사 중 DB를 봐야 하는 게 있다(지침 중복 확인). 세션을 만들지 않고 받아 쓰는 이유:
+    # 턴 루프가 자기 세션을 열면 요청 트랜잭션 밖에서 읽게 되고, 테스트의 롤백 세션도 안 통한다.
+    db: Session | None = None,
+) -> ChatResponse:
     client = _gemini_client()
     try:
         resp = await client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=_messages_to_gemini_contents(messages),
             config=genai_types.GenerateContentConfig(
-                system_instruction=build_system_prompt(context),
+            system_instruction=build_system_prompt(context, guidelines),
                 tools=[await _gemini_tool()],
                 automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
                 thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
@@ -677,13 +825,13 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
         return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=text)
 
     name, args = fn_call.name, dict(fn_call.args or {})
-    if _is_write_tool(name):
-        block_hint = _write_block_hint(name, args, context)
+    if _is_write_tool(name, args):
+        block_hint = _write_block_hint(name, args, context, db) if db is not None else None
         if block_hint is not None:
             if depth >= MAX_TURNS:
                 return ChatResponse(messages=[ChatMessage(**m) for m in messages], reply=block_hint)
             messages = messages + [_tool_result_message("gemini", name, block_hint, True)]
-            return await _run_turn_gemini(messages, context, depth + 1)
+            return await _run_turn_gemini(messages, context, depth + 1, guidelines, db)
         note = "".join(p.text for p in parts if p.text and not p.thought)
         return ChatResponse(
             messages=[ChatMessage(**m) for m in messages],
@@ -702,7 +850,7 @@ async def _run_turn_gemini(messages: list[dict[str, Any]], context: dict[str, An
 
     result_text, is_error = await _tool_result_text(name, args, context)
     messages = messages + [_tool_result_message("gemini", name, result_text, is_error)]
-    return await _run_turn_gemini(messages, context, depth + 1)
+    return await _run_turn_gemini(messages, context, depth + 1, guidelines, db)
 
 
 # ---------- 엔드포인트 ----------
@@ -720,14 +868,24 @@ async def chat_providers() -> ProviderInfo:
     )
 
 
+def _chat_guidelines(context: dict[str, Any], db: Session) -> str:
+    """지금 화면의 계정에 걸리는 대화용 지침(전 계정 공통 + 그 계정)을 프롬프트 블록으로 읽는다.
+
+    매 요청마다 읽는다 — 담당자가 방금 "금액은 억원으로 써"를 등록했으면 바로 다음 답변부터
+    적용돼야 한다. 캐시하면 "등록했는데 안 따른다"가 되고, 그게 지침 기능 자체를 못 믿게 만든다."""
+    return guidelines_text(db, account_key=context.get("key") or "", applies_to="chat")
+
+
 @router.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest) -> ChatResponse:
+async def chat(body: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     messages = [m.model_dump() for m in body.messages]
-    return await _run_turn(messages, body.context, body.provider)
+    return await _run_turn(
+        messages, body.context, body.provider, guidelines=_chat_guidelines(body.context, db), db=db
+    )
 
 
 @router.post("/chat/confirm", response_model=ChatResponse)
-async def chat_confirm(body: ConfirmRequest) -> ChatResponse:
+async def chat_confirm(body: ConfirmRequest, db: Session = Depends(get_db)) -> ChatResponse:
     provider = _resolve_provider(body.provider)
     messages = [m.model_dump() for m in body.messages]
     if body.approved:
@@ -735,4 +893,8 @@ async def chat_confirm(body: ConfirmRequest) -> ChatResponse:
     else:
         result_text, is_error = "사용자가 이 작업을 취소했습니다.", True
     messages = messages + [_tool_result_message(provider, body.pending.tool_use_id, result_text, is_error)]
-    return await _run_turn(messages, body.context, provider)
+    # 지침을 승인 직후에 다시 읽는다 — 방금 승인한 게 upsert_guideline이면 그 지침이 바로 이
+    # 답변부터 걸려야 한다("등록했습니다"라고 말하면서 그 지침을 안 따르면 안 된다).
+    return await _run_turn(
+        messages, body.context, provider, guidelines=_chat_guidelines(body.context, db), db=db
+    )

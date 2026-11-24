@@ -20,3 +20,11 @@ wheels/
 
 # 업로드 원본 로컬 보관 폴더(S3 미설정 시)
 var/
+
+# node (테스트용 브라우저 도구 — package.json 참고)
+node_modules/
+
+# 손으로 돌려 보던 임시 스크립트 — 커밋하지 않는다
+_look.mjs
+*.tmp.mjs
+*.tmp.js

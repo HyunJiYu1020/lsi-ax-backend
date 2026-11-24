@@ -1,17 +1,13 @@
 """수식 대조 테스트 — 같은 입력에 프런트(core.js)와 백엔드가 같은 숫자를 내는지 본다.
 
-PLAN.md P1-4: 환율 환산 · 인건비 분해 · 집계 트리 수식이 프런트(frontend-html/shared/core.js)와
-백엔드에 **각각** 적혀 있다. 지금까지 유일한 안전장치는 overseas.py:912-915의 "식을 바꿀 때 같이
-고칠 것" 주석뿐이었다. 한 곳만 고치면 화면 숫자 ≠ 챗봇 숫자가 되고, 그건 사용자가 가장 먼저
+환율 환산 · 인건비 분해 · 집계 트리 수식이 프런트(frontend-html/shared/core.js)와 백엔드에
+**각각** 적혀 있다. 한 곳만 고치면 화면 숫자 ≠ 챗봇 숫자가 되고, 그건 사용자가 가장 먼저
 알아차리는 종류의 버그다.
 
-**2026-11-16: React(frontend/src/logic/calc.js) 대조를 걷어냈다.** 쓰는 프런트는
-frontend-html 하나이고 React는 지금 돌리지 않는다 — 안 돌리는 코드와 맞춰 보는 비교는
-깨져도 아무도 안 아프고, 고치려면 멈춰 있는 폴더를 건드려야 한다. React를 다시 꺼내면 그때
-되살리면 된다(지운 테스트는 git 이력에 있다: test_labor_split_matches_between_frontends,
-test_17_column_aggregation_matches_calc_js, test_react_markup_ratio_uses_a_different_base).
+대조 대상은 frontend-html 하나다 — React(frontend/src/logic/calc.js)는 돌리지 않으므로
+맞춰 보지 않는다.
 
-이 테스트는 이중화를 없애지 않는다(그건 Phase 6). 어긋나는 순간 빨개지게만 만든다.
+이 테스트는 이중화를 없애지 않는다 — 어긋나는 순간 빨개지게만 만든다.
 프런트 수식을 파이썬으로 베껴 적지 않고 js_formula_harness.mjs로 **실제 실행**해서 비교한다 —
 베껴 적으면 그게 세 번째 복제본이 되고, 베낀 쪽이 낡으면 테스트가 거짓으로 통과한다.
 """
@@ -26,8 +22,9 @@ import pytest
 from app.accounts.overseas.endpoints.collect import yyyymm, get_labor_split, get_overseas_state
 from app.accounts.overseas.services.labs import lab_views
 from app.accounts.overseas.services.entries import current_basis_month
-from app.accounts.overseas.services.aggregate import group_tree, krw_months, pl_rows, to_17
-from app.accounts.overseas.cost_groups import GROUP_CALC, resolve_leaves
+from app.accounts.overseas.services.aggregate import agg_across, group_tree, krw_months, pl_rows, to_17
+from app.accounts.overseas.cost_groups import AGGREGATE_ROWS, GROUP_CALC, resolve_leaves
+from app.accounts.overseas.services.versions import load_basis, resolve_bases
 from app.accounts.overseas.services.fxcalc import rate_arrays
 
 BASIS_YEAR = 2026
@@ -37,9 +34,9 @@ REPO = Path(__file__).resolve().parents[3]  # tests/overseas/ → backend → S.
 HAS_NODE = shutil.which("node") is not None
 HAS_CORE = (REPO / "frontend-html/shared/core.js").exists()
 
-# 프런트 소스가 없으면 비교할 게 없다. 스킵 조건을 좁게 두는 이유: 예전에는 React가 없으면
-# core.js 대조까지 통째로 스킵해서, React 폴더가 사라진 순간 가드레일 34개가 조용히 꺼지고
-# 테스트는 녹색으로 남았다(실제로 그렇게 됐다). 보호가 꺼진 걸 모르는 게 보호가 없는 것보다 나쁘다.
+# 프런트 소스가 없으면 비교할 게 없다. 스킵 조건은 **이 대조가 쓰는 것**만 본다 — 조건이 넓으면
+# 관계없는 폴더가 사라진 순간 가드레일이 조용히 꺼지고 테스트는 녹색으로 남는다. 보호가 꺼진 걸
+# 모르는 게 보호가 없는 것보다 나쁘다.
 pytestmark = pytest.mark.skipif(
     not HAS_NODE or not HAS_CORE,
     reason="node 또는 프런트 소스(frontend-html/shared/core.js)가 없어 대조할 수 없다",
@@ -65,7 +62,7 @@ def run_js(case: str, inp: dict | None = None, labs: list[dict] | None = None) -
 def z(v: float | None) -> float:
     """미등록(null)을 0으로 본다 — 백엔드는 "안 올라온 칸"을 null로 남기고(빈칸으로 그린다)
     core.js·백엔드는 0으로 채운다. 금액 비교에서는 둘이 같은 뜻이라 여기서 맞춰 준다.
-    이 차이 자체는 test_blank_cell_handling_differs_by_design이 따로 기록한다."""
+    이 표기 차이가 없어진 경위는 test_blank_cell_handling_now_matches_the_backend에 적어 뒀다."""
     return 0.0 if v is None else float(v)
 
 
@@ -165,28 +162,45 @@ def test_group_definitions_cover_the_same_keys():
     assert set(backend) - set(front) == set(), "백엔드에만 있는 집계 행이 생겼다 — core.js도 같이 고칠 것"
 
 
-def test_krw_aggregation_matches_core_js():
-    """ovAgg(mode="krw") = krw_months. 저장값 K$ × 1000 × (원/$)로 원화를 만드는 경로다.
+def test_krw_aggregation_invariants():
+    """원화 환산 집계(agg_across)의 성질. 2026-11-18까지는 core.js ovAgg와 대조했는데, 화면이
+    이 계산을 더 하지 않게 되면서(모두 서버 값) 대조할 상대가 없어졌다 — 그래서 **백엔드 출력의
+    내부 정합성**으로 바꿨다(pl_rows · lab_tables · variance를 지울 때 한 것과 같은 전환).
 
-    연구소 2곳(USD · 현지통화)을 묶어서 집계한다 — pk 하나만 넣으면 "여러 연구소를 더하는 순서"에서
-    나는 차이를 못 잡는다."""
+    지키는 성질 넷:
+      ① 원화 = 저장값($) × (원/$) — 리프를 손으로 더한 값과 같다
+      ② 연구소 묶음 = 각 연구소 따로 낸 값의 합(더하는 순서와 무관)
+      ③ rate를 안 주면 저장 단위($) 그대로다 — 인력(hc)처럼 환율을 곱하면 안 되는 행이 쓴다
+      ④ 전부 미등록인 달은 None이고 0이 아니다 — 하나라도 올라오면 올라온 것만 더한다
+    """
     d = {PK_USD: flat(PD_USD), PK_LOCAL: flat(PD_LOCAL)}
-    keys = ["labor", "hr", "A", "tot", "hc"]
-    js = run_js(
-        "agg_krw", {"d": d, "pks": [PK_USD, PK_LOCAL], "keys": keys, "rate": RATE_KRW}
-    )
 
-    for k in keys:
+    for k in ["labor", "hr", "A", "tot"]:
         tree = group_tree(k)
-        backend = [0.0] * 12
-        for pk in (PK_USD, PK_LOCAL):
-            # 인력(hc)은 금액이 아니라 명수라 환율을 곱하지 않는다 — 프런트 ovAgg도 k==="hc"를 건너뛴다.
-            rate = [1.0] * 12 if k == "hc" else RATE_KRW
-            months = krw_months(d[pk], {}, tree, rate)
-            for j in MONTHS:
-                backend[j] += months[j] if k != "hc" else months[j] / 1000
+        leaves = [x for x in tree if x not in GROUP_CALC]
+        both = agg_across([PK_USD, PK_LOCAL], d, {}, tree, RATE_KRW)
+        one = agg_across([PK_USD], d, {}, tree, RATE_KRW)
+        other = agg_across([PK_LOCAL], d, {}, tree, RATE_KRW)
         for j in MONTHS:
-            assert z(js["core"][k][j]) == pytest.approx(backend[j], rel=1e-9), f"core.js ≠ 백엔드: {k}[{j}]"
+            assert z(both[j]) == pytest.approx(z(one[j]) + z(other[j]), rel=1e-9), f"② {k}[{j}]"
+            hand = sum(z(d[PK_USD].get(leaf, [None] * 12)[j]) for leaf in leaves)
+            # 저장값이 $라 원화는 `값 × 환율`이다.
+            assert z(one[j]) == pytest.approx(hand * RATE_KRW[j], rel=1e-9), f"① {k}[{j}]"
+
+    # ③ rate 없이 부르면 환산하지 않는다(인력 행이 쓰는 경로)
+    hc = group_tree("hc")
+    raw = agg_across([PK_USD], d, {}, hc, None)
+    krw = agg_across([PK_USD], d, {}, hc, RATE_KRW)
+    for j in MONTHS:
+        assert z(krw[j]) == pytest.approx(z(raw[j]) * RATE_KRW[j], rel=1e-9), f"③ [{j}]"
+
+    # ④ 미등록 처리: 아무도 안 올린 달은 None, 한쪽만 올린 달은 그 값만
+    tree = group_tree("labor")
+    leaf = sorted(x for x in tree if x not in GROUP_CALC)[0]
+    blank = {PK_USD: {leaf: [None] * 12}, PK_LOCAL: {leaf: [None] * 11 + [7.0]}}
+    out = agg_across([PK_USD, PK_LOCAL], blank, {}, tree, RATE_KRW)
+    assert out[0] is None, "전부 미등록인 달은 0이 아니라 빈칸이다"
+    assert out[11] == pytest.approx(7.0 * RATE_KRW[11], rel=1e-9)
 
 
 # ---------- ② 인건비 분해 (인원 효과 vs 단가 효과) ----------
@@ -204,7 +218,7 @@ def test_labor_split_matches_backend(db, lab_scope):
     SARC는 USD, SIRC는 현지통화(ILS)라 두 분기를 다 지난다.
 
     입력을 고르는 부분(연구소 필터 · 환율 기준)은 엔드포인트가 하는 일을 테스트에서 다시 적은
-    것이다 — Phase 1에서 services/overseas/로 추출되면 그 함수를 그대로 부르도록 고칠 것.
+    것이다 — services에 같은 입력을 만드는 함수가 생기면 그걸 그대로 부르도록 고칠 것.
     """
     try:
         result = get_labor_split(
@@ -223,9 +237,18 @@ def test_labor_split_matches_backend(db, lab_scope):
     if not pks:
         pytest.skip(f"{lab_scope}: 올라온 데이터가 없다")
 
+    # 비교 기준(전실행)은 **서버와 같은 해석기**로 고른다 — "그 해 최신 실적" 같은 다른 규칙을
+    # 쓰면 실적 버전이 둘 이상일 때 서버가 쓰는 달(버전 순서상 직전)과 달라지고, 수식이 같아도
+    # 값이 어긋난다. 그러면 이 대조가 "수식 차이"가 아니라 "기준 차이"를 잡는다.
+    base = next(b for b in resolve_bases(db, BASIS_YEAR, basis_month, "forecast", None).bases
+                if b.key == "prev")
+    if not base.has_data:
+        pytest.skip("전실행 데이터가 없다")
+    base_d = load_basis(db, (base.year, base.month, base.kind, base.plan_no), set(pks))
+
     local = {labs[pk].currency for pk in pks if labs[pk].currency and labs[pk].currency != "USD"}
     rate_cur = rate_arrays(db, BASIS_YEAR, basis_month, "forecast", local, tuple(MONTHS))
-    rate_base = rate_arrays(db, BASIS_YEAR, snap.thru_month, "actual", local, tuple(MONTHS))
+    rate_base = rate_arrays(db, base.year, base.month, base.kind, local, tuple(MONTHS))
 
     def rates(arr: dict[str, list[float]]) -> dict[str, list[float]]:
         # core.js는 현지환율을 소문자 통화 키("ils")로 찾는다(ovLcOf). CP도 같은 원/$ 배열을 쓴다.
@@ -235,7 +258,7 @@ def test_labor_split_matches_backend(db, lab_scope):
         "pks": pks,
         "ix": list(MONTHS),
         "cur": {"d": {pk: state.V["cur"].d.get(pk, {}) for pk in pks}, "rate": rates(rate_cur)},
-        "base": {"d": {pk: snap.d.get(pk, {}) for pk in pks}, "rate": rates(rate_base)},
+        "base": {"d": {pk: base_d.get(pk, {}) for pk in pks}, "rate": rates(rate_base)},
     }
     js = run_js("labor_split", inp)
 
@@ -314,23 +337,22 @@ def test_lab_currency_tables_agree(db):
     assert front["TDC"] == db_cur["TDC"] == "USD"
 
 
-def test_blank_cell_handling_differs_by_design():
-    """미등록 칸(빈칸) 처리가 프런트와 백엔드에서 다르다는 사실을 고정해 둔다.
+def test_blank_cell_handling_now_matches_the_backend():
+    """미등록 칸(빈칸) 처리가 두 구현에서 같아졌다 — 2026-11에 프런트를 백엔드 규칙으로 맞췄다.
 
-    core.js는 "안 올라온 칸"을 num()으로 0으로 바꿔 읽고, 백엔드는 None으로 남긴다(공통 RULE:
-    빈칸 처리 — 0으로 보고된 것과 구분해야 한다). 금액 합계는 어느 쪽이든 같지만, "하위가 전부
-    미등록인 소계"에서만 0 vs 빈칸으로 갈린다.
+    전에는 core.js가 "안 올라온 칸"을 num()으로 0으로 바꿔 읽어서, "하위가 전부 미등록인 소계"가
+    프런트에서는 0, 백엔드에서는 빈칸이었다. 업로드 양식에서 연구소가 **0으로 보고한 달**과
+    **아직 안 낸 달**을 구분하기로 하면서(ovParse가 빈칸을 null로 읽고 서버도 그 달을 저장하지
+    않는다) 화면 표도 0은 "0", 미등록은 "–"로 그려야 해서 프런트 계산이 null을 들고 가게 됐다.
 
-    이 테스트는 그 차이를 없애라는 뜻이 아니라, 위의 금액 대조가 z()로 null을 0으로 맞추고 있는
-    근거를 남기는 것이다 — 집계 ① 탭처럼 백엔드가 계산자가 된 화면은 빈칸이 그대로 빈칸으로
-    내려오고, 그래서 "안 올라온 달"과 "0원으로 보고된 달"이 화면에서 구분된다."""
+    금액은 양쪽 모두 "있는 값만 더한다"라 달라지지 않는다 — 달라지는 건 전부 미등록인 칸의 표기뿐이다.
+    (위 금액 대조가 z()로 null을 0으로 맞추는 건 그대로 둔다 — 비교에서는 둘이 같은 뜻이다.)"""
     # 인건비 리프(sal·bonus·welf)를 하나도 안 보낸 입력 → labor는 "전부 미등록"인 소계가 된다.
     js = run_js("part_el", {"pd": {"misc": [5] * 12}, "keys": ["labor", "misc"]})
 
-    assert js["core"]["labor"] == [0] * 12, "core.js는 전부 미등록인 소계를 0으로 채운다"
+    assert js["core"]["labor"] == [None] * 12, "프런트가 전부 미등록인 소계를 0으로 채웠다"
     assert js["core"]["misc"] == [5] * 12, "값이 있는 칸은 그대로다"
-    # 백엔드는 같은 상황에서 빈칸을 유지한다 — 이게 두 구현의 유일한 설계 차이다.
-    assert to_17([None] * 12, "sum") == [None] * 17, "백엔드는 전부 미등록이면 빈칸을 유지한다"
+    assert to_17([None] * 12, "sum") == [None] * 17, "백엔드도 전부 미등록이면 빈칸을 유지한다"
 
 
 # ---------- ⑤ 17열 집계 (월 12 + 분기 4 + 연간) ----------
@@ -379,7 +401,6 @@ def test_17_column_core_js_fills_blanks_with_zero(how, case):
     이 차이는 결함이 아니라 설계 차이다(core.js는 num()으로 null을 0으로 바꿔 읽는다,
     test_blank_cell_handling_differs_by_design 참조). 여기서 고정하는 건 **값이 있는 칸은
     두 구현이 같다**는 것과, 차이가 "미등록을 0으로 본다"는 그 한 가지뿐이라는 점이다.
-    Phase 6에서 백엔드가 유일한 계산자가 되면 이 차이도 사라진다.
     """
     months = _MONTHS_CASES[case]
     js = run_js("to17", {"months": months, "how": how})
@@ -398,34 +419,46 @@ def test_17_column_core_js_fills_blanks_with_zero(how, case):
 
 
 @pytest.mark.parametrize("mode", ["usd", "krw"])
-def test_pl_rows_matches_front(mode):
-    """pl_rows(백엔드) = ovPLRows(core.js). 집계 화면 ① 전체 계정 표 전체를 행·칸 단위로 대조한다.
+def test_pl_rows_is_45_rows_and_folds_periods(mode):
+    """집계 ① 전체 계정 표 — 45행이고, 분기 = 3개월 합 · 연간 = 12개월 합이다.
 
-    이 표가 Phase 6의 핵심이다 — 백엔드가 계산해서 내려주면 프런트는 그리기만 한다.
-    45행 전부를 비교하는 이유: 한 행만 빠뜨려도(또는 들여쓰기·단위가 어긋나도) 화면이
-    다른 표를 그린다. 대조 테스트가 이미 두 건을 잡았다 —
-    ① ov17 avg가 안 올라온 달을 0으로 세던 것, ② 비율의 분모가 개발비 vs 개발비(매출)로 갈려 있던 것.
+    **2026-11-17: 프런트 대조(ovPLRows)를 걷어내고 백엔드 단독 검사로 바꿨다.** 집계 ①이 서버
+    값을 쓰게 된 뒤 브라우저 계산 ovPLRows를 지워서 대조할 상대가 없어졌다(지운 테스트는 git
+    이력에 있다: test_pl_rows_matches_front).
+
+    대조가 지켜 주던 건 ① 45행 구성(키 · 표시 형식)과 ② 17칸 값이었다. 전자는 그대로 보고,
+    후자는 "기간 접기가 자기 정의와 맞는지"로 바꿨다 — 계산자가 하나뿐일 때는 두 구현을 맞춰
+    보는 대신 출력이 규칙과 맞는지 보는 쪽이 맞다.
+
+    대조가 과거에 잡은 것(기록): ① ov17 avg가 안 올라온 달을 0으로 세던 것, ② 비율의 분모가
+    개발비 vs 개발비(매출)로 갈려 있던 것. 둘 다 지금은 백엔드 한 곳에만 있다.
     """
     d = {PK_USD: flat(PD_USD), PK_LOCAL: flat(PD_LOCAL)}
     pks = [PK_USD, PK_LOCAL]
     rate = RATE_KRW if mode == "krw" else None
-    js = run_js("pl_rows", {"d": d, "pks": pks, "mode": mode, "rate": RATE_KRW})
     backend = pl_rows(pks, d, {}, mode, rate)
 
-    assert len(backend) == len(js["core"]) == 45, "행 수가 다르다 — 표 구성이 어긋났다"
+    assert len(backend) == 45, "행 수가 다르다 — 표 구성이 어긋났다"
+    # 키와 표시 형식은 계정 정의(AGGREGATE_ROWS)가 정한다 — 표가 정의와 갈리면 화면이 다른 표를 그린다.
+    assert [r["key"] for r in backend] == [k for k, _l, _u, _m in AGGREGATE_ROWS], "행 키·순서가 정의와 다르다"
+    for r in backend:
+        assert len(r["values"]) == 17, f"{r['key']}: 칸이 {len(r['values'])}개다"
 
-    for i, (row, front) in enumerate(zip(backend, js["core"])):
-        # 행 식별자(프런트는 rk로 담는다)와 표시 형식이 같아야 같은 행이다.
-        assert row["key"] == front["key"], f"{i}번째 행의 키가 다르다: {row['key']} ≠ {front['key']}"
-        assert row["format"] == front["f"], f"{row['key']}: 표시 형식이 다르다"
-        for j in range(17):
-            where = f"{mode}/{row['key']}[{j}]" + (" 월" if j < 12 else " 분기" if j < 16 else " 연간")
-            b, f = row["values"][j], front["v"][j]
-            # 프런트는 미등록을 0으로 채운다(설계 차이) — 값이 있는 칸만 비교한다.
-            if b is None:
-                assert f in (0, 0.0, None), f"백엔드는 빈칸인데 프런트에 값이 있다: {where} = {f!r}"
+    for r in backend:
+        # 인력은 평균, 비율은 분자 ÷ 분모라 "합" 규칙의 대상이 아니다(각각 다른 테스트가 본다).
+        if r["format"] not in ("krw", "usd"):
+            continue
+        months = r["values"][:12]
+        for qi, ix in enumerate(((0, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11))):
+            part = [months[j] for j in ix if months[j] is not None]
+            got, where = r["values"][12 + qi], f"{mode}/{r['key']}/{qi + 1}Q"
+            if part:
+                assert got == pytest.approx(sum(part), rel=1e-9), f"{where}: 분기 ≠ 3개월 합"
             else:
-                assert f == pytest.approx(b, rel=1e-9), f"값이 다르다: {where}"
+                assert got is None, f"{where}: 월이 다 빈칸인데 분기에 값이 있다"
+        have = [m for m in months if m is not None]
+        if have:
+            assert r["values"][16] == pytest.approx(sum(have), rel=1e-9), f"{mode}/{r['key']}: 연간 ≠ 12개월 합"
 
 
 def test_pl_rows_memo_rows_are_outside_the_total():

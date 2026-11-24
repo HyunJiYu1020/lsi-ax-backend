@@ -8,19 +8,21 @@
 from sqlalchemy.orm import Session
 
 from app.shared.core.enums import AccountStatus, CodeGroup, OverseasSheetType, VersionStatus
+from app.db.seed_reference import seed_reference
 from app.db.session import SessionLocal
 from app.accounts.overseas.models import OverseasLab, OverseasLabSheet
 from app.shared.models.account import Account, AccountProgress, AccountStep
+from app.shared.models.reference import RefCostElement, RefDeptCode
 from app.shared.models.system import CommonCode, CommonCodeGroup
 
 # 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order, currency)
 # — 프론트 OV_LABS와 동일.
 # sort_order는 lab_code 단위 표시 순서(같은 lab_code의 파트들은 같은 값) — 탭·집계표가 이 순서로 나온다.
 #
-# currency(현지통화)를 여기 적어 두는 이유: 예전에는 시드가 통화를 아예 안 넣어서 컬럼 기본값 USD로
-# 깔리고, 통화는 마이그레이션(b3f4c91a7d2e)이 국가별 매핑으로 한 번 백필하는 것에만 의존했다.
-# 그러면 "마이그레이션을 다 돌린 뒤 새로 시드한" DB는 모든 연구소가 USD가 되어 현지통화 연구소의
-# 환차 분해(현지→$ 단계)가 통째로 사라진다. 통화는 환산의 입력이라 시드가 직접 책임져야 한다.
+# currency(현지통화)를 여기 적어 두는 이유: 시드가 통화를 안 넣으면 컬럼 기본값 USD로 깔리고,
+# 마이그레이션(b3f4c91a7d2e)의 국가별 백필에만 의존하게 된다. 그러면 "마이그레이션을 다 돌린 뒤
+# 새로 시드한" DB는 모든 연구소가 USD가 되어 현지통화 연구소의 환차 분해(현지→$ 단계)가 통째로
+# 사라진다. 통화는 환산의 입력이라 시드가 직접 책임져야 한다.
 #
 # 대만(TDC)만 국가 기본값(TWD)이 아니라 USD다 — TDC는 $로 결산하는 연구소라 프런트에서도 국가별
 # 기본값을 덮어쓴다(core.js ovLabsSeed의 `r.c==="TDC"?"USD":...`). 국가로 유추하지 말 것.
@@ -47,14 +49,17 @@ OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int, str]] = [
     ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999, "USD"),
 ]
 
-# 연구소(lab_code)별 워크북 시트 구성. SARC+ACL만 비용 시트 하나고, 나머지는 비용·증감분석·
-# 외주용역업체 3개 — 연구소가 늘어나거나 시트 구성이 바뀌면 이 목록만 고치면 된다(코드 변경 없음).
+# 연구소(lab_code)별 워크북 시트 구성 — 12개 연구소가 모두 비용·증감분석·외주용역업체 3장을
+# 보낸다. 연구소가 늘어나거나 시트 구성이 바뀌면 이 목록만 고치면 된다(코드 변경 없음).
+# SARC는 한때 비용만 받는 것으로 등록돼 있었는데, 실제로는 셋을 다 보낸다 — 그 상태에서는 화면
+# 업로드 현황표가 SARC의 증감사유·외주용역을 영구 "미"로 보여줬다. 비용 시트만 파트별로 여러
+# 장(CPU · GPU (ACL) · 총계)이고, 증감분석·외주용역은 연구소 한 장이다.
 _STD_SHEETS = [(OverseasSheetType.COST, 10), (OverseasSheetType.VARIANCE, 20), (OverseasSheetType.VENDOR, 30)]
 OVERSEAS_LAB_SHEETS: list[tuple[str, OverseasSheetType, int]] = [
     (lab_code, sheet_type, order)
-    for lab_code in ("DSRA", "SIRC", "SSIR", "SCSC", "SSCR", "TDC", "DSRJ", "SRPOL", "SRR", "CP", "SRCX")
+    for lab_code in ("SARC", "DSRA", "SIRC", "SSIR", "SCSC", "SSCR", "TDC", "DSRJ", "SRPOL", "SRR", "CP", "SRCX")
     for sheet_type, order in _STD_SHEETS
-] + [("SARC", OverseasSheetType.COST, 10)]
+]
 
 # (key, name, color, data_type) — 프론트 accSeed()의 19개 계정과 동일
 # data_type은 "지금 당장 테이블이 있다"는 뜻이 아니라 "이 계정이 어떤 모양의 데이터를 다룰지"에
@@ -305,6 +310,9 @@ def seed(db: Session) -> None:
 
     db.commit()
 
+    # 기준정보(비용계정 · 자산 Class 매핑 · 부서코드 · PLM 과제)는 표가 커서 별 모듈로 뺐다.
+    seed_reference(db)
+
 
 def main() -> None:
     db = SessionLocal()
@@ -312,7 +320,8 @@ def main() -> None:
         seed(db)
         print(
             f"done — accounts: {db.query(Account).count()}, steps: {db.query(AccountStep).count()}, "
-            f"labs: {db.query(OverseasLab).count()}, lab_sheets: {db.query(OverseasLabSheet).count()}"
+            f"labs: {db.query(OverseasLab).count()}, lab_sheets: {db.query(OverseasLabSheet).count()}, "
+            f"ref_cost_elements: {db.query(RefCostElement).count()}, ref_dept_codes: {db.query(RefDeptCode).count()}"
         )
     finally:
         db.close()

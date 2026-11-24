@@ -58,28 +58,52 @@ def has_cp_mark(text: str) -> bool:
     return bool(CP_RX.search(str(text or "").upper()))
 
 
+# 규칙의 match_field → 전표의 어느 칸을 보는지.
+RULE_FIELDS = {
+    "vendor": "vendor",
+    "text": "text",
+    "cost_center": "cost_center",
+    "project": "project_code",
+    "assignment": "assignment",
+}
+# match_op를 안 적은 규칙(이 컬럼이 생기기 전에 만든 것)이 쓰던 방식. 적요는 같은 내용을 매달 조금씩
+# 다르게 적어 보내서 '포함'이고, 나머지는 코드·이름이라 '같음'이다. 일괄 백필하지 않고 여기서
+# 해석하는 이유는 close_match_rules.match_op 주석에 적어 뒀다.
+RULE_OP_DEFAULT = {"text": "contains"}
+
+
+def rule_matches(voucher: dict, rule: dict) -> bool:
+    """규칙 한 건이 이 전표에 걸리는지. match_op가 비어 있으면 필드별 기본 방식으로 본다."""
+    field = rule.get("match_field")
+    want = normalize(rule.get("match_value"))
+    column = RULE_FIELDS.get(field)
+    if not want or not column:
+        return False
+    got = normalize(voucher.get(column))
+    if not got:
+        return False
+    op = rule.get("match_op") or RULE_OP_DEFAULT.get(field, "equals")
+    if op == "contains":
+        return want in got
+    if op == "starts_with":
+        return got.startswith(want)
+    return got == want
+
+
 def match_rule(voucher: dict, rules: list[dict]) -> dict | None:
     """담당자가 승인한 규칙(close_match_rules) 중 이 전표에 걸리는 것. 먼저 걸린 규칙이 이긴다.
 
     규칙은 AI 추천을 **이긴다** — 사람이 "앞으로 이렇게"라고 답한 것이라서, 기계가 다시 뒤집으면
-    같은 수정을 매달 반복하게 된다."""
+    같은 수정을 매달 반복하게 된다.
+
+    rejected=True인 행은 건너뛴다 — 그건 담당자가 제안에 [닫기]를 누른 기록이라 "규칙으로 쓰지
+    말라"는 뜻이다. 같은 제안을 다시 묻지 않으려고 같은 테이블에 남기는 것이라, 매칭에서 빼지
+    않으면 거절한 규칙이 그대로 적용돼 버린다."""
     for rule in rules:
-        field, want = rule.get("match_field"), normalize(rule.get("match_value"))
-        if not want:
+        if rule.get("rejected"):
             continue
-        if field == "text":
-            # 적요는 '포함'으로 본다 — 같은 내용을 매달 조금씩 다르게 적어 보낸다.
-            if want in normalize(voucher.get("text")):
-                return rule
-        elif field == "vendor":
-            if want == normalize(voucher.get("vendor")):
-                return rule
-        elif field == "cost_center":
-            if want == normalize(voucher.get("cost_center")):
-                return rule
-        elif field == "project":
-            if want == normalize(voucher.get("project_code")):
-                return rule
+        if rule_matches(voucher, rule):
+            return rule
     return None
 
 

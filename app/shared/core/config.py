@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     app_name: str = "S.LSI 예산관리 플랫폼 API"
     database_url: str = "postgresql+psycopg://slsi:slsi@localhost:5432/slsi"
     cors_origins: list[str] = ["http://localhost:5173"]
-    # 2026-11-16: 챗봇 공급자를 **Gemini 하나로** 줄였다(PLAN.md 질문 6).
+    # 챗봇 공급자를 **Gemini 하나로** 줄였다.
     # 왜: 모델과 왕복하는 턴 루프가 공급자마다 한 벌씩 있어서, 도구를 하나 추가하면 세 곳을
     # 고쳐야 했다 — 그게 chat.py가 689줄인 이유다.
     # 되살릴 때: 아래 주석 + chat.py · reason_translate.py의 주석 블록 + .env의 키를 같이 푼다.
