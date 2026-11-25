@@ -92,9 +92,7 @@ def test_state_shape_is_frozen(db, state):
 
     for version in VERSIONS:
         vd = state.V[version]
-        assert len(vd.etc) % 12 == 0 and len(vd.etc) >= 12
         for pk, cats in vd.d.items():
-            assert pk != "_ETC", "원화 기타는 d가 아니라 etc로 따로 내려준다"
             for key, months in cats.items():
                 # 12의 배수 — 기간을 다음 연도까지 늘려 받는 확장 지점(_entry_months_bulk).
                 assert len(months) % 12 == 0 and len(months) >= 12, f"{version}/{pk}/{key}"
@@ -537,14 +535,13 @@ def test_month_with_no_rows_comes_back_empty_not_substituted(db):
 
     assert s.basis_month == empty_month, "보낸 달을 그대로 돌려줘야 화면이 그 달 버킷에 써넣는다"
     assert s.V["cur"].d == {}, "그 달에 행이 없는데 다른 달 데이터가 cur로 들어왔다"
-    assert s.V["cur"].etc == [0.0] * 12
 
 
 def test_month_with_rows_still_comes_back_filled(db):
     """반대쪽 — 행이 있는 달을 열면 그 달 값이 그대로 온다(빈 응답을 돌려주는 버그가 아니다).
 
     "행이 있는 달"은 **합산 대상 연구소 행이 있는 달**이다(filled_cost_yyyymm). max(yyyymm)으로
-    고르면 안 된다 — 원화 기타(_ETC) 같은 가상 행 한 줄만 들어간 달이 집히고, 그 달의 cur는
+    고르면 안 된다 — 합산에서 빠지는 행(합계 시트 등) 한 줄만 들어간 달이 집히고, 그 달의 cur는
     당연히 비어 있어서 이 테스트가 "빈 응답 버그"라고 잘못 외친다(2026-11-23에 실제로 그랬다).
     기준월을 정하는 코드도 같은 판정을 쓴다."""
     latest = filled_cost_yyyymm(db, "forecast")

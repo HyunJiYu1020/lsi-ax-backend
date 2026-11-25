@@ -38,6 +38,7 @@ from app.accounts.overseas.cost_groups import CATEGORY_LABELS
 from app.shared.core.enums import CodeGroup
 from app.shared.core.periods import PERIOD_IX, ym_year, yyyymm
 from app.shared.core.values import n
+from app.accounts.overseas.services.aggregate import ANCHORABLE, NO_ANCHOR
 from app.accounts.overseas.services import anomaly_rules as anomaly_rules_service
 from app.accounts.overseas.services import translate as translate_service
 from app.accounts.overseas.services.carry import carry_forward
@@ -517,14 +518,13 @@ def list_labs(as_of: str | None = None, db: Session = Depends(get_db)) -> list[L
             is_active=lab.is_active,
         )
         for lab in sorted(lab_views(db, as_of), key=lambda lab: (lab.sort_order, lab.pk))
-        if lab.pk != "_ETC"
     ]
 
 
 @router.put("/overseas/labs", response_model=list[LabOut])
 def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
     """연구소 기준정보 편집 화면(ovLabPage)의 "저장" — 화면에 보이는 전체 목록을 통째로 받아
-    upsert하고, 목록에서 빠진 lab_code는 삭제한다(단 _ETC 가상 행은 화면에 없으니 건드리지 않음).
+    upsert하고, 목록에서 빠진 lab_code는 삭제한다.
     cost_entries 등에 남은 데이터는 FK가 없어 지워지지 않고, 집계에서만 조용히 빠진다."""
     by_code: dict[str, list[OverseasLab]] = {}
     for lab in all_labs(db):
@@ -532,7 +532,7 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
 
     submitted_codes = {row.lab_code for row in body}
     for lab_code, rows in by_code.items():
-        if lab_code == "_ETC" or lab_code in submitted_codes:
+        if lab_code in submitted_codes:
             continue
         for row in rows:
             db.delete(row)
@@ -588,7 +588,6 @@ def save_labs(body: list[LabIn], db: Session = Depends(get_db)) -> list[LabOut]:
             is_active=lab.is_active,
         )
         for lab in sorted(all_labs(db), key=lambda lab: (lab.sort_order, lab.pk))
-        if lab.pk != "_ETC"
     ]
 
 
@@ -1180,6 +1179,19 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
         )
     if body.source == "chat":
         block_duplicate_label(db, body, existing)
+    # anchor_key는 **고정 계정 코드**(또는 합산 제외)만 받는다. 다른 추가 행의 row_key 같은 값은
+    # 자리로 쓸 수 없어 화면도 집계도 조용히 기타경비로 떨어뜨리는데, 보낸 쪽은 "그 항목 밑에
+    # 넣었다"고 믿는다 — 금액이 아니라 자리가 틀리는 형태라 숫자만 봐서는 못 알아챈다.
+    # 인력(hc)이 빠지는 이유: 명 단위라 금액을 더할 수 없다(ANCHORABLE = 계정 전부 - hc).
+    if body.anchor_key is not None and body.anchor_key not in ANCHORABLE and body.anchor_key != NO_ANCHOR:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"anchor_key '{body.anchor_key}'는 자리로 쓸 수 없습니다 — 추가 행의 자리는 고정 계정 "
+                f"코드이거나 '{NO_ANCHOR}'(합산 제외)여야 합니다. 다른 추가 행의 row_key는 자리가 될 수 "
+                "없습니다. 자리를 안 정하려면 anchor_key를 비워 보내세요(기타경비로 합산됩니다)."
+            ),
+        )
     # v를 아예 안 보내면(None) "저장된 금액은 손대지 않는다"는 뜻이다 — 이미 있는 행을 다른 항목
     # 아래로 옮길 때 쓴다. 금액이 제자리에 남는다는 뜻이 **아니다**: 월별 금액은 이 행(cost_entry)에
     # 매달려 있어서 행과 함께 옮겨가고, 집계도 새 anchor_key 아래에서 센다(aggregate.py의

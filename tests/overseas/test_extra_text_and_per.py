@@ -28,7 +28,7 @@ YM = "209509"
 
 @pytest.fixture
 def lab(db):
-    pks = [x.pk for x in all_labs(db) if x.pk != "_ETC"]
+    pks = [x.pk for x in all_labs(db)]
     if not pks:
         pytest.skip("연구소 기준정보가 없어 스킵합니다")
     return pks[0]

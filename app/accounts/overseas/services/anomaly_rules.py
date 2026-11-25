@@ -8,7 +8,12 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.accounts.overseas.cost_groups import GROUP_CALC, category_label, resolve_leaves
+from app.accounts.overseas.cost_groups import (
+    GROUP_CALC,
+    VARIANCE_ROWS,
+    category_label,
+    resolve_leaves,
+)
 from app.shared.core import anomaly
 from app.shared.models.generic import AnomalyRule, AnomalyRuleLog
 from app.accounts.overseas.schemas import (
@@ -20,6 +25,12 @@ from app.accounts.overseas.schemas import (
 )
 from app.accounts.overseas.services.extra_rows import check_lab_pk, check_version, months_by_category
 from app.accounts.overseas.services.labs import ACCOUNT_KEY, all_labs
+from app.accounts.overseas.services.versions import load_basis, resolve_bases
+
+
+# 금액이 아니라 "명"으로 적혀 오는 행(인력). 기간 합 검사의 허용값이 달라서 따로 알려 준다 —
+# 단위는 VARIANCE_ROWS가 원본이니(공통코드에서 갱신된다) 여기서 베껴 적지 않고 거기서 뽑는다.
+COUNT_KEYS = {k for k, _lv, unit in VARIANCE_ROWS if unit == "hc"}
 
 
 def rule_rows(db: Session) -> list[AnomalyRule]:
@@ -100,17 +111,84 @@ def upsert_rule(db: Session, body: AnomalyRuleIn) -> list[AnomalyRuleOut]:
     return rules_out(db)
 
 
-def base_months(db: Session, lab_pk: str, version: str, ym: str, lab_wide: bool) -> dict[str, list[float]]:
-    """비교할 전실행 값. lab_wide면 같은 연구소의 파트를 전부 더해서 돌려준다 — 증감사유·외주용역은
-    연구소 단위 시트라 SARC를 CPU 하나와 비교하면 전부 불일치로 걸린다. 총계 행(part_code=TOTAL)은
-    더하지 않는다 — 다른 파트를 더해 만든 값이라 넣으면 두 번 세어진다."""
+def scan_pks(db: Session, lab_pk: str, lab_wide: bool) -> list[str]:
+    """검사가 읽을 자리(pk) 목록. lab_wide면 같은 연구소의 파트를 전부 — 증감사유·외주용역은
+    연구소 단위 시트라(SARC = CPU+GPU) 파트 하나와 비교하면 전부 불일치로 걸린다. 총계 행
+    (part_code=TOTAL)은 빼고 센다 — 다른 파트를 더해 만든 값이라 넣으면 두 번 세어진다."""
     if not lab_wide:
-        return months_by_category(db, lab_pk, version, ym)
+        return [lab_pk]
     lab_code = next((lab.lab_code for lab in all_labs(db) if lab.pk == lab_pk), lab_pk)
-    pks = [
+    return [
         lab.pk for lab in all_labs(db)
         if lab.lab_code == lab_code and (lab.part_code or "").upper() != "TOTAL"
     ] or [lab_pk]
+
+
+def _sum_by_category(parts: list[dict[str, list]]) -> dict[str, list[float]]:
+    """pk별 {계정 → 월 배열} 여러 벌을 계정별로 더한다(파트 합)."""
+    out: dict[str, list[float]] = {}
+    for one in parts:
+        for cat, months in (one or {}).items():
+            acc = out.setdefault(cat, [])
+            for i, v in enumerate(months or []):
+                if i < len(acc):
+                    acc[i] += float(v or 0)
+                else:
+                    acc.append(float(v or 0))
+    return out
+
+
+def analysis_bases(db: Session, body: AnomalyScanIn) -> tuple[dict[str, dict | None], list[tuple[str, str]]]:
+    """증감분석 세 열(PLAN · 전실행 · 당월)을 맞대볼 본사 값 + 못 구한 것의 이유.
+
+    **비교 기준은 서버가 정한다**(API.md "비교 기준을 화면이 추측하면 안 된다") — 전실행은 직전
+    버전이고 가리키는 대상이 달마다 바뀐다(11월 속보의 전실행 = 10월 실적, 1월 속보는 전년 12월
+    실적). 경영계획은 "적용 차수"로 푼다(entries.pick_plan_no와 같은 규칙을 resolve_bases가 쓴다).
+    급변 검사가 쓰는 base_vals(전월 **속보**)와는 다른 값이다 — 그쪽은 "지난번 편성과 얼마나
+    달라졌나"를 보고, 이쪽은 연구소가 시트에 옮겨 적은 칸이 본사 장부와 같은지를 본다.
+
+    당월 열은 저장된 값이 아니라 **같은 파일로 온 비용 시트**(body.cost_vals)와 맞댄다. 반영 전
+    검사라 비용 값은 아직 DB에 없고, 보려는 것도 "한 파일 안에서 두 시트가 같은 말을 하는가"다.
+    """
+    out: dict[str, dict | None] = {"plan": None, "prev": None, "cur": None}
+    skipped: list[tuple[str, str]] = []
+    if not body.analysis:
+        return out, skipped
+    ym = (body.yyyymm or "").strip()
+    if len(ym) != 6 or not ym.isdigit():
+        return out, [("analysis_prev", "증감분석 대조 — 기준 연월(yyyymm)을 읽을 수 없습니다")]
+    year, month = int(ym[:4]), int(ym[4:6])
+    pks = set(scan_pks(db, body.lab_pk, body.base_lab_wide))
+
+    by_key = {b.key: b for b in resolve_bases(db, year, month, body.version).bases}
+    for key, rule_key in (("plan", "analysis_plan"), ("prev", "analysis_prev")):
+        b = by_key.get(key)
+        label = anomaly.DEFAULTS[rule_key]["label"]
+        if b is None or not b.has_data:
+            note = (b.fallback_note if b else "") or "비교할 값이 없습니다"
+            skipped.append((rule_key, f"{label} — {note}"))
+            continue
+        # load_basis는 {pk: {계정 → 월}}로 준다 — 파트가 나뉜 연구소는 그걸 계정별로 더해야
+        # 연구소 단위 시트(증감분석)와 같은 자리를 가리킨다.
+        loaded = load_basis(db, (b.year, b.month, b.kind, b.plan_no), pks)
+        out[key] = _sum_by_category([loaded.get(pk, {}) for pk in pks])
+
+    if body.cost_vals:
+        out["cur"] = {k: list(v or []) for k, v in body.cost_vals.items()}
+    else:
+        skipped.append((
+            "analysis_cur",
+            f"{anomaly.DEFAULTS['analysis_cur']['label']} — 같은 파일의 비용 시트 값이 이 검사에"
+            " 함께 오지 않았습니다",
+        ))
+    return out, skipped
+
+
+def base_months(db: Session, lab_pk: str, version: str, ym: str, lab_wide: bool) -> dict[str, list[float]]:
+    """급변·단위 검사가 비교할 전월 속보 값. lab_wide면 파트를 전부 더한다(scan_pks와 같은 이유)."""
+    if not lab_wide:
+        return months_by_category(db, lab_pk, version, ym)
+    pks = scan_pks(db, lab_pk, True)
     out: dict[str, list[float]] = {}
     for pk in pks:
         for cat, months in months_by_category(db, pk, version, ym).items():
@@ -146,6 +224,10 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
         skipped.append("급변·단위(배수) — 비교할 전월 속보 값이 없습니다")
 
     rules = anomaly.merged_rules(rule_rows(db), body.overrides)
+    # 증감분석 세 열의 비교 상대. 못 구한 열은 그 이유를 skipped로 올린다 — 조용히 빼면
+    # "증감분석 대조 이상 없음"으로 읽힌다(이 엔드포인트의 공통 약속).
+    abases, abase_skipped = analysis_bases(db, body)
+    skipped += [msg for rule_key, msg in abase_skipped if rules[rule_key]["enabled"]]
     findings = anomaly.detect(
         vals={k: list(v or []) for k, v in vals.items()},
         base_vals=base_vals,
@@ -158,8 +240,10 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
         periods=body.periods,
         outs_rows=[r.model_dump() for r in body.outs_rows] if body.outs_rows else None,
         analysis=body.analysis,
+        analysis_bases=abases,
         basis_month=body.basis_month,
         cols=body.cols,
+        count_keys=COUNT_KEYS,
     )
     if not body.sums and rules["sum_mismatch"]["enabled"]:
         skipped.append("합계 불일치 — 파일에 소계·합계 행이 없습니다")
@@ -174,19 +258,30 @@ def scan(db: Session, body: AnomalyScanIn) -> AnomalyScanResult:
     # 읽고 엉뚱한 재요청을 하게 된다. 이 엔드포인트가 아는 건 "이 검사에 쓸 값이 왔는가"뿐이다.
     if not body.periods and not body.outs_rows and rules["period_mismatch"]["enabled"]:
         skipped.append("기간 합 불일치 — 파일의 1Q~4Q·연간 칸에 값이 없습니다")
+    # 증감분석 대조 세 기준 + 당월 빈칸. 쓰는 재료가 열마다 달라서 열 단위로 밝힌다.
+    ANALYSIS_RULES = ("analysis_plan", "analysis_prev", "analysis_cur")
     if not body.analysis:
         # 화면은 비용 · 증감분석 · 외주용역을 각각 다른 카드로 검사한다 — 비용 카드에는 증감분석
         # 값이 실리지 않는다. 그걸 "시트가 안 왔다"로 적으면 같은 파일로 온 증감분석 시트를 두고도
         # 연구소에 다시 달라고 하게 된다.
-        for key in ("analysis_prev", "analysis_missing"):
+        for key in ANALYSIS_RULES + ("analysis_missing",):
             if rules[key]["enabled"]:
                 skipped.append(f"{rules[key]['label']} — 증감분석 값이 이 검사에 함께 오지 않았습니다")
-    elif rules["analysis_prev"]["enabled"] and not any(
-        ((blocks or {}).get("y") or {}).get("prev") is not None for blocks in body.analysis.values()
-    ):
-        # 값은 왔는데 전실행 열이 통째로 비어 있는 경우 — 대조할 상대가 없다.
-        # 이걸 안 밝히면 "전월 대조 이상 없음"으로 읽힌다.
-        skipped.append(f"{rules['analysis_prev']['label']} — 증감분석 시트의 전실행 열이 비어 있습니다")
+    else:
+        # 값은 왔는데 그 **열이** 통째로 비어 있는 경우 — 대조할 상대가 아니라 대조할 값이 없다.
+        # 이걸 안 밝히면 "대조 이상 없음"으로 읽힌다.
+        for key, field in zip(ANALYSIS_RULES, ("plan", "prev", "cur")):
+            if not rules[key]["enabled"] or abases.get(field) is None:
+                continue  # 비교 상대가 없는 건 위 abase_skipped가 이미 적었다
+            if not any(
+                ((blocks or {}).get(b) or {}).get(field) is not None
+                for blocks in body.analysis.values()
+                for b in ("y", "m")
+            ):
+                skipped.append(f"{rules[key]['label']} — 증감분석 시트의 그 열이 비어 있습니다")
+    if body.analysis and not body.basis_month and rules["analysis_prev"]["enabled"]:
+        # 당월 블록은 "기준월 한 칸"과 맞대므로 몇 월인지 모르면 검사할 수 없다(연간 블록만 본다).
+        skipped.append("증감분석 당월 블록 대조 — 기준월(basis_month)이 오지 않았습니다")
     if base_vals is None and rules["new_category"]["enabled"]:
         skipped.append(f"{rules['new_category']['label']} — 비교할 전월 속보 값이 없습니다")
     counts: dict[str, int] = {}

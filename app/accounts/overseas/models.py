@@ -25,8 +25,8 @@ class OverseasLab(Base):
 
     __tablename__ = "overseas_labs"
     __table_args__ = {
-        "comment": "해외연구소·파트 기준정보(SARC는 CPU·GPU로 분리) + 연구소에 속하지 않는 "
-        "계정 전체 단위 값을 담는 가상 행(_ETC). 프론트 탭은 이 테이블을 lab_code로 묶어서 그린다."
+        "comment": "해외연구소·파트 기준정보(SARC는 CPU·GPU로 분리). 프론트 탭은 이 테이블을 "
+        "lab_code로 묶어서 그린다."
     }
 
     id: Mapped[int] = mapped_column(primary_key=True)

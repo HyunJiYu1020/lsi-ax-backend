@@ -38,7 +38,7 @@ VER = "forecast"   # version은 cost_entries와 같은 값만 받는다(forecast
 @pytest.fixture
 def lab_code(db) -> str:
     """실재하는 연구소 코드 하나. 없는 코드를 쓰면 400으로 막히므로 DB에서 고른다."""
-    codes = sorted({lab.lab_code for lab in all_labs(db)} - {"_ETC"})
+    codes = sorted({lab.lab_code for lab in all_labs(db)})
     if not codes:
         pytest.skip("연구소가 없다")
     return codes[0]
@@ -98,7 +98,7 @@ def test_replaces_the_whole_unit_not_upsert(db, lab_code):
 def test_other_labs_are_untouched(db):
     """보내지 않은 연구소는 건드리지 않는다 — 한 연구소 시트를 올렸는데 다른 연구소 자료가
     사라지면 안 된다."""
-    codes = sorted({lab.lab_code for lab in all_labs(db)} - {"_ETC"})
+    codes = sorted({lab.lab_code for lab in all_labs(db)})
     if len(codes) < 2:
         pytest.skip("연구소가 2곳 미만")
     a, b = codes[0], codes[1]

@@ -186,7 +186,7 @@ def _lab_parts(db: Session) -> dict[str, list[str]]:
     세는 셈이 되어 제외한다."""
     parts: dict[str, list[str]] = {}
     for lab in db.scalars(select(OverseasLab).order_by(OverseasLab.sort_order, OverseasLab.pk)):
-        if lab.pk == "_ETC" or lab.part_code == "TOTAL":
+        if lab.part_code == "TOTAL":
             continue
         parts.setdefault(lab.lab_code, []).append(lab.pk)
     return parts

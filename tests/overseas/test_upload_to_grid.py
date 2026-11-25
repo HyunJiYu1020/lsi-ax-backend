@@ -53,11 +53,24 @@ SAL_Q = ["99", "45", "54", "63"]
 SAL_Y = "198"
 BONUS = [5, 5, "", 5, 5, 5, 5, 5, 5, 5, 5, 5]   # 3월은 빈칸(미제출) — 0으로 보고한 것과 다르다
 FILE_Q1_SAL = 99                      # 파일에 적혀 온 1Q 칸: 월 합(36)과 어긋난다 → 검증 대상
+# 소계 행(인건비) — 월 12칸은 하위 합과 맞춰 적고(합계 불일치를 일부러 만들지 않는다) 1Q 칸만
+# 월 합(46)과 다른 값을 적어 보낸다. 소계 행도 **파일에 적힌 분기 칸을 그대로** 보여주는지가 여기
+# 걸린다: 이 칸을 안 들고 가면 미리보기가 월 합으로 계산해서 46을 보여주고, 담당자는 연구소가
+# 적어 보낸 777을 미리보기에서 영원히 못 본다(반영 뒤 표는 소계를 하위 합으로 그린다).
+LABOR = [a + b for a, b in zip(SAL, [v or 0 for v in BONUS])]
+FILE_Q1_LABOR = 777
+
+# 개발비(매출) 행 — 양식에 있는 행이고 **연구소가 금액을 적어 보낸다**. 하위 합(= 인건비, 이 파일엔
+# 다른 계정이 없다)과 일부러 다르게 적는다: 우리가 리프를 다시 더해 만든 값이 아니라 연구소가
+# 보고한 값이 저장돼야 한다는 게 여기서 걸린다. 어긋난다는 사실은 "합계 불일치"가 따로 알린다.
+FILE_TOT = [v + 7 for v in LABOR]
 
 COST_ROWS = [
     ["sal", "(급여)", "Salaries & Wages"] + SAL + [FILE_Q1_SAL, "", "", "", ""],
     ["bonus", "(상여)", "Bonus (MBO etc)"] + BONUS + [""] * 5,
     ["welf", "(복리후생)", "Welfare, Health Insurance"] + [0] * 12 + [""] * 5,
+    ["labor", "인건비", "Labor Cost"] + LABOR + [FILE_Q1_LABOR, "", "", "", ""],
+    ["tot", "개발비(매출)", "Development Expense Total (A+B)"] + FILE_TOT + [""] * 5,
 ]
 SHEET = {"name": "Format", "aoa": [["", "TEST Expense Report (Unit : K$)"], HDR] + COST_ROWS}
 
@@ -199,8 +212,14 @@ def test_file_lands_in_the_pending_card_before_anything_changes(result):
     assert "해외연구소_SIRC_M2611A.xlsx" in result["modalText"]
     assert "비용 3개 행" in result["modalText"], f"읽은 행 수가 다르다: {result['modalText'][:300]}"
 
-    before = [c["txt"] for c in _row(result["before"], "Salaries & Wages")["cells"][:12]]
-    assert before != [str(v) for v in SAL], "반영 전에 이미 파일 값이 그리드에 들어가 있다"
+    # 아직 아무 값도 안 올라온 자리는 표를 아예 그리지 않는다 — 17열이 전부
+    # '–'인 표는 "0으로 채워진 실제 값"으로 읽히고, 바로 위 업로드 현황표의 '미'와 화면이 서로
+    # 다른 말을 하게 된다. 그 연구소에 이미 올라온 값이 있는 DB에서 돌 수도 있으니 둘 다 받는다.
+    if result["before"] is None:
+        assert "아직 올라온 비용 시트가 없습니다" in result["beforeEmpty"], result["beforeEmpty"]
+    else:
+        before = [c["txt"] for c in _row(result["before"], "Salaries & Wages")["cells"][:12]]
+        assert before != [str(v) for v in SAL], "반영 전에 이미 파일 값이 그리드에 들어가 있다"
 
 
 def test_preview_modal_shows_the_file_as_written(result):
@@ -213,6 +232,20 @@ def test_preview_modal_shows_the_file_as_written(result):
     assert bonus["cells"][2]["txt"] == "–", "빈칸(미제출)이 0으로 보인다"
     welf = _row(result["modal"], "Welfare, Health Insurance")
     assert [c["txt"] for c in welf["cells"][:12]] == ["0"] * 12, "0으로 보고한 달이 빈칸으로 보인다"
+
+
+def test_preview_modal_computes_a_subtotal_rows_quarter(result):
+    """소계 행의 분기·연간은 **하위 합**으로 보여준다 — 파일에 적혀 온 칸이 있어도 그렇다.
+
+    파일 값을 그대로 쓰면 하위에 행을 추가하고 값을 넣어도 1Q·연간이 옛 값에 묶여서, 같은 줄
+    안에서 월 합과 분기가 어긋나 보인다. 소계는 월·분기·연간이 한 규칙(하위 합)이어야 읽힌다 — 연구소가 적어 보낸
+    값과 다르다는 사실은 "합계 불일치" 지적과 취합 표의 빨간 칸이 따로 알린다.
+    """
+    labor = _row(result["modal"], "Labor Cost")
+    assert [c["txt"] for c in labor["cells"][:12]] == [str(v) for v in LABOR]
+    assert labor["cells"][12]["txt"] == str(sum(LABOR[:3])), "소계 1Q가 파일 값에 묶여 있다"
+    assert labor["cells"][13]["txt"] == str(sum(LABOR[3:6]))
+    assert labor["cells"][16]["txt"] == str(sum(LABOR))
 
 
 def test_validation_marks_the_cells_in_the_preview_modal(result):
@@ -247,6 +280,24 @@ def test_grid_shows_exactly_what_excel_had(result):
     assert bonus["cells"][2]["txt"] == "–", "빈칸으로 온 3월이 0으로 들어갔다 — 미제출과 0 보고가 섞인다"
     assert bonus["cells"][0]["txt"] == "5"
     assert bonus["cells"][12]["txt"] == "10", "빈칸이 있는 분기는 있는 달만 더한다"
+
+
+def test_grid_computes_a_subtotal_rows_quarter_and_flags_the_gap(result):
+    """[반영] 뒤 취합 표도 소계 분기를 하위 합으로 그리고, 파일 값과 다르면 그 칸을 빨갛게 칠한다.
+
+    파일의 1Q(777)와 월 합(46)이 다른 칸이다. 숫자는 집계한 값으로 바꿔 넣되 올라온 값을 숨기지
+    않는다 — 칸에 ovf-err를 칠하고, 마우스를 올리면 두 값을 같이 보여준다. 미리보기에서 지적을
+    보고도 안 고치고 반영한 경우가 바로 이 자리다.
+    """
+    labor = _row(result["grid"], "Labor Cost")
+    assert [c["txt"] for c in labor["cells"][:12]] == [str(v) for v in LABOR], "소계 월 칸이 하위 합이 아니다"
+    q1 = labor["cells"][12]
+    assert q1["txt"] == str(sum(LABOR[:3])), "소계 1Q가 파일 값에 묶여 있다"
+    assert "ovf-err" in q1["flag"], f"올라온 값과 다른 칸인데 표시가 없다(flag={q1['flag']!r})"
+    assert str(FILE_Q1_LABOR) in q1["title"] and str(sum(LABOR[:3])) in q1["title"], q1["title"]
+    assert labor["cells"][16]["txt"] == str(sum(LABOR))
+    # 파일 값과 같은 칸은 칠하지 않는다 — 전부 빨가면 어디가 문제인지 못 고른다.
+    assert not labor["cells"][0]["flag"], "월 칸은 파일과 같은데 칠했다"
 
 
 def test_grid_tells_a_reported_zero_apart_from_a_blank(result):
@@ -294,3 +345,24 @@ def test_only_whole_new_rows_are_marked_row_wide(result):
                 if f["month"] is None and not f["months"] and not f["block"] and not f["row"]]
     bad = [f["tip"] for f in row_wide if f["rule"] not in ("new_category", "jump")]
     assert not bad, "칸을 짚을 수 있는데 행 전체로 표시된 지적: " + json.dumps(bad, ensure_ascii=False)
+
+
+def test_a_total_that_disagrees_with_its_rows_shows_the_computed_value(result):
+    """A 100 · B 100인데 총계가 400으로 온 경우 — 표에는 **집계한 값**이 들어간다.
+
+    이 파일의 개발비(매출)은 하위 합보다 7 크게 적혀 있다(FILE_TOT). 담당자가 미리보기 지적을
+    보고도 안 고치고 반영하면, 표가 올라온 400을 그대로 들고 있어서는 안 된다 — 그 숫자는 아래
+    줄들과 더해지지 않는 값이라, 표 안에서 합이 안 맞는 채로 남는다.
+    """
+    tot = _row(result["grid"], "Development Expense Total (A+B)")
+    assert [c["txt"] for c in tot["cells"][:12]] == [str(v) for v in LABOR], "올라온 총계가 그대로 들어갔다"
+
+
+def test_that_mismatching_total_is_painted_and_explains_itself_on_hover(result):
+    """그 칸은 빨갛고, 마우스를 올리면 올라온 값과 집계한 값을 같이 알려 준다."""
+    tot = _row(result["grid"], "Development Expense Total (A+B)")
+    for j in range(12):
+        c = tot["cells"][j]
+        assert "ovf-err" in c["flag"], f"{j+1}월 칸에 이상값 표시가 없다(flag={c['flag']!r})"
+        assert str(FILE_TOT[j]) in c["title"], f"{j+1}월 안내에 올라온 값이 없다: {c['title']!r}"
+        assert str(LABOR[j]) in c["title"], f"{j+1}월 안내에 집계한 값이 없다: {c['title']!r}"

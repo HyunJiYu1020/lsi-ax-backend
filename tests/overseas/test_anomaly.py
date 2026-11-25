@@ -12,6 +12,9 @@ from app.accounts.overseas.endpoints import collect as ov
 from app.shared.core import anomaly
 from app.accounts.overseas.cost_groups import GROUP_CALC, category_label, resolve_leaves
 from app.accounts.overseas.schemas import AnomalyRuleIn, AnomalyScanIn
+# 실제 호출부(anomaly_rules)가 넘기는 값을 그대로 쓴다 — 여기서 {"hc"}를 베껴 적으면
+# 호출부가 안 넘기게 바뀌어도 이 파일만 통과한다.
+from app.accounts.overseas.services.anomaly_rules import COUNT_KEYS
 
 YM, BASE_YM, VER = "209901", "209812", "forecast"
 
@@ -21,12 +24,13 @@ K = 1000
 
 
 def _detect(vals, base=None, sums=None, reasons=None, periods=None, outs_rows=None,
-            analysis=None, basis_month=None, **over):
+            analysis=None, basis_month=None, abases=None, **over):
     rules = anomaly.merged_rules([], over or None)
     return anomaly.detect(
         vals=vals, base_vals=base, sums=sums, reasons=reasons, rules=rules,
         group_calc=GROUP_CALC, label_of=category_label, leaves_of=resolve_leaves,
         periods=periods, outs_rows=outs_rows, analysis=analysis, basis_month=basis_month,
+        analysis_bases=abases, count_keys=COUNT_KEYS,
     )
 
 
@@ -107,8 +111,10 @@ def test_missing_reason_marks_the_same_cell_as_the_jump():
     assert miss["month"] == jump["month"] == 12
 
     # 신규(전실행에 값이 없던 항목)만 행 전체로 남는다 — 그 행은 실제로 통째로 새 행이다.
+    # new_category는 여기 없다: 급변이 같은 사실을 이미 올렸으면 빠진다
+    # (test_new_value_in_an_old_account_is_reported_once_as_a_jump).
     new = _detect({"cons": [5 * K] * 12}, {"travel": [1 * K] * 12}, reasons={})
-    assert {f["rule"] for f in new if f["month"] is None} == {"jump", "missing_reason", "new_category"}
+    assert {f["rule"] for f in new if f["month"] is None} == {"jump", "missing_reason"}
 
 
 def test_only_new_rows_are_marked_row_wide():
@@ -218,6 +224,39 @@ def test_scan_says_what_it_could_not_check(db):
     assert any("합계 불일치" in s for s in r.skipped)  # 파일에 소계 행이 없을 때도 알린다
 
 
+def test_scan_resolves_the_analysis_bases_itself(db):
+    """증감분석을 같이 보내면 서버가 비교 기준을 **직접 푼다** — 전실행(직전 버전) · 경영계획
+    (적용 차수). 화면이 "기준월 - 1"로 추측해 보내면 1월 속보(전년 12월 실적)에서 틀린다
+    (API.md "비교 기준을 화면이 추측하면 안 된다").
+
+    기준이 없는 DB에서는 지어내지 않고 skipped로 밝힌다 — 조용히 빠지면 "대조 이상 없음"이 된다.
+    """
+    r = _scan(db, analysis={"travel": {"y": {"plan": 1 * K, "prev": 1 * K, "cur": 1 * K}, "m": {}}},
+              basis_month=11)
+    # 비용 시트 값을 같이 안 보냈으니 당월 열 대조는 못 한다 — 그 사실이 문장으로 남는다.
+    assert any("당월 대조" in s and "비용 시트" in s for s in r.skipped), r.skipped
+    # 경영계획·전실행도 이 DB에 없으면 그 이유가 같이 남는다(있으면 대조가 돌아 findings로 나온다).
+    assert any("경영계획 대조" in s for s in r.skipped) or any(
+        f.rule == "analysis_plan" for f in r.findings
+    ), r.skipped
+    assert any("전실행 대조" in s for s in r.skipped) or any(
+        f.rule == "analysis_prev" for f in r.findings
+    ), r.skipped
+
+
+def test_scan_compares_the_analysis_current_column_with_the_uploaded_cost_sheet(db):
+    """당월 열은 같은 파일로 온 비용 시트(cost_vals)와 맞댄다 — 저장된 값이 아니다(반영 전이다)."""
+    r = _scan(
+        db,
+        analysis={"travel": {"y": {"cur": 999 * K}, "m": {"cur": 1 * K}}},
+        cost_vals={"travel": [1 * K] * 12},   # 연간 12K$ · 11월 1K$
+        basis_month=11,
+    )
+    hit = [f for f in r.findings if f.rule == "analysis_cur"]
+    assert [(f.block, f.fields) for f in hit] == [("y", ["cur"])], "연간만 어긋난 파일인데 짚은 칸이 다르다"
+    assert not any("당월 대조" in s for s in r.skipped), "비용 값을 보냈는데 건너뛴 것으로 적었다"
+
+
 def test_scan_overrides_do_not_save(db):
     """"이번만 50%로 봐줘"는 그 조회에만 적용되고 저장되지 않는다."""
     before = _rules(db)["jump"].pct
@@ -272,6 +311,23 @@ def test_period_mismatch_checks_quarters_and_year():
     assert [f for f in rounding if f["rule"] == "period_mismatch"] == []
 
 
+def test_period_mismatch_year_cell_is_one_years_worth():
+    """기간을 늘려 받은 파일(24·36개월)의 연간 칸은 **1년치**(1~12월)와 대조한다.
+
+    양식의 1Q~4Q·연간 칸은 한 벌뿐이라 2년치 월 열이 와도 1년치를 가리킨다. 월 배열 전체를
+    더해서 비교하면 분기 넷은 다 맞는데 연간 칸만 2배로 어긋나 보인다 — 월 500씩 24칸 ·
+    분기 1500 · 연간 6000인 파일에서 연간만 이상값으로 칠해진다.
+    """
+    vals = {"sal": [500] * 24}
+    periods = {"sal": [1500, 1500, 1500, 1500, 6000]}
+    assert [f for f in _detect(vals, periods=periods) if f["rule"] == "period_mismatch"] == []
+
+    # 1년치 합과 진짜로 어긋나면 그대로 걸린다(2년치 합과 우연히 같은 값도 걸러야 한다).
+    hit = [f for f in _detect(vals, periods={"sal": [1500, 1500, 1500, 1500, 12000]})
+           if f["rule"] == "period_mismatch"]
+    assert len(hit) == 1 and hit[0]["month"] == 17
+
+
 def test_period_mismatch_skips_blank_period_cells():
     """연구소가 분기 칸을 아예 안 적었으면 기간 불일치로 올리지 않는다 — 그건 빈칸(missing_cell)이
     잡을 일이고, 여기서 또 올리면 같은 칸이 두 번 걸린다."""
@@ -301,20 +357,85 @@ def test_new_category_has_no_amount_floor():
 
 def test_analysis_prev_column_must_match_our_base():
     """증감분석의 전실행 열은 연구소가 전월 파일을 보고 옮겨 적는 칸이라, 본사 값과 어긋나면
-    비교 기준 자체가 다른 것이다."""
-    base = {"sal": [10 * K] * 12}  # 본사 전실행 합계 120K$
-    same = _detect({}, base, analysis={"sal": {"y": {"prev": 120 * K}, "m": {}}})
+    비교 기준 자체가 다른 것이다.
+
+    비교 상대는 **전실행(직전 버전)**이고 급변 검사가 쓰는 전월 속보(base_vals)와 다른 값이다 —
+    그래서 analysis_bases로 따로 받는다(서버가 resolve_bases로 풀어 넣는다).
+    """
+    prev = {"sal": [10 * K] * 12}  # 본사 전실행 합계 120K$
+    same = _detect({}, analysis={"sal": {"y": {"prev": 120 * K}, "m": {}}}, abases={"prev": prev})
     assert [f for f in same if f["rule"] == "analysis_prev"] == []
 
-    diff = _detect({}, base, analysis={"sal": {"y": {"prev": 99 * K}, "m": {}}})
+    diff = _detect({}, analysis={"sal": {"y": {"prev": 99 * K}, "m": {}}}, abases={"prev": prev})
     hit = [f for f in diff if f["rule"] == "analysis_prev"]
     assert len(hit) == 1 and "99" in hit[0]["message"] and "120" in hit[0]["message"]
+    # 칸을 짚어야 그 칸만 칠린다(화면 ovModFlags의 ablk) — 블록 세 칸을 다 칠하면 고칠 자리가 가려진다.
+    assert hit[0]["block"] == "y" and hit[0]["fields"] == ["prev"]
 
     # 연구소는 K$를 소수 한 자리까지 적어 보내고 우리 합계는 $ 원본이라, 제대로 옮겨 적어도
     # 수백 달러가 남는다. 그 반올림까지 걸리면 모든 계정이 "전실행 불일치"가 된다.
     rounded = {"sal": [10 * K + 37.31] * 12}          # 본사 합계 $120,447.72
-    ok = _detect({}, rounded, analysis={"sal": {"y": {"prev": 120.4 * K}, "m": {}}})
+    ok = _detect({}, analysis={"sal": {"y": {"prev": 120.4 * K}, "m": {}}}, abases={"prev": rounded})
     assert [f for f in ok if f["rule"] == "analysis_prev"] == []
+
+    # 비교 상대를 안 주면 그 대조는 아예 안 돈다 — 서버가 skipped로 밝힌다(여기서 지어내지 않는다).
+    assert [f for f in _detect({}, analysis={"sal": {"y": {"prev": 99 * K}, "m": {}}})
+            if f["rule"] == "analysis_prev"] == []
+
+
+def test_analysis_three_columns_are_checked_in_both_blocks():
+    """증감분석 세 열을 각자의 상대와 맞대본다 — PLAN은 경영계획, 전실행 열은 직전 버전,
+    당월 열은 **같은 파일로 온 비용 시트**다. 왼쪽 덩어리(연간)는 12개월 합, 오른쪽(당월)은
+    기준월 한 칸이 기준이다.
+
+    한 열·한 블록만 보면 PLAN을 지난 차수 값으로 적어 보내거나 당월 열이 비용 시트와 다른
+    파일도 "이상 없음"으로 통과한다 — 같은 파일 안에서 두 시트가 서로 다른 금액을 말하는데
+    어느 쪽을 저장해도 틀린 보고가 된다.
+    """
+    abases = {
+        "plan": {"sal": [10 * K] * 12},   # 경영계획: 연간 120K$ · 11월 10K$
+        "prev": {"sal": [20 * K] * 12},   # 전실행:   연간 240K$ · 11월 20K$
+        "cur": {"sal": [30 * K] * 12},    # 비용 시트: 연간 360K$ · 11월 30K$
+    }
+    good = {"sal": {
+        "y": {"plan": 120 * K, "prev": 240 * K, "cur": 360 * K},
+        "m": {"plan": 10 * K, "prev": 20 * K, "cur": 30 * K},
+    }}
+    assert [f for f in _detect({}, analysis=good, basis_month=11, abases=abases)
+            if f["rule"].startswith("analysis_") and f["rule"] != "analysis_missing"] == []
+
+    bad = {"sal": {
+        "y": {"plan": 111 * K, "prev": 240 * K, "cur": 999 * K},
+        "m": {"plan": 10 * K, "prev": 77 * K, "cur": 30 * K},
+    }}
+    hit = {(f["rule"], f["block"]): f for f in _detect({}, analysis=bad, basis_month=11, abases=abases)
+           if f["rule"] in ("analysis_plan", "analysis_prev", "analysis_cur")}
+    assert set(hit) == {("analysis_plan", "y"), ("analysis_cur", "y"), ("analysis_prev", "m")}
+    assert hit[("analysis_prev", "m")]["fields"] == ["prev"]
+    # 당월 블록 지적은 몇 월인지를 문장에 적는다 — "당월"로만 적으면 지난 파일을 다시 볼 때 못 읽는다.
+    assert "11월" in hit[("analysis_prev", "m")]["message"]
+
+
+def test_analysis_subtotal_rows_compare_against_their_leaves():
+    """소계·합계 행은 하위 계정 합과 맞대본다 — 본사는 소계를 저장하지 않는다(sum_mismatch와 같은
+    사정). 그냥 찾으면 전부 "본사에 없음"이 되어, 소계 행을 적어 보낸 파일이 통째로 걸렸다."""
+    leaves = {k: [1 * K] * 12 for k in resolve_leaves("lab")}
+    n = len(resolve_leaves("lab"))
+    ok = _detect({}, analysis={"lab": {"y": {"plan": n * 12 * K}, "m": {}}}, abases={"plan": leaves})
+    assert [f for f in ok if f["rule"] == "analysis_plan"] == []
+
+    bad = _detect({}, analysis={"lab": {"y": {"plan": 1 * K}, "m": {}}}, abases={"plan": leaves})
+    assert [f["rule"] for f in bad if f["rule"] == "analysis_plan"] == ["analysis_plan"]
+
+
+def test_analysis_plan_treats_a_missing_account_as_zero():
+    """경영계획에 없는 계정은 "0으로 편성한 것"이다 — 거기에 금액을 적어 보냈으면 불일치다.
+    전실행·비용 시트 열은 반대로 건너뛴다: 그 사실을 다른 기준이 이미 짚는다(전실행에 없던 값 ·
+    비용 카드의 "파일에 이 행이 없습니다")."""
+    a = {"travel": {"y": {"plan": 50 * K, "prev": 50 * K, "cur": 50 * K}, "m": {}}}
+    got = {f["rule"] for f in _detect({}, analysis=a, abases={"plan": {}, "prev": {}, "cur": {}})}
+    assert "analysis_plan" in got
+    assert "analysis_prev" not in got and "analysis_cur" not in got
 
 
 def test_analysis_current_block_blanks_are_reported():
@@ -343,3 +464,67 @@ def test_scan_reports_checks_it_skipped_for_missing_input(db):
     # "신규 계정"이 아니라 "전실행에 없던 값"이다 — 신규는 공통코드(사용 중)에 없는 이름으로 온
     # 행의 몫이고(화면 ovRowKey · row_alias), 이 기준은 계정은 있고 값이 새로 생긴 경우다.
     assert any("전실행에 없던 값" in s for s in r.skipped)
+
+
+def test_headcount_period_cells_are_checked_in_people_not_dollars():
+    """인력(명) 행의 분기 칸도 걸린다 — 금액 허용값($500)이 명수를 묻어 버리면 안 된다.
+
+    왜 필요한가: 인력을 월 100명씩 적고 1Q~4Q 칸에 100을 적어 보낸 파일이 **연간만** 이상값으로
+    뜨고 분기 넷은 조용히 통과했다(100 ≠ 300, 차이 200이 허용값 500 안). 같은 어긋남인데 칸에
+    따라 걸리고 안 걸리면 담당자는 분기 칸을 "맞는 값"으로 읽는다. 값은 파일에 적혀 온 그대로
+    보여 주고(화면이 그 값을 그린다) 어긋난 칸만 짚는 것이 이 검사의 몫이다.
+    """
+    hc = _detect({"hc": [100] * 12}, periods={"hc": [100, 100, 100, 100, 100]})
+    pm = [f for f in hc if f["rule"] == "period_mismatch"]
+    assert [f["month"] for f in pm] == [13, 14, 15, 16, 17], (
+        "분기 1Q~4Q(13~16)와 연간(17)이 모두 걸려야 한다: " + str([(f["month"], f["message"]) for f in pm])
+    )
+    assert "100명" in pm[0]["message"] and "$" not in pm[0]["message"], (
+        "명수를 금액으로 적으면(100명 → $0.1K) 경고를 읽을 수 없다: " + pm[0]["message"]
+    )
+
+    # 금액 행의 허용값은 그대로다 — 반올림 차이($0.4K)로 경고가 늘어나면 아무도 안 읽는다.
+    sal = _detect({"sal": [100 * K] * 12}, periods={"sal": [300 * K + 400, 300 * K, 300 * K, 300 * K, 1200 * K]})
+    assert not [f for f in sal if f["rule"] == "period_mismatch"]
+
+
+def test_empty_subtotal_row_is_not_a_sum_mismatch():
+    """연구소가 소계 행을 비워 보냈으면 합계 불일치가 아니다 — 빈칸은 0이 아니다.
+
+    왜 필요한가: 소계 칸이 전부 빈 파일에서 "파일의 합계 $0.0K ≠ 하위 항목 합 $6,000K"가 소계
+    행마다 떴다(개발비 · 인원성경비 · 자산성경비 … 9줄). 소계를 비워 보내는 건 정상이고 화면은
+    하위 합으로 계산해 그린다 — 틀린 값을 보낸 게 아닌데 "이상값"으로 칠하면, 담당자는 진짜
+    틀린 줄을 찾으려고 9줄을 하나씩 열어 보게 된다.
+    """
+    leaves = {"dep": [100 * K] * 12, "amort": [100 * K] * 12, "rent": [100 * K] * 12,
+              "repair": [100 * K] * 12, "ins": [100 * K] * 12}
+    blank = _detect(leaves, sums={"asset": [None] * 12})
+    assert not [f for f in blank if f["rule"] == "sum_mismatch"], (
+        "빈 소계 행을 0으로 읽고 합계 불일치를 올렸다: "
+        + str([f["message"] for f in blank if f["rule"] == "sum_mismatch"])
+    )
+
+    # 한 달이라도 적어 왔으면 그 값이 연구소의 보고다 — 그때는 그대로 검사한다.
+    partial = _detect(leaves, sums={"asset": [9 * K] + [None] * 11})
+    assert [f for f in partial if f["rule"] == "sum_mismatch"], "적어 온 소계는 검사해야 한다"
+
+
+def test_new_value_in_an_old_account_is_reported_once_as_a_jump():
+    """전실행에 0이던 계정에 값이 생기면 **급변 한 줄**이다 — 같은 사실을 두 번 올리지 않는다.
+
+    왜 필요한가: 두 지적은 등급이 달라서(급변=튀는 값 주황, 이쪽=빈칸 파랑) 한 행에 같이 붙으면
+    미리보기에서 주황 줄 + 파란 칸이 되고, 파란 칸의 범례("… 새 행")만 본 담당자는 **계정 매칭이
+    안 된 새 행**으로 읽는다 — 실제로는 그 계정에 제대로 붙은 행이다.
+    """
+    base = {"eda": [0] * 12}
+    big = _detect({"eda": [100 * K] * 12}, base)
+    rules = [f["rule"] for f in big]
+    assert "jump" in rules, "전실행 0 → $1,200K는 급변이다"
+    assert "new_category" not in rules, (
+        "급변이 이미 말한 것을 전실행에 없던 값이 또 올렸다: "
+        + str([f["message"] for f in big if f["rule"] == "new_category"])
+    )
+
+    # 급변의 금액 하한에 못 미치는 소액은 여전히 이쪽이 맡는다 — 숨기지는 않는다.
+    small = _detect({"eda": [1] * 12}, base)
+    assert [f["rule"] for f in small if f["rule"] in ("jump", "new_category")] == ["new_category"]

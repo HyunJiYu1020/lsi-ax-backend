@@ -29,7 +29,7 @@ OTHER_YM = "209510"  # 건드리면 안 되는 다른 달
 def labs(db):
     """실재하는 연구소 pk 두 개. 파트가 있는 연구소("SARC:CPU")도 그대로 받는지 같이 본다 —
     비용 시트는 증감사유·외주용역과 달리 파트 단위로 올라온다."""
-    pks = [lab.pk for lab in all_labs(db) if lab.pk != "_ETC"]
+    pks = [lab.pk for lab in all_labs(db)]
     if len(pks) < 2:
         pytest.skip("연구소 기준정보가 2개 미만이라 스킵합니다")
     return pks[0], pks[1]

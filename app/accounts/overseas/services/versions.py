@@ -55,7 +55,7 @@ def check_kind(kind: str) -> str:
 
 # ---------- 비교 기준 해석 ----------
 # "그 버전에 데이터가 있나"는 **계산이 실제로 읽는 집합**으로 판정한다(entries.has_summable_rows ·
-# filled_cost_yyyymm). 행이 하나라도 있으면 있다고 보면, 원화 기타(_ETC) 빈 줄 하나만 들어간 달이
+# filled_cost_yyyymm). 행이 하나라도 있으면 있다고 보면, 값이 없는 줄 하나만 들어간 달이
 # "속보가 있는 달"로 집힌다 — 그 달로 화면이 열리고 증감분석은 "데이터가 없다"로 404를 낸다.
 def has_cost_data(db: Session, version: str, yyyymm: str) -> bool:
     return has_summable_rows(db, version, yyyymm)
@@ -310,7 +310,7 @@ def active_labs(db: Session, basis_year: int, basis_month: int) -> dict[str, Lab
     """계산에 넣을 연구소 pk → 기준정보. 기준정보는 "그 버전 시점" 값으로 읽는다 — 통화를 지금
     값으로 보면 지난달에 보고한 환차 분해가 소급해서 달라진다(공통 RULE).
 
-    합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 뺀다 — 넣으면
+    합계 행(part_code="TOTAL")은 다른 행을 더해 만든 값이라 뺀다 — 넣으면
     SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다."""
     return {
         lab.pk: lab
@@ -356,10 +356,9 @@ class TableInputs:
     label: str                # "26.09 속보" 같은 사람이 읽는 이름
     api_version: str          # 추가 행·환율을 읽을 슬롯(forecast | actual)
     extras_yyyymm: str        # 그 슬롯의 연월("YYYYMM")
-    labs: dict                # 계산에 넣을 연구소 pk → 기준정보(합계행·원화기타 제외)
+    labs: dict                # 계산에 넣을 연구소 pk → 기준정보(합계 시트 제외)
     pks: list                 # labs의 키를 정렬한 목록
     d: dict                   # 연구소 pk → 비용항목 → 12개월($)
-    etc: list                 # 원화 기타(_ETC) 12개월(억원) — 금액이 아니라 원화라 d에서 뗀다
     extras: dict              # 추가 행 — 연구소 pk → 얹힐 계정 키 → 12개월($)
     extra_rows: list          # 추가 행 원본(파생 행 포함) — 파생 열 계산이 행 단위로 다시 본다
     rate: list | None         # 원/$ 12개월. with_rate=False면 None(달러 표만 그릴 때)
@@ -425,15 +424,12 @@ def table_inputs(
     extra_rows = read_extra_rows(db, yyyymm=extras_yyyymm, version=api_version)
     extras = extra_row_months(extra_rows)
 
-    # 원화 기타(_ETC)는 active_labs가 빼 놓은 pk라 따로 달아서 읽고, 바로 d에서 떼어낸다 —
-    # d는 "연구소별 $"라는 뜻을 유지해야 한다(단위가 섞이면 합계가 조용히 틀린다).
-    d = load_basis(db, spec, set(pks) | {"_ETC"})
-    etc = list((d.pop("_ETC", {}) or {}).get("etc") or [0.0] * 12)
+    d = load_basis(db, spec, set(pks))
 
     rate = rate_arrays(db, fx_year, fx_month, api_version, set(), tuple(range(12)))["USD"] if with_rate else None
 
     return TableInputs(
         basis_year=basis_year, basis_month=month, kind=spec_kind, plan_no=spec[3], label=label,
         api_version=api_version, extras_yyyymm=extras_yyyymm,
-        labs=labs, pks=pks, d=d, etc=etc, extras=extras, extra_rows=extra_rows, rate=rate,
+        labs=labs, pks=pks, d=d, extras=extras, extra_rows=extra_rows, rate=rate,
     )

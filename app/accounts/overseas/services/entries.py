@@ -139,7 +139,7 @@ def bulk_upsert_cost_entries(
     periods는 (scope_code, version, category_code, yyyymm) -> [1Q,2Q,3Q,4Q,연간]이다. 연구소가 파일에
     적어 보낸 분기·연간 칸을 **그대로** 저장한다. 안 주면(None) 그 칸은 **저장하지 않는다** — 월에서
     계산해 만들어 두지 않는다(머리 주석). 보는 쪽이 저장된 칸이 있으면 그 값을, 없으면 월에서 계산한
-    값을 그린다.
+    값을 그린다. rows에 없는 계정(= 월값이 없는 소계 계정)이 와도 받는다 — 아래 header_keys를 볼 것.
 
     clear_blanks는 **빈칸의 뜻**을 고른다. 기본(False)은 "그 달은 건드리지 마라"(부분 갱신)이고,
     True는 "그 달은 아직 안 냈다"라서 저장된 상세 행을 지운다. 파일 업로드가 True를 쓴다 — 연구소가
@@ -149,7 +149,12 @@ def bulk_upsert_cost_entries(
         (scope_code, version, category_code, yyyymm): months
         for scope_code, version, category_code, yyyymm, months in rows
     }
-    if not dedup:
+    # 월값 없이 분기·연간만 오는 자리가 있다: 소계 계정(인건비·개발비(A)…)이다. 그 줄의 월 12칸은
+    # 하위 합으로 계산하므로 rows에 안 들어오지만, 연구소가 **그 줄의 1Q~4Q·연간 칸에 적어 보낸
+    # 숫자**는 그대로 보여줘야 한다(리프 계정과 같은 규칙). 헤더를 같이 만들어 두지 않으면 아래
+    # id_by_key에서 못 찾아 그 값이 조용히 사라진다 — 미리보기에는 보이는데 반영하면 없어진다.
+    header_keys = list(dedup) + [k for k in (periods or {}) if k not in dedup]
+    if not header_keys:
         return
 
     header_stmt = pg_insert(CostEntry).values(
@@ -158,7 +163,7 @@ def bulk_upsert_cost_entries(
                 "yyyymm": yyyymm, "account_code": ACCOUNT_KEY, "scope_code": scope_code,
                 "version": version, "category_code": category_code,
             }
-            for scope_code, version, category_code, yyyymm in dedup
+            for scope_code, version, category_code, yyyymm in header_keys
         ]
     )
     header_stmt = header_stmt.on_conflict_do_update(
@@ -352,7 +357,7 @@ def filled_cost_yyyymm(
     """그 버전에서 **합산 대상 연구소 데이터가 실제로 들어 있는** 가장 늦은 편성 연월. 없으면 빈 문자열.
 
     왜 max(yyyymm)이 아닌가 (2026-11-23): 그냥 최댓값을 집으면 연구소 행이 하나도 없는 달도 "그
-    버전이 있는 달"로 집힌다. 실제로 11월 속보에 원화 기타(_ETC) 빈 줄 하나만 들어간 적이 있는데,
+    버전이 있는 달"로 집힌다. 실제로 11월 속보에 값이 없는 줄 하나만 들어간 적이 있는데,
     그것 때문에 편성 기준월이 11월로 밀려서 화면이 11월로 열리고 증감분석은 "26.11 속보 데이터가
     없다"로 404가 났다 — 같은 달을 두고 한쪽은 "있다", 계산은 "없다"고 답한 것이다.
 

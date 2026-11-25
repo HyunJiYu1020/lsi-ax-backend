@@ -134,7 +134,10 @@ def extra_row_months(rows) -> dict[str, dict[str, list[float]]]:
     return out
 
 def krw_months(
-    cats: dict[str, list[float | None]], extra: dict[str, list[float]], tree: set[str], rate: list[float]
+    cats: dict[str, list[float | None]],
+    extra: dict[str, list[float]],
+    tree: set[str],
+    rate: list[float],
 ) -> list[float]:
     """그 연구소의 월별 원화 금액. 저장값이 $라 (원/$)만 곱하면 원화가 된다.
 
@@ -449,8 +452,10 @@ def lab_tables(
 
     # ── 표 한 장의 행을 만드는 세 가지 ─────────────────────────
     # 같은 모양을 보정본(①)과 PL본(②③) 두 번 쓴다 — 다른 건 CP 줄에 넣는 금액(cp 인자)뿐이다.
-    # 달러 표에만 "인당 개발비"와 SARC 하위 파트(CPU · GPU) 줄이 있는 건 화면이 그렇게 그려 온
-    # 구성이다(원화 표는 연구소 합계까지만 본다).
+    # 달러 표에만 "인당 개발비" 줄이 있다 — 금액이 아니라 $/명이라 원화로 바꿀 대상이 아니다.
+    # 파트 하위 줄(SARC의 CPU · GPU)은 달러 · 원화 양쪽에 다 넣는다: 같은 항목에서 단위만 바꿨을
+    # 때 줄이 늘었다 줄었다 하면 두 표를 나란히 읽을 수 없다(인건비 t5 · 인건비외 t6 원화 표와
+    # 같은 구성).
 
     def dev_rows(fmt, r, cp):
         """개발비(매출) 표 — 맨 윗줄이 그 표의 개발비(매출)이고, 그 아래 "개발비(A,CP제외)"는
@@ -472,9 +477,11 @@ def lab_tables(
                 _lab_label(g, cp_quarterly=cp is not None, apjt=usd),
                 col(g.pks, tot, r, cp), fmt, key=g.code,
             ))
-            if usd:
-                # 하위 줄은 보정을 넣지 않는다(CP가 아니라 파트 분해라 분기 정산과 무관하다).
-                rows += [_row(lb, col([pk], tot, r), fmt, 2, muted=True, key=pk) for pk, lb in g.parts]
+            # 하위 줄은 보정을 넣지 않는다(CP가 아니라 파트 분해라 분기 정산과 무관하다).
+            rows += [
+                _row(lb, col([pk], tot, r), fmt, 2, muted=True, key=pk)
+                for pk, lb in g.parts
+            ]
         return rows
 
     def labor_rows(fmt, r, cp, *, country=False, ex_label=None, parts=False, head=None):

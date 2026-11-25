@@ -135,13 +135,10 @@ def _slot_entries(db: Session, spec, lab_pks, custom_keys, slot) -> None:
     periods_by_id = _entry_periods_bulk(db, entries) if kind != "plan" else {}
     for e in entries:
         months = months_by_id[e.id]
-        if e.scope_code == "_ETC":
-            slot.etc = months
-        else:
-            slot.d.setdefault(e.scope_code, {})[e.category_code] = months
-            cells = periods_by_id.get(e.id)
-            if cells:
-                slot.per.setdefault(e.scope_code, {})[e.category_code] = cells
+        slot.d.setdefault(e.scope_code, {})[e.category_code] = months
+        cells = periods_by_id.get(e.id)
+        if cells:
+            slot.per.setdefault(e.scope_code, {})[e.category_code] = cells
 
 
 def build_state(
@@ -159,7 +156,7 @@ def build_state(
     progress = db.scalar(select(AccountProgress).where(AccountProgress.account_id == acct.id))
     step = progress.current_step_order if progress else 1
 
-    V: dict[str, VersionData] = {v: VersionData(d={}, etc=[0.0] * 12) for v in ("cur", "prev", "prior", "plan")}
+    V: dict[str, VersionData] = {v: VersionData(d={}) for v in ("cur", "prev", "prior", "plan")}
     # 기준월은 **호출하는 쪽이 정한다** — 보낸 월이 있으면 그 달을 그대로 쓴다. 그 달에 행이 하나도
     # 없어도 DB에 들어 있는 다른 달로 대체하지 않는다: 그게 이 함수가 유일하게 남아 있던 "월을
     # 짐작하는 자리"였고, 화면은 그 짐작 때문에 아직 아무것도 안 올린 달을 열어도 직전 달 데이터를
@@ -234,7 +231,7 @@ def build_state(
     if actual_rows:
         latest_yyyymm = max(e.yyyymm for e in actual_rows)
         athru = ym_month(latest_yyyymm)
-        snap = ActualSnapshot(thru_month=athru, d={}, etc=[0.0] * 12)
+        snap = ActualSnapshot(thru_month=athru, d={})
         latest_actual_entries = [
             entry
             for entry in actual_rows
@@ -246,10 +243,7 @@ def build_state(
         for entry in latest_actual_entries:
             pk = entry.scope_code
             months = latest_actual_months[entry.id]
-            if pk == "_ETC":
-                snap.etc = months
-            else:
-                snap.d.setdefault(pk, {})[entry.category_code] = months
+            snap.d.setdefault(pk, {})[entry.category_code] = months
                 # 이 스냅샷은 "올해 어디까지 실적으로 마감됐나"(thru_month)를 화면에 알려주는 값이다.
                 # 전실행(V["prev"])은 여기서 정하지 않는다 — 위에서 resolve_bases가 버전 순서대로 푼다.
         actualV["cur"] = snap
@@ -507,18 +501,10 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
             for pk, cats in (state.cost_periods or {}).items():
                 for category_key, cells in cats.items():
                     cost_periods[(pk, "forecast", category_key, forecast_yyyymm)] = cells
-            # 원화 기타(_ETC)는 연구소 금액이 하나도 없으면 쓰지 않는다. _ETC는 합산 대상이 아닌
-            # 가상 행이라, 이 줄만 들어간 달은 "속보가 있지만 계산할 연구소 데이터는 0개"인 달이
-            # 되고, 화면은 그 달로 열리는데 증감분석은 404를 낸다. 기준월 판정
-            # (entries.filled_cost_yyyymm)과 함께 빈 줄을 만들지 않는 쪽도 막는다.
-            if "_ETC" in lab_pks and (vd.d or any(vd.etc)):
-                cost_rows.append(("_ETC", "forecast", "etc", forecast_yyyymm, vd.etc))
         elif version == "plan":
             for pk, cats in vd.d.items():
                 for category_key, months in cats.items():
                     plan_rows.append((pk, category_key, state.basis_year, months))
-            if "_ETC" in lab_pks:
-                plan_rows.append(("_ETC", "etc", state.basis_year, vd.etc))
     # 화면 상태 전체를 받는 경로라 보낸 배열이 그 칸의 전부다 — 빈칸(None)은 "미제출"이라는
     # 보고이므로 저장된 행을 지운다(연구소가 칸을 비워 다시 보낸 경우가 이것이다).
     bulk_upsert_cost_entries(db, cost_rows, clear_blanks=True, periods=cost_periods)
@@ -549,8 +535,6 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
         for pk, cats in snap.d.items():
             for category_key, months in cats.items():
                 actual_cost_rows.append((pk, "actual", category_key, actual_yyyymm, months))
-        if "_ETC" in lab_pks:
-            actual_cost_rows.append(("_ETC", "actual", "etc", actual_yyyymm, snap.etc))
     bulk_upsert_cost_entries(db, actual_cost_rows)
 
     # 2) 업로드 이력 — 자리(cur·prev…)가 아니라 **기준월**로 적는다. 자리는 보는 달에 따라 달라지는

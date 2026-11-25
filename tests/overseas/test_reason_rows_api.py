@@ -38,7 +38,7 @@ VER = "forecast"   # version은 cost_entries와 같은 값만 받는다(forecast
 
 @pytest.fixture
 def lab_code(db) -> str:
-    codes = sorted({lab.lab_code for lab in all_labs(db)} - {"_ETC"})
+    codes = sorted({lab.lab_code for lab in all_labs(db)})
     if not codes:
         pytest.skip("연구소가 없다")
     return codes[0]

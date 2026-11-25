@@ -114,6 +114,34 @@ def test_a_later_save_does_not_overwrite_reported_periods(db):
     assert _details(db, "YEAR") == {0: 1234.0}
 
 
+def test_a_subtotal_rows_reported_periods_are_stored_even_without_months(db):
+    """소계 계정(인건비)의 분기·연간도 그대로 저장한다 — 월값이 없다고 버리지 않는다.
+
+    소계 줄의 월 12칸은 하위 합으로 계산하는 자리라 월값이 아예 안 올라온다(rows에 없다).
+    그렇다고 헤더를 안 만들면 분기 칸이 조용히 사라진다 — 업로드 미리보기에는 연구소가 적어 보낸
+    777이 떴는데 [반영]을 누르면 월 합으로 바뀌어, 담당자 입장에서는 화면이 숫자를 고친 것으로
+    보인다. 저장은 하되 월값을 만들어 주지는 않는다(그 줄은 계속 하위 합으로 그린다)."""
+    bulk_upsert_cost_entries(
+        db,
+        [(PK, "forecast", CAT, YYYYMM, [1.0] * 12)],
+        periods={(PK, "forecast", "labor", YYYYMM): [777.0, None, None, None, None]},
+    )
+    db.flush()
+
+    assert _details(db, "QUARTER", "labor") == {1: 777.0}, "소계 행의 분기값이 저장되지 않았다"
+    assert _details(db, "MONTH", "labor") == {}, "소계 행의 월값을 만들어 저장했다"
+
+
+def test_periods_alone_are_enough_to_save(db):
+    """월값 없이 분기·연간만 와도 저장한다 — 소계 줄만 담긴 호출이 그 모양이다."""
+    bulk_upsert_cost_entries(
+        db, [], periods={(PK, "forecast", "labor", YYYYMM): [None, None, None, None, 888.0]}
+    )
+    db.flush()
+
+    assert _details(db, "YEAR", "labor") == {0: 888.0}
+
+
 def test_headcount_is_not_summed_into_quarters(db):
     """인력(명)도 분기·연간을 만들지 않는다 — 전에는 월 합으로 저장해서 분기가 3배가 됐다."""
     bulk_upsert_cost_entries(db, [(PK, "forecast", HC, YYYYMM, [65.0] * 12)])

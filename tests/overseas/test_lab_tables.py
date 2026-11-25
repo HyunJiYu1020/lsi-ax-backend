@@ -110,12 +110,13 @@ def test_usd_labor_table_has_no_excluded_row(backend):
 
 
 def test_only_some_tables_show_lab_parts(backend):
-    """개발비 달러 표와 ① 인건비 · 인건비외 표만 SARC 하위 파트(CPU · GPU) 줄을 그린다 —
-    ③ 인건비(CP_PL)는 연구소 합계까지만 보여준다(화면이 그렇게 그려 온 구성이다)."""
+    """①② 개발비 · ① 인건비 · 인건비외 표는 달러 · 원화 양쪽에서 SARC 하위 파트(CPU · GPU)
+    줄을 그린다 — 단위만 바꿨을 때 줄이 늘었다 줄었다 하면 두 표를 나란히 읽을 수 없다.
+    ③ 인건비(CP_PL)만 연구소 합계까지 보여준다(화면이 그렇게 그려 온 구성이다)."""
     def has_parts(key):
         return any(r["label"] in ("CPU", "GPU (ACL)") for r in backend[key]["rows"])
 
-    for key in ("t2u", "t7u", "t5", "t5u", "t6", "t6u"):
+    for key in ("t2u", "t2k", "t7u", "t7k", "t5", "t5u", "t6", "t6u"):
         assert has_parts(key), f"{key}: 파트 줄이 없다"
     assert not has_parts("t3"), "③ 달러 표에 파트 줄이 들어 있다"
     assert not has_parts("t4"), "③ 원화 표에 파트 줄이 들어 있다"
@@ -276,3 +277,35 @@ def test_lab_part_rows_are_keyed_by_pk(backend):
     parts = [r for r in backend["t2u"]["rows"] if r["level"] == 2]
     assert parts, "하위 파트 줄이 없다(② 표에는 있어야 한다)"
     assert all(":" in r["key"] for r in parts), [r["key"] for r in parts]
+
+
+# ---------- 소계는 예외 없이 하위 합이다 ----------
+# 개발비(매출)도 소계(A + MARK UP)라 연구소가 그 줄에 적어 보낸 값이 있어도 쓰지 않는다 —
+# 소계가 어떤 줄은 계산값이고 어떤 줄은 보고값이면 표 안에서 규칙이 둘이 되고, 하위에 행을
+# 더했을 때 올라가는 줄과 안 올라가는 줄이 갈린다. 어긋남은 업로드 검증("합계 불일치")이 알린다.
+
+D_REPORTED = {**D, "SARC:CPU": {**D["SARC:CPU"], "tot": [20.0] * 12}}
+
+
+@pytest.fixture(scope="module")
+def reported() -> dict:
+    return lab_tables(GROUPS, D_REPORTED, {}, RATE, CP_QUARTER)
+
+
+def _val(tables, key, label, i=0):
+    return next(r["values"][i] for r in tables[key]["rows"] if r["label"] == label)
+
+
+def test_a_reported_subtotal_is_ignored_in_favour_of_the_sum(reported, backend):
+    """연구소가 적어 보낸 개발비(매출)(20)이 아니라 하위 합(sal 10 + B 2 = 12)이 나온다."""
+    assert _val(backend, "t2u", "CPU") == 12.0
+    assert _val(reported, "t2u", "CPU") == 12.0, "저장된 소계 값이 하위 합을 덮었다"
+
+
+def test_every_dev_total_row_is_the_sum_of_what_is_under_it(backend):
+    """맨 윗줄 = 연구소 줄 합, 연구소 줄 = 파트 줄 합 — 표가 위아래로 맞아떨어진다."""
+    labs = [r for r in backend["t2u"]["rows"] if r["level"] == 1 and r["key"]]
+    head = _val(backend, "t2u", "개발비(매출), K$")
+    assert head == pytest.approx(sum(r["values"][0] or 0 for r in labs))
+    sarc = _val(backend, "t2u", "SARC+ACL")
+    assert sarc == pytest.approx(_val(backend, "t2u", "CPU") + _val(backend, "t2u", "GPU (ACL)"))

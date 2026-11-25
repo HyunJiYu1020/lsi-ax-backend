@@ -15,7 +15,7 @@ from app.shared.models.account import Account, AccountProgress, AccountStep
 from app.shared.models.reference import RefCostElement, RefDeptCode
 from app.shared.models.system import CommonCode, CommonCodeGroup
 
-# 해외연구소 파트 14개 + 가상 행 _ETC (pk, lab_code, part_code, name, country, sort_order, currency)
+# 해외연구소 파트 14개 (pk, lab_code, part_code, name, country, sort_order, currency)
 # — 프론트 OV_LABS와 동일.
 # sort_order는 lab_code 단위 표시 순서(같은 lab_code의 파트들은 같은 값) — 탭·집계표가 이 순서로 나온다.
 #
@@ -44,9 +44,6 @@ OVERSEAS_LABS: list[tuple[str, str, str | None, str, str, int, str]] = [
     ("SRR", "SRR", None, "SRR", "러시아", 100, "RUB"),
     ("CP", "CP", None, "CP", "이스라엘", 110, "ILS"),
     ("SRCX", "SRCX", None, "SRCX", "중국", 120, "CNY"),
-    # 실제 연구소가 아니라 "원화 기타"처럼 특정 연구소에 속하지 않는 계정 전체 단위 값을
-    # 담기 위한 가상 행. cost_entries 등 공용 테이블의 scope_code를 그대로 재사용하기 위함.
-    ("_ETC", "_ETC", None, "(계정 공통) 원화 기타", "-", 999, "USD"),
 ]
 
 # 연구소(lab_code)별 워크북 시트 구성 — 12개 연구소가 모두 비용·증감분석·외주용역업체 3장을

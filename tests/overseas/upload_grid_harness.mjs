@@ -127,6 +127,11 @@ await page.route('**/api/v1/**', async (route) => {
   }
   if (req.method() === 'GET' || url.includes('anomaly-scan')) return route.continue();
   out.writes.push(req.method() + ' ' + url.replace(API, ''));
+  // 저장 본문도 같이 들고 간다 — "무엇을 저장하러 갔나"를 봐야 하는 테스트가 있다(개발비(매출)은
+  // 연구소가 적어 보낸 값이라 그 줄이 본문에 실려 가야 한다). 주소만 기록하면 그걸 못 본다.
+  if (/\/overseas\/state/.test(url)) {
+    try { out.saved = JSON.parse(req.postData() || 'null'); } catch (e) { out.saved = null; }
+  }
   await route.fulfill({
     status: 200, contentType: 'application/json',
     body: JSON.stringify({ ok: true, state_token: 'harness-token' }),
@@ -146,6 +151,13 @@ try {
   // ---------- 반영 전: 그리드는 비어 있어야 한다 ----------
   // "미리보기에서 걸러진다"는 말은 **반영을 누르기 전에는 화면 값이 바뀌지 않는다**는 뜻도 된다.
   out.before = await page.evaluate(SCRAPE, '.panel table.ovt');
+  // 아직 아무 값도 안 올라온 자리는 표를 **아예 그리지 않고** 빈 안내만 띄운다(ovCostView) —
+  // 17열이 전부 '–'인 표는 "0으로 채워진 실제 값"으로 읽히기 때문이다. 그래서 before가 null일
+  // 수 있고, 그때 화면이 무슨 말을 하고 있는지를 같이 들고 간다.
+  out.beforeEmpty = await page.evaluate(() => {
+    const e = document.querySelector('.panel .empty');
+    return e ? e.textContent.replace(/\s+/g, ' ').trim() : '';
+  });
 
   // ---------- ① 파일 선택 (사람이 하는 그대로) ----------
   await page.setInputFiles('#ovFile', FILE);

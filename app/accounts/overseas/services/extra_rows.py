@@ -68,7 +68,7 @@ def months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> d
     if lab_pk != ALL_SCOPE:
         stmt = stmt.where(CostEntry.scope_code == lab_pk)
     else:
-        # 전체 합산에서는 합계 시트(SARC:TOTAL)와 원화 기타(_ETC)를 뺀다 — 안 빼면 SARC가
+        # 전체 합산에서는 합계 시트(SARC:TOTAL)를 뺀다 — 안 빼면 SARC가
         # CPU+GPU+TOTAL로 두 번 세어져, 재료가 그 연구소만큼 부풀고 합계·차이 파생 행이 그대로
         # 틀린다(집계표는 전부터 빼고 있어서 같은 급여 행인데 표와 파생 행 숫자가 달랐다).
         # 빼는 판정은 집계표와 같은 한 곳에서 온다(labs.is_summable).

@@ -113,7 +113,7 @@ def test_열두_달을_모두_월로_읽고_머리글을_그대로_들고_온다
 def test_프런트가_읽은_머리글을_서버가_그대로_저장한다(db):
     """프런트의 열 자리 키를 서버가 받아주는가 — 거절하면 머리글이 화면에서 조용히 사라진다."""
     hdr = run_js(HEADER_STYLES["꾸밈말 붙은 한글"])
-    lab = next(lab.pk for lab in all_labs(db) if lab.pk != "_ETC")
+    lab = next(lab.pk for lab in all_labs(db))
     out = upsert_cost_headers(
         CostHeaderIn(
             lab_pk=lab, version="forecast", yyyymm=YM, labels=hdr, source_file="해외연구소_SIRC_M2509.xlsx"

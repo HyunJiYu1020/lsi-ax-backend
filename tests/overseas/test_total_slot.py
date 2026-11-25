@@ -47,7 +47,6 @@ def test_active_labs_excludes_total(db, total_pks):
 
     for pk in total_pks:
         assert pk not in labs, f"{pk}가 집계 대상에 들어 있다 — SARC 금액이 두 배가 된다"
-    assert "_ETC" not in labs, "원화 기타(_ETC)도 다른 행을 더해 만든 값이라 빠져야 한다"
     assert labs, "집계 대상이 비었다 — 필터가 과하게 걸렸다"
 
 

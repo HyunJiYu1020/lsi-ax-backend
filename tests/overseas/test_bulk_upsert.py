@@ -17,6 +17,9 @@ from app.accounts.overseas.schemas import ReasonRow
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연월/연도를 키로 써서 테스트한다.
 TEST_YM = "209901"
+# 중복 키 테스트용 자리 — 실제 연구소 pk를 쓴다(쓰지 않는 가상 scope를 쓰면,
+# 그 가상 행이 없어졌을 때 테스트가 "무엇을 덮어쓰는지" 모르는 채로 통과한다).
+TEST_SCOPE = "SARC:CPU"
 TEST_YEAR = 2099
 TEST_PLAN_NO = "P01"
 
@@ -56,8 +59,8 @@ def test_bulk_upsert_cost_entries_inserts_header_and_details(db):
 def test_bulk_upsert_cost_entries_dedup_last_wins(db):
     """같은 (scope,version,category,yyyymm) 키가 두 번 들어오면 마지막 값이 이겨야 한다."""
     rows = [
-        ("_ETC", "forecast", "etc", TEST_YM, [0.0] * 12),
-        ("_ETC", "forecast", "etc", TEST_YM, [999.0] * 12),
+        (TEST_SCOPE, "forecast", "misc", TEST_YM, [0.0] * 12),
+        (TEST_SCOPE, "forecast", "misc", TEST_YM, [999.0] * 12),
     ]
     bulk_upsert_cost_entries(db, rows)
     db.flush()
@@ -65,7 +68,7 @@ def test_bulk_upsert_cost_entries_dedup_last_wins(db):
     entry = db.scalar(
         select(CostEntry).where(
             CostEntry.account_code == ACCOUNT_KEY,
-            CostEntry.scope_code == "_ETC",
+            CostEntry.scope_code == TEST_SCOPE,
             CostEntry.yyyymm == TEST_YM,
             CostEntry.version == "forecast",
         )

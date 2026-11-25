@@ -150,7 +150,7 @@ def check_overseas_confirm(
     labs = [
         lab
         for lab in lab_views(db, f"{basis_year:04d}-{month:02d}")
-        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+        if lab.is_active and (lab.part_code or "").upper() != "TOTAL"
     ]
     uploaded_pks = _uploaded_lab_pks(db, ym, version)
     by_code: dict[str, list] = {}
@@ -254,7 +254,7 @@ def get_labor_ratio(
     labs = [
         lab
         for lab in lab_views(db, f"{rate_year:04d}-{rate_month:02d}")
-        if lab.is_active and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+        if lab.is_active and (lab.part_code or "").upper() != "TOTAL"
     ]
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
     cp_total_q, cp_labor_q = cp_quarter_amounts(db, basis_year, f"{basis_year:04d}-{basis_month:02d}")

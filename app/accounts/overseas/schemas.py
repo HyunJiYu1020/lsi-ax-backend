@@ -18,7 +18,6 @@ class VersionData(BaseModel):
     (공통 RULE: 빈칸 처리). PUT으로 None을 보내면 그 달은 저장하지 않고 미등록으로 둔다."""
 
     d: dict[str, dict[str, list[float | None]]]  # pk -> category_key -> [12 months]
-    etc: list[float | None]  # 원화 기타, 12개월
     # 저장돼 있는 1Q~4Q · 연간 다섯 칸. pk -> category_key -> [q1,q2,q3,q4,year]. **읽기 전용**이다 —
     # 화면이 그대로 그리라고 내려주는 값이고, 여기로 다시 받지는 않는다(쓰기는 cost_periods).
     per: dict[str, dict[str, list[float | None]]] = {}
@@ -30,7 +29,6 @@ class ActualSnapshot(BaseModel):
 
     thru_month: int
     d: dict[str, dict[str, list[float | None]]]  # None = 미등록 (VersionData 주석 참고)
-    etc: list[float | None]
 
 
 class ReasonRow(BaseModel):
@@ -537,14 +535,13 @@ class OverseasSummary(BaseModel):
     version_label: str = ""
     step: int  # 0-based 화면 단계 인덱스 (0 취합 · 1 집계 · 2 증감분석)
     step_count: int
-    total: float  # 개발비(매출) = 연구소 합계 + 원화 기타 (원)
-    etc_total: float  # 그중 원화 기타 (원)
+    total: float  # 개발비(매출) = 연구소 합계 (원)
     labor: float  # 인건비 (원, CP 분기 정산 반영)
     non_labor: float  # 인건비외 (원, CP 분기 정산 반영)
     labor_pct: float
     non_labor_pct: float
     uploaded: int  # 데이터가 올라온 연구소 수
-    lab_count: int  # 전체 연구소 수 (원화 기타 제외)
+    lab_count: int  # 전체 연구소 수
     labs: list[OverseasSummaryLab]
     # 위 금액이 "연구소 전체 합계"가 아니라 "올라온 것만 더한 합계"라는 걸 말로 적은 것. 화면
     # 히어로 카드의 "12개 중 n개 기준" 문구와 같은 내용이다 — 챗봇이 이 총액을 전체 합계라고
@@ -1559,6 +1556,11 @@ class AnomalyScanIn(BaseModel):
     # 증감분석 시트 값(계정 키 → {"y": 연간 블록, "m": 당월 블록} → {plan, prev, cur}).
     # 업로드 파싱 결과(core.js ovParseRsn)와 같은 모양으로 받는다 — 옮겨 적으면 어긋난다.
     analysis: dict[str, dict[str, dict[str, float | None]]] | None = None
+    # **같은 파일로 온 비용 시트**의 월별 값(계정 키 → 12개월). 증감분석 당월 열 대조에만 쓴다 —
+    # 반영 전이라 비용 값은 아직 DB에 없고, 보려는 것도 "한 파일 안에서 두 시트가 같은 말을 하는가"다.
+    # 파트가 나뉜 연구소(SARC)는 증감분석이 연구소 전체 기준이라 파트를 합쳐서 보낸다(TOTAL 제외).
+    # 안 보내면 그 대조를 건너뛴다.
+    cost_vals: dict[str, list[float | None]] | None = None
     # 파일에 **실제로 있던** 기간 열의 자리 키("m1".."m12" · "q1".."q4" · "y").
     # 열 누락 검사가 이걸 양식과 대조한다 — overseas_cost_headers.col_key와 같은 키 규칙이고,
     # 화면은 업로드 파싱이 읽어 둔 머리글(core.js ovParse의 hdr)의 키를 그대로 보낸다.

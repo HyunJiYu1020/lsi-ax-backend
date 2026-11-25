@@ -60,18 +60,17 @@ def test_memo_rows_are_marked(db):
     assert memo == {"itx", "eda", "emu", "swl", "svr", "itoth", "outs"}
 
 
-def test_total_rows_and_etc_are_excluded_from_the_sum(db):
-    """SARC의 'TOTAL' 파트와 원화 기타(_ETC)는 합계에서 빠진다 —
+def test_total_rows_are_excluded_from_the_sum(db):
+    """SARC의 'TOTAL' 파트는 합계에서 빠진다 —
     넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 두 배가 된다."""
     t = get_aggregate_table(basis_year=BASIS_YEAR, mode="usd", db=db)
     labs = lab_views(db)
     n_counted = len([
         l for l in labs
-        if l.is_active and l.pk != "_ETC" and (l.part_code or "").upper() != "TOTAL"
+        if l.is_active and (l.part_code or "").upper() != "TOTAL"
     ])
 
     assert f"연구소 {n_counted}곳" in t.caption
-    assert "_ETC" not in t.caption
 
 
 def test_caption_and_note_explain_the_table(db):

@@ -58,7 +58,7 @@ def _labs_by_currency(db) -> dict[str, list[str]]:
     month = current_basis_month(db) or 1
     out: dict[str, list[str]] = {}
     for lab in lab_views(db, f"2026-{month:02d}"):
-        if not lab.is_active or lab.pk == "_ETC":
+        if not lab.is_active:
             continue
         cur = (lab.currency or "USD").upper()
         if lab.lab_code not in out.setdefault(cur, []):

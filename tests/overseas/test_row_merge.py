@@ -106,6 +106,13 @@ def test_quarter_and_year_are_left_alone(db, ym):
     되면 업로드 미리보기가 period_mismatch로 색칠해 알리고, 사람이 다시 올려서 고친다."""
     _add(db, ym, "ux_other_t", "Other", 1.0)
     target = _entry(db, ym, "misc")
+    if target is None:
+        # 이 테스트만 **이미 저장된** 기타경비 행의 분기·연간 상세를 읽는다 — 합친 뒤에도 그 칸이
+        # 그대로인지가 확인할 거리다. 그래서 그 연구소가 지금 편성 기준월에 올려 둔 데이터가
+        # 있어야 한다(_add로 만드는 추가 행은 category_code가 row_key라 기타경비 행이 아니다).
+        # 기준월은 "속보 데이터가 들어 있는 가장 늦은 달"이라 다른 연구소가 다음 달을 올리는
+        # 순간 넘어간다 — 없는 걸 AttributeError로 터뜨리지 않고 이유를 적고 건너뛴다.
+        pytest.skip(f"{PK}의 {ym} 속보에 기타경비(misc) 행이 없어 스킵 — 분기·연간 상세를 읽을 자리가 없다")
     read = lambda: {
         (r.period_type, r.year, r.period): float(r.amount)
         for r in db.scalars(

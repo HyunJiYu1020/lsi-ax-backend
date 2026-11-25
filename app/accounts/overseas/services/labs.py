@@ -110,11 +110,11 @@ def lab_views(db: Session, as_of: str | None = None) -> list[LabView]:
 
 
 def is_summable(lab: LabView) -> bool:
-    """합산에 넣는 연구소인가. 합계 시트(part_code="TOTAL")와 원화 기타(_ETC)는 다른 행을 더해
-    만든 값이라 뺀다 — 넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다
+    """합산에 넣는 연구소인가. 합계 시트(part_code="TOTAL")는 다른 행을 더해 만든 값이라 뺀다 —
+    넣으면 SARC가 CPU+GPU+TOTAL로 두 번 세어져 금액이 정확히 두 배가 된다
     (tests/overseas/test_total_slot.py). 집계표(versions.active_labs)와 파생 행의 재료
     (extra_rows.months_by_category)가 같은 판정을 써야 두 숫자가 어긋나지 않는다."""
-    return bool(lab.is_active) and lab.pk != "_ETC" and (lab.part_code or "").upper() != "TOTAL"
+    return bool(lab.is_active) and (lab.part_code or "").upper() != "TOTAL"
 
 
 def summable_pks(db: Session, as_of: str | None = None) -> list[str]:

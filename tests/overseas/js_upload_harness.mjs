@@ -43,7 +43,7 @@ function browserStub() {
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const ctx = vm.createContext(browserStub());
 const core = vm.runInContext(
-  fs.readFileSync(CORE_JS, "utf8") + "\n;({S, ovHandleSheets, ovModHtml, ovModOpen, ovPkName, parseCSV});\n",
+  fs.readFileSync(CORE_JS, "utf8") + "\n;({S, ovHandleSheets, ovModHtml, ovModOpen, ovPkName, parseCSV, ovTxtSheets, ovTxtSep, ovFormDl});\n",
   ctx, { filename: CORE_JS });
 
 const posts = [];
@@ -56,14 +56,37 @@ ctx.render = () => {};
 core.S.basis = input.basis || "2026-11";
 core.S.ov = { upVer: "cur", lab: input.lab || "SIRC", part: "", pending: [], V: { cur: { d: {} } }, files: {}, R: {}, U: {} };
 
-// pasted: 사람이 화면 칸에 직접 넣은 입력(텍스트 붙여넣기). 안 온 시트를 묻는 검사가 꺼진다.
-// pastes: 붙여넣기 **원문 텍스트**를 준 경우 — core의 parseCSV로 직접 돌린다(ovHandleTextSheets가
-// 하는 그대로). 엑셀 클립보드는 탭 구분인데 숫자에 천단위 콤마가 섞여 오므로, 표(aoa)로 미리
-// 만들어 넣으면 바로 그 깨짐을 못 본다.
-const pasted = (input.pastes || []).filter((x) => x.text && x.text.trim())
+// pastes: 시트 내용을 **원문 텍스트**로 준 경우 — core의 parseCSV로 직접 돌린다. 엑셀 클립보드와
+// 탭 구분 .txt는 숫자에 천단위 콤마가 섞여 오므로, 표(aoa)로 미리 만들어 넣으면 바로 그 깨짐을
+// 못 본다(문자열을 표로 자르는 자리가 바로 parseCSV다).
+const rawSheets = (input.pastes || []).filter((x) => x.text && x.text.trim())
   .map((x) => ({ name: x.name, aoa: core.parseCSV(x.text) }));
-const err = core.ovHandleSheets(pasted.length ? pasted : input.sheets, input.file,
-  input.pasted ? { pasted: true } : undefined);
+// text: 텍스트 파일(.txt) **원문** — 구분자 줄로 블록을 쪼개는 길을 그대로 지난다(ovTxtSheets).
+// 여기도 표(aoa)로 미리 만들어 넣으면 안 된다: 쪼개지는 자리가 바로 그 원문이기 때문이다.
+// form:"txt" — **텍스트 양식을 만들어 그대로 다시 올린다**(왕복). 양식이 쓰는 구분자와 업로드가
+// 받는 구분자가 갈리면(한쪽 이름만 바뀌면) 연구소가 채워 보낸 파일이 안 읽히는데, 사람이 양식을
+// 받아서 올려 보기 전까지는 아무도 그걸 모른다. downloadBlob을 가로채 파일 내용을 그대로 쓴다.
+let form = null;
+if (input.form === "txt") {
+  // [양식 받기] 한 번이 파일을 **여러 개** 떨어뜨린다(공용 한 개 + 파트가 나뉜 연구소마다 한 개).
+  // 마지막 것만 붙잡으면 어느 연구소를 시험해도 파트 양식만 올려 보게 된다 — 전부 받아 두고,
+  // 그 연구소가 실제로 받는 파일을 고른다: 파일명에 연구소 코드가 붙은 것이 있으면 그것,
+  // 없으면 공용(코드가 안 붙은 첫 파일)이다.
+  const got = [];
+  ctx.downloadBlob = (name, blob) => { got.push({ name, blob }); };
+  core.ovFormDl("txt");
+  const lab = input.lab || "SIRC";
+  const pick = got.find((g) => g.name.includes("_" + lab + "_")) || got[0];
+  form = pick ? { name: pick.name, text: await pick.blob.text(), files: got.map((g) => g.name) } : null;
+}
+const text = form ? form.text : input.text;
+const split = text ? core.ovTxtSheets(text, input.lab || "SIRC") : null;
+// 구분자를 못 찾은 텍스트 파일은 종전처럼 시트 한 장으로 본다 — ovHandleOneFile이 하는 그대로다
+// (구분자가 없는 파일이 "읽을 시트가 없다"로 거절되면 안 된다).
+const txtSheets = text
+  ? split || [{ name: input.file, aoa: core.parseCSV(text, core.ovTxtSep(text)) }]
+  : null;
+const err = core.ovHandleSheets(txtSheets || (rawSheets.length ? rawSheets : input.sheets), input.file);
 const scans = posts.filter((p) => p.url.includes("anomaly-scan")).map((p) => p.body);
 const pends = core.S.ov.pending.map((p, i) => ({
   pk: p.pk,
@@ -72,8 +95,7 @@ const pends = core.S.ov.pending.map((p, i) => ({
   has_rsn: !!p.rsn,
   has_outs: !!p.outs,
   errs: p.errs || [],
-  // lost: 양식에 있어야 하는데 안 온 시트. 담당자가 연구소에 재요청해야 하는 줄이라, 채울 수
-  // 없는 입력(붙여넣기)에서 뜨면 헛경고가 된다.
+  // lost: 양식에 있어야 하는데 안 온 시트. 담당자가 연구소에 재요청해야 하는 줄이다.
   lost: p.lost || [],
   // 계정 목록에 없는 행 — 구분(label)과 Cost Element(label_en)를 **둘 다** 꺼낸다. 영문명은
   // 추가 행에만 쓰이고(고정 계정은 OV_EL의 en), 파싱이 흘리면 표의 Cost Element 칸이 빈
@@ -97,4 +119,11 @@ if (core.S.ov.pending.length) {
     modal = { ok: false, tabs: 0, error: String((e && e.message) || e) };
   }
 }
-process.stdout.write(JSON.stringify({ error: err || "", pends, modal }));
+// split: 구분자로 쪼갠 결과(블록 이름 = 양식 시트명 · 줄 수). null이면 구분자를 못 찾아
+// "파일 한 개 = 시트 한 장"으로 간 것이다 — 그 둘을 테스트가 구분해야 한다.
+process.stdout.write(JSON.stringify({ error: err || "", pends, modal,
+  split: split && split.map((x) => ({ name: x.name, rows: x.aoa.length })),
+  // files: [양식 받기] 한 번에 떨어진 **파일 이름 전부**. 올려 보는 건 그중 한 개지만, 몇 개가
+  // 나오고 이름에 연구소 코드가 박혀 있는지도 고정해야 한다 — 연구소 이름이 들어간 양식이
+  // 다시 생기면 담당자가 그 파일을 다른 연구소에 돌려 쓸 수 없다.
+  form: form && { name: form.name, text: form.text, files: form.files } }));

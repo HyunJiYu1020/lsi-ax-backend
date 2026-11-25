@@ -81,7 +81,7 @@ def prepare(
     resolved = resolve_bases(db, basis_year, month, kind, plan_no)
     basis = next(b for b in resolved.bases if b.key == base_version)
 
-    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 한다 — 넣으면
+    # 합계 행(part_code="TOTAL")은 다른 행을 더해 만든 값이라 빼야 한다 — 넣으면
     # SARC가 CPU+GPU+TOTAL로 두 번 세어져 인원과 금액이 정확히 두 배가 된다(실제로 그렇게 나왔다).
     # 기준정보는 "보고 있는 버전 시점" 값으로 읽는다 — 통화를 지금 값으로 보면 지난달에 보고한
     # 환차 분해가 소급해서 달라진다(공통 RULE: 기준정보 변경은 변경한 버전부터).

@@ -40,9 +40,12 @@ def cost_sheet(name, rows):
 
 
 def run_js(sheets, file="해외연구소_SIRC_M2611A.xlsx", lab="SIRC", basis="2026-11",
-           pasted=False, pastes=None):
+           pastes=None, text=None, form=None):
+    """text를 주면 **텍스트 파일 원문**을 넣는 길이다(구분자로 블록을 쪼개는 ovTxtSheets를 지난다)
+    — test_upload_txt_blocks.py가 쓴다. sheets(표)로 미리 만들어 넣으면 쪼개지는 자리를 못 본다."""
     job = json.dumps({"file": file, "sheets": sheets, "lab": lab, "basis": basis,
-                      "pasted": pasted, "pastes": pastes or []}, ensure_ascii=False)
+                      "pastes": pastes or [], "text": text,
+                      "form": form}, ensure_ascii=False)
     p = subprocess.run(["node", str(HARNESS)], input=job, capture_output=True, text=True, timeout=120)
     if p.returncode != 0:
         pytest.fail(
@@ -62,15 +65,23 @@ def lab_card(r):
     return next(p for p in r["pends"] if p["has_rsn"] or p["has_outs"])
 
 
-def detect(payload, base=None, **over):
-    """프런트가 보낸 payload를 서버 판정에 그대로 먹인다(엔드포인트가 하는 것과 같은 조립)."""
+def detect(payload, base=None, abases=None, **over):
+    """프런트가 보낸 payload를 서버 판정에 그대로 먹인다(엔드포인트가 하는 것과 같은 조립).
+
+    abases는 증감분석 세 열의 비교 상대다 — 엔드포인트에서는 서버가 푼다(전실행=직전 버전 ·
+    경영계획=적용 차수). "cur"(비용 시트)만 payload가 들고 오므로 안 주면 그걸 쓴다.
+    """
     rules = anomaly.merged_rules([], over or None)
+    ab = dict(abases or {})
+    if "cur" not in ab and payload.get("cost_vals"):
+        ab["cur"] = {k: list(v or []) for k, v in payload["cost_vals"].items()}
     return anomaly.detect(
         vals={k: list(v or []) for k, v in (payload["vals"] or {}).items()},
         base_vals=base, sums=payload.get("sums"), reasons=payload.get("reasons"),
         rules=rules, group_calc=GROUP_CALC, label_of=category_label, leaves_of=resolve_leaves,
         periods=payload.get("periods"), outs_rows=payload.get("outs_rows"),
-        analysis=payload.get("analysis"), basis_month=payload.get("basis_month"),
+        analysis=payload.get("analysis"), analysis_bases=ab or None,
+        basis_month=payload.get("basis_month"),
     )
 
 
@@ -91,8 +102,8 @@ def test_blank_is_null_and_zero_stays_zero():
 
     found = detect(cost_card(r)["payload"])
     blanks = [f for f in found if f["rule"] == "missing_cell"]
-    # 분기·연간 칸(13~16=1Q~4Q, 17=연간)도 빈칸으로 센다 (2026-11-24). 그날부터 저장이 그 칸을
-    # 월 합으로 만들어 채우지 않으므로, 안 적어 보내면 실제로 비는 칸이 된다.
+    # 분기·연간 칸(13~16=1Q~4Q, 17=연간)도 빈칸으로 센다 — 저장이 그 칸을 월 합으로 만들어
+    # 채우지 않으므로, 안 적어 보내면 실제로 비는 칸이 된다.
     # 이 파일은 bonus·welf가 분기·연간을 전부 비워 보냈고 sal만 적어 보냈다.
     assert [(f["category_key"], f["months"]) for f in blanks] == [
         ("bonus", [3, 13, 14, 15, 16, 17]),
@@ -130,12 +141,86 @@ def test_analysis_sheet_blanks_and_prev_column_are_checked():
     assert payload["analysis"]["sal"]["m"]["prev"] is None, "당월 빈칸이 0으로 바뀌었다"
     assert payload["analysis"]["sal"]["y"]["prev"] == 99_000   # K$ 99 → $ 99,000
 
-    found = detect(payload, base={"sal": [10_000] * 12})  # 본사 전실행 합계 $120,000 ≠ 파일의 $99,000
+    # 전실행 열의 비교 상대는 **전실행(직전 버전)**이다 — 급변이 쓰는 전월 속보가 아니라 따로 온다.
+    found = detect(payload, abases={"prev": {"sal": [10_000] * 12}})  # 본사 $120,000 ≠ 파일 $99,000
     prev = [f for f in found if f["rule"] == "analysis_prev"]
     assert len(prev) == 1 and prev[0]["category_key"] == "sal"
+    assert prev[0]["block"] == "y" and prev[0]["fields"] == ["prev"]
 
     miss = [f for f in found if f["rule"] == "analysis_missing"]
     assert [(f["category_key"], f["fields"]) for f in miss] == [("sal", ["prev"])]
+
+
+def test_analysis_current_column_is_compared_with_the_cost_sheet_in_the_same_file():
+    """증감분석 당월 열은 **같은 파일의 비용 시트**와 맞댄다 — 연간 블록은 12개월 합, 당월 블록은
+    기준월(11월) 한 칸이다.
+
+    왜 파일 안에서 보나: 반영 전이라 비용 값은 아직 DB에 없다. 그리고 여기서 보려는 것이 바로
+    "한 파일 안에서 두 시트가 같은 금액을 말하는가"다 — 어긋나면 어느 쪽을 저장해도 틀린 보고가
+    되고, 여기서 안 짚으면 반영 뒤 집계에서야 숫자가 안 맞는 것으로 드러난다.
+    """
+    # 비용 시트: 급여 월 10K$ × 12 → 연간 120K$, 11월 10K$ (비용 파서는 계정 행이 **셋 이상**
+    # 있어야 머리글 줄을 고른다 — core.js ovParse의 seen.size<3)
+    cost = [
+        ["sal", "(급여)", "Salaries & Wages"] + [10] * 12 + [30, 30, 30, 30, 120],
+        ["bonus", "(상여)", "Bonus (MBO etc)"] + [5] * 12 + [15, 15, 15, 15, 60],
+        ["welf", "(복리후생)", "Welfare, Health Insurance"] + [0] * 12 + [0, 0, 0, 0, 0],
+    ]
+    rsn = {"name": "Analysis", "aoa": [
+        ["", "T Analysis"],
+        ["계정코드", "구분", "Cost Element", "PLAN", "M2610A", "M2611A", "Difference(2026)", "", "", "",
+         "PLAN", "M2610A", "M2611A", "Difference(NOV)", "", "", ""],
+        ["", "", "", "2026", "2026", "2026", "vs Plan", "Remark", "vs M2610A", "Remark",
+         "NOV.", "NOV.", "NOV.", "vs Plan", "Remark", "vs M2610A", "Remark"],
+        # 연간 당월 열 120 = 비용 연간과 같다(통과) · 당월 블록 당월 열 77 ≠ 비용 11월 10(걸린다)
+        ["sal", "(급여)", "Salaries & Wages", 100, 99, 120, 20, "", 21, "사유", 10, 10, 77, 67, "", 67, "사유"],
+        # 증감분석 파서도 계정 행이 둘 이상이어야 한다(core.js ovParseRsn). 이 행은 비용 시트와
+        # 똑같이 적어 — 걸리는 것은 위 급여 당월 칸 하나뿐이어야 한다.
+        ["bonus", "(상여)", "Bonus (MBO etc)", 60, 60, 60, 0, "", 0, "", 5, 5, 5, 0, "", 0, ""],
+    ]}
+    r = run_js([cost_sheet("Format", cost), rsn])
+    payload = lab_card(r)["payload"]
+    # 비용 값은 증감분석 카드에 **같이 실려** 온다(연구소 카드엔 vals가 없다).
+    assert payload["vals"] == {}, "연구소 카드에 비용이 vals로 섞였다"
+    assert payload["cost_vals"]["sal"] == [10_000] * 12, "비용 시트 값이 K$→$로 안 올라왔다"
+
+    hit = [f for f in detect(payload) if f["rule"] == "analysis_cur"]
+    assert [(f["block"], f["fields"]) for f in hit] == [("m", ["cur"])], \
+        "연간은 맞고 당월만 어긋난 파일인데 짚은 칸이 다르다"
+    assert "11월" in hit[0]["message"] and "77" in hit[0]["message"]
+
+
+def test_part_sheets_are_summed_for_the_analysis_cost_comparison():
+    """파트가 나뉜 연구소(SARC)는 증감분석이 연구소 전체 기준이라 비용 시트도 CPU+GPU를 더해서
+    보낸다. 총계 시트(Format → SARC:TOTAL)는 그 둘을 더해 만든 값이라 빼고 더한다 — 넣으면
+    금액이 정확히 두 배가 되어 맞게 적어 보낸 파일도 전부 불일치로 걸린다."""
+    rsn = {"name": "Analysis", "aoa": [
+        ["", "T Analysis"],
+        ["계정코드", "구분", "Cost Element", "PLAN", "M2610A", "M2611A", "Difference(2026)", "", "", "",
+         "PLAN", "M2610A", "M2611A", "Difference(NOV)", "", "", ""],
+        ["", "", "", "2026", "2026", "2026", "vs Plan", "Remark", "vs M2610A", "Remark",
+         "NOV.", "NOV.", "NOV.", "vs Plan", "Remark", "vs M2610A", "Remark"],
+        ["sal", "(급여)", "Salaries & Wages", 100, 99, 240, 140, "", 141, "사유", 10, 10, 20, 10, "", 10, "사유"],
+        ["bonus", "(상여)", "Bonus (MBO etc)", 120, 120, 120, 0, "", 0, "", 10, 10, 10, 0, "", 0, ""],
+    ]}
+    one = [
+        ["sal", "(급여)", "Salaries & Wages"] + [10] * 12 + [30, 30, 30, 30, 120],
+        ["bonus", "(상여)", "Bonus (MBO etc)"] + [5] * 12 + [15, 15, 15, 15, 60],
+        ["welf", "(복리후생)", "Welfare, Health Insurance"] + [0] * 12 + [0, 0, 0, 0, 0],
+    ]
+    both = [
+        ["sal", "(급여)", "Salaries & Wages"] + [20] * 12 + [60, 60, 60, 60, 240],
+        ["bonus", "(상여)", "Bonus (MBO etc)"] + [10] * 12 + [30, 30, 30, 30, 120],
+        ["welf", "(복리후생)", "Welfare, Health Insurance"] + [0] * 12 + [0, 0, 0, 0, 0],
+    ]
+    r = run_js(
+        [cost_sheet("CPU", one), cost_sheet("GPU", one), cost_sheet("Format", both), rsn],
+        file="해외연구소_업로드양식_SARC_M2611A.xlsx", lab="SARC",
+    )
+    payload = lab_card(r)["payload"]
+    # CPU 10 + GPU 10 = 20K$. Format(총계 20K$)까지 더했다면 40K$가 된다.
+    assert payload["cost_vals"]["sal"] == [20_000] * 12
+    assert [f for f in detect(payload) if f["rule"] == "analysis_cur"] == []
 
 
 def test_outsourcing_rows_are_compared_by_row():
@@ -229,11 +314,7 @@ def test_english_only_row_does_not_duplicate_its_name():
     assert got == [{"label": "Cloud Fee", "label_en": ""}]
 
 
-# ---------- 텍스트 붙여넣기 (엑셀을 못 읽는 보안 환경의 대체 입력) ----------
-# 엑셀과 **같은 처리 함수**(ovHandleSheets)를 지난다. 화면은 붙여넣기 칸을 양식 한 벌
-# (ovWantSheets)로 그리고 칸 이름에 양식 시트명을 쓰므로, 자리를 가리는 규칙도 엑셀과 같다 —
-# 파트가 나뉜 연구소(SARC)는 CPU · GPU · 총계 · 증감사유 · 외주용역 다섯 칸이다.
-
+# ---------- 안 온 시트 묻기 (양식 한 벌 중 빠진 자리) ----------
 RSN_SHEET = {"name": "Analysis", "aoa": [
     ["", "TEST Analysis (Unit : K$)"],
     ["계정코드", "구분", "Cost Element", "PLAN", "M2610A", "M2611A", "Difference(2026)", "", "", "",
@@ -245,43 +326,12 @@ RSN_SHEET = {"name": "Analysis", "aoa": [
 ]}
 
 
-def paste(*sheets):
-    """붙여넣기 적용 — 칸 이름이 양식 시트명이라는 점만 엑셀과 다르다(파일명이 없다)."""
-    return run_js(list(sheets), file="텍스트 입력", lab="SARC", pasted=True)
-
-
-def test_pasted_text_goes_through_the_same_path_as_excel():
-    """붙여넣은 텍스트도 비용 카드 + 연구소 카드(증감사유)를 같은 규칙으로 만든다."""
-    r = paste(cost_sheet("Format", BLANK_AND_ZERO), RSN_SHEET)
-    assert cost_card(r)["cost_rows"] > 0, "붙여넣은 비용 칸이 읽히지 않았다"
-    assert lab_card(r)["has_rsn"], "붙여넣은 증감사유 칸이 읽히지 않았다"
-
-
-def test_pasted_part_boxes_land_in_their_own_places():
-    """파트별 칸이 각자 자리로 들어간다 — 이게 안 되면 파트가 나뉜 연구소는 붙여넣기로 편성할 수 없다.
-
-    칸이 비용 하나뿐이던 동안은 CPU · GPU · 총계가 모두 "지금 선택된 파트" 한 자리로 겹쳐 들어가서,
-    먼저 넣은 금액이 뒤 칸에 덮이거나 "자리를 다른 시트가 이미 썼습니다"로 버려졌다.
-    """
-    r = paste(cost_sheet("CPU", BLANK_AND_ZERO), cost_sheet("GPU", BLANK_AND_ZERO),
-              cost_sheet("Format", BLANK_AND_ZERO), RSN_SHEET)
-    assert [p["pk"] for p in r["pends"]] == ["SARC:CPU", "SARC:GPU", "SARC:TOTAL", "SARC"]
-    assert all(p["cost_rows"] > 0 for p in r["pends"] if not p["has_rsn"])
-    assert not any(p["errs"] for p in r["pends"]), [p["errs"] for p in r["pends"]]
-
-
-def test_pasting_does_not_ask_to_re_request_from_the_lab():
-    """비워 둔 칸을 "안 왔다"고 알리지 않는다.
-
-    칸이 양식 한 벌로 다 있으니 빈 칸은 보면서 일부러 비운 것이다 — 이 경고의 쓸모는 "받은 파일이
-    불완전하니 연구소에 재요청하라"인데, 직접 넣는 사람에게는 틀린 안내다.
-    """
-    r = paste(cost_sheet("CPU", BLANK_AND_ZERO), RSN_SHEET)
-    assert all(not p["lost"] for p in r["pends"]), [p["lost"] for p in r["pends"]]
-
-
 def test_excel_workbook_still_reports_missing_part_sheets():
-    """엑셀은 그대로 묻는다 — 위 완화가 진짜 누락까지 덮으면 CPU·GPU가 통째로 비어도 조용해진다."""
+    """양식 한 벌 중 안 온 시트를 자리별로 적는다 — 이게 없으면 CPU·GPU가 통째로 비어도 조용하다.
+
+    파트가 나뉜 연구소(SARC)가 Format 한 장만 보냈는데 "비용 시트는 찾았으니" 아무 말이 없으면,
+    담당자가 알 길이 업로드 현황의 '미' 표시뿐이다 — 그건 연구소에 재요청해야 하는 일이다.
+    """
     r = run_js(
         [cost_sheet("CPU", BLANK_AND_ZERO), RSN_SHEET],
         file="해외연구소_업로드양식_SARC_M2611A.xlsx", lab="SARC",
@@ -290,9 +340,10 @@ def test_excel_workbook_still_reports_missing_part_sheets():
     assert any("GPU" in x for x in lost) and any("Format" in x for x in lost), lost
 
 
-# ---------- 엑셀에서 Ctrl+C 한 클립보드 원문 ----------
+# ---------- 탭 구분 원문 (엑셀 Ctrl+C 클립보드 · 엑셀이 저장한 .txt가 같은 모양이다) ----------
 # 표(aoa)를 미리 만들어 넣으면 이 구간을 통째로 못 본다 — 깨지는 자리가 **문자열을 표로 자르는**
 # parseCSV이기 때문이다. 그래서 여기만 원문 텍스트를 그대로 넣는다.
+# 엑셀을 못 여는 담당자가 쓰는 길이 이것이다([.txt 받기] → 채워서 .txt로 업로드).
 
 PASTE_HDR = ["구분", "Cost Element", "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
              "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "1Q", "2Q", "3Q", "4Q", "'26"]
@@ -317,7 +368,7 @@ def test_excel_clipboard_keeps_thousand_separated_amounts_in_one_cell():
         ["(상여)", "Bonus (MBO etc)", "(50)"] + ["50"] * 11 + [""] * 5,
         ["(복리후생)", "Welfare, Health Insurance", "10", "", "0"] + ["10"] * 9 + [""] * 5,
     ])
-    r = run_js([], file="텍스트 입력", lab="SARC", pasted=True,
+    r = run_js([], file="해외연구소_SARC_M2611A.txt", lab="SARC",
                pastes=[{"name": "CPU", "text": text}])
     vals = cost_card(r)["payload"]["vals"]
     # 저장 단위는 $다(양식 K$ × 1000) — chat.py _to_stored_dollar와 같은 기준.

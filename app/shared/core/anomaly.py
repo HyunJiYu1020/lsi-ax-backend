@@ -36,8 +36,16 @@
 없는 지적을 행 테두리로 그린다 · core.js ovModFlags). 빈 양식을 올렸을 때 사유 누락 29건이 행을
 통째로 칠해서 "신규 행 29개"처럼 보인 적이 있다 — 그래서 missing_reason은 급변이 찍은 칸에,
 sum_mismatch는 연간 칸에 붙인다.
+- analysis_plan(증감-경영계획) 증감분석 시트의 PLAN 열 값 ≠ 본사가 들고 있는 경영계획 금액.
 - analysis_prev(증감-전월) 증감분석 시트의 전실행 열 값 ≠ 본사가 들고 있는 전실행 합계. 연구소가 전월
                       파일을 보고 옮겨 적는 칸이라, 어긋나면 비교 기준 자체가 다른 것이다.
+- analysis_cur(증감-당월 대조) 증감분석 시트의 당월 열 값 ≠ **같은 파일로 온 비용 시트** 금액. 한 파일
+                      안에서 두 시트가 다른 숫자를 말하는 경우라, 어느 쪽을 저장해도 틀린 보고가 된다.
+
+  위 세 열은 같은 규칙으로 본다: **연간 블록은 12개월 합, 당월 블록은 기준월 한 칸**과 맞대본다.
+  소계·합계 행은 그 행의 하위 계정 합과 맞대본다(본사는 소계를 저장하지 않는다 — sum_mismatch와
+  같은 방식). 비교 기준이 무엇인지는 **서버가 정한다**(전실행=직전 버전 · 경영계획=적용 차수) —
+  화면이 "기준월 - 1"로 추측하면 1월 속보(전년 12월 실적)에서 틀린다(API.md "비교 기준").
 - analysis_missing(증감-당월) 증감분석 당월 블록의 빈칸. 연간 블록은 비어 있어도 연간 합으로 메울 수
                       있지만 당월은 그 달 보고의 본문이라 비면 읽을 게 없다.
 - missing_column(열 누락) 양식의 기간 열(1~12월 · 1Q~4Q · 연간) 중 파일에 아예 **없는 열**. 값이 빈
@@ -109,7 +117,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "label": "기간 합 불일치",
         "enabled": True,
         "pct": None,
-        "amount": 500.0,  # 월 합과 분기·연간 칸의 차이 허용값($ — 0.5K$, 반올림 흡수)
+        # 월 합과 분기·연간 칸의 차이 허용값($ — 0.5K$, 반올림 흡수). 인력(명) 행에는
+        # 이 값을 쓰지 않는다 — COUNT_TOLERANCE를 볼 것.
+        "amount": 500.0,
         "ratio": None,
         "desc": "월 1~12 합과 파일의 1Q~4Q·연간 칸 차이가 {amount} 초과",
     },
@@ -135,6 +145,24 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "ratio": None,
         "desc": "증감분석의 전실행 열과 본사 전실행 합계 차이가 {amount} 초과",
     },
+    "analysis_plan": {
+        "label": "증감분석 경영계획 대조",
+        "enabled": True,
+        "pct": None,
+        # 전실행 대조(analysis_prev)와 같은 "반올림 흡수" 허용값이다($ — 0.5K$). 연구소는 K$를
+        # 소수 한 자리까지 적어 보내고 본사 값은 $ 원본이라, 바르게 옮겨 적어도 수백 달러가 남는다.
+        "amount": 500.0,
+        "ratio": None,
+        "desc": "증감분석의 PLAN 열과 본사 경영계획 금액 차이가 {amount} 초과",
+    },
+    "analysis_cur": {
+        "label": "증감분석 당월 대조",
+        "enabled": True,
+        "pct": None,
+        "amount": 500.0,
+        "ratio": None,
+        "desc": "증감분석의 당월 열과 같은 파일 비용 시트 금액 차이가 {amount} 초과",
+    },
     "analysis_missing": {
         "label": "증감분석 당월 빈칸",
         "enabled": True,
@@ -157,6 +185,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
 PERIOD_MONTHS = (13, 14, 15, 16, 17)
 PERIOD_LABELS = ("1Q", "2Q", "3Q", "4Q", "연간")
 
+# 인력(명) 행의 기간 합 허용값. 금액 허용값(period_mismatch.amount = $500)을 명수에 그대로 쓰면
+# 500명 차이까지 묻혀서 분기 칸이 조용히 통과한다. 양식에 소수 한 자리까지 적혀 오므로
+# (실제 제출 파일의 1Q 칸: 65.3) 반올림만 흡수할 만큼 둔다.
+COUNT_TOLERANCE = 0.5
+
 # 양식이 반드시 갖는 기간 열 — 열 자리 키 → (월 번호, 사람이 읽는 이름).
 # 키는 프런트(core.js ovParse의 hdr)와 overseas_cost_headers.col_key가 쓰는 것과 같은 규칙이다
 # ("m1".."m12" 월 · "q1".."q4" 분기 · "y" 연간). 한쪽만 바꾸면 열 누락 검사가 조용히 틀어지므로
@@ -178,6 +211,8 @@ RULE_ALIASES = {
     "기간": "period_mismatch", "분기": "period_mismatch", "연간": "period_mismatch",
     "신규": "new_category", "신규계정": "new_category", "새계정": "new_category",
     "증감전월": "analysis_prev", "전월대조": "analysis_prev",
+    "증감경영계획": "analysis_plan", "경영계획대조": "analysis_plan", "plan대조": "analysis_plan",
+    "증감당월대조": "analysis_cur", "당월대조": "analysis_cur", "비용시트대조": "analysis_cur",
     "증감당월": "analysis_missing", "당월빈칸": "analysis_missing",
     "열": "missing_column", "열누락": "missing_column", "컬럼": "missing_column",
 }
@@ -233,6 +268,11 @@ def _k(v: float) -> str:
     return f"${k:,.1f}K" if abs(k) < 10 else f"${k:,.0f}K"
 
 
+def _hc(v: float) -> str:
+    """인력 표기. 금액(_k)으로 적으면 100명이 "$0.1K"로 나와 경고를 읽을 수가 없다."""
+    return f"{v:,.1f}명".replace(".0명", "명")
+
+
 def detect(
     *,
     vals: dict[str, list[Any]],
@@ -246,8 +286,12 @@ def detect(
     periods: dict[str, list[Any]] | None = None,
     outs_rows: list[dict] | None = None,
     analysis: dict[str, dict[str, dict[str, Any]]] | None = None,
+    # 증감분석 세 열을 맞대볼 본사 값: {"plan"|"prev"|"cur": {계정 → 12개월}}.
+    # 안 준 열은 그 대조를 건너뛴다(호출하는 쪽이 skipped로 밝힌다) — 조용히 빠지면 "이상 없음"이 된다.
+    analysis_bases: dict[str, dict[str, list[Any]] | None] | None = None,
     basis_month: int | None = None,
     cols: list[str] | None = None,
+    count_keys: set[str] | None = None,
 ) -> list[dict]:
     """findings 목록. 각 건은 화면이 그대로 띄울 수 있는 문장(message)과 칸 표시용 좌표를 갖는다.
 
@@ -316,6 +360,12 @@ def detect(
         tol = _num(sm["amount"])
         for cat, months in sums.items():
             if cat not in group_calc:
+                continue
+            # 파일에 소계 칸이 하나도 안 적혀 온 행은 건너뛴다 — 연구소가 소계를 비워 보내는 것은
+            # 정상이고(화면이 하위 합으로 "계산"해서 그린다) 틀린 값을 보낸 게 아니다. 빈칸을 0으로
+            # 세면 "파일의 합계 $0.0K ≠ 하위 항목 합"이 소계 행마다 뜬다(공통 RULE: 빈칸 ≠ 0).
+            # 일부만 적어 온 행은 그대로 검사한다 — 적어 온 칸이 있으면 그 값이 연구소의 보고다.
+            if all(m is None for m in months or []):
                 continue
             reported = _total(months)
             computed = sum(_total(vals.get(leaf)) for leaf in leaves_of(cat))
@@ -409,19 +459,28 @@ def detect(
 
         def period_check(key: str, label: str, months: list[Any], cells: list[Any], row_label: str = "") -> None:
             """월 합 vs 분기·연간 칸. 칸이 비어 있으면(연구소가 안 적었으면) 그 칸은 건너뛴다 —
-            안 적은 것은 빈칸(missing_cell)이 같은 칸 번호로 올린다. 여기서 또 올리면 두 번 걸린다."""
+            안 적은 것은 빈칸(missing_cell)이 같은 칸 번호로 올린다. 여기서 또 올리면 두 번 걸린다.
+
+            값은 파일에 적혀 온 그대로 두고(화면도 그 값을 그린다) 어긋난 칸만 짚는다 — 여기서
+            고쳐 주면 연구소가 보고한 공식 분기값이 화면에서 사라진다."""
+            is_count = key in (count_keys or ())
+            row_tol, fmt = (COUNT_TOLERANCE, _hc) if is_count else (tol, _k)
             for idx, cell in enumerate(cells or []):
                 if cell is None or idx >= len(PERIOD_MONTHS):
                     continue
                 if idx < 4:
                     computed = sum(_num(m) for m in (months or [])[idx * 3 : idx * 3 + 3])
                 else:
-                    computed = _total(months)
+                    # 연간 칸도 **1년치**(1~12월)와 대조한다 — 월 배열 전체를 더하면 안 된다.
+                    # 기간을 늘려 받은 파일(24·36개월: ovParse의 nMo)은 월 열이 24개인데 1Q~4Q·
+                    # 연간 칸은 한 벌(1년치)뿐이라, 전체를 더하면 분기 넷은 다 맞는데 연간 칸만
+                    # 2·3배로 어긋나 보인다.
+                    computed = sum(_num(m) for m in (months or [])[:12])
                 gap = _num(cell) - computed
-                if abs(gap) > tol:
+                if abs(gap) > row_tol:
                     add(
                         "period_mismatch", key, PERIOD_MONTHS[idx],
-                        f"{row_label or label} {PERIOD_LABELS[idx]} 칸 {_k(_num(cell))} ≠ 월 합 {_k(computed)} (차이 {_k(gap)})",
+                        f"{row_label or label} {PERIOD_LABELS[idx]} 칸 {fmt(_num(cell))} ≠ 월 합 {fmt(computed)} (차이 {fmt(gap)})",
                         value=_num(cell), base=computed, row_label=row_label,
                     )
 
@@ -437,6 +496,12 @@ def detect(
         for cat, months in vals.items():
             if cat in group_calc:
                 continue
+            # 급변(jump)이 같은 계정을 "전실행에 없던 항목"으로 이미 올렸으면 여기서 또 올리지
+            # 않는다. 두 규칙이 같은 사실을 말하는데 등급이 달라(급변=튀는 값, 이쪽=빈칸·새 행)
+            # 한 줄에 주황 줄과 파란 칸이 같이 붙고, 파란 칸만 본 담당자는 "계정 목록에 없는 새 행"
+            # 으로 읽는다. 금액 하한에 못 미쳐 급변이 그냥 보낸 것만 이쪽이 맡는다.
+            if cat in jumped:
+                continue
             if _total(months) and not _total(base_vals.get(cat)):
                 add(
                     "new_category", cat, None,
@@ -444,25 +509,69 @@ def detect(
                     value=_total(months),
                 )
 
-    ap = rules["analysis_prev"]
-    if ap["enabled"] and analysis and base_vals:
-        tol = _num(ap["amount"])
-        for cat, blocks in analysis.items():
-            cell = ((blocks or {}).get("y") or {}).get("prev")
-            if cell is None:
+    # ---------- 증감분석 세 열 대조 (PLAN · 전실행 · 당월) ----------
+    # 연간 블록은 12개월 합, 당월 블록은 기준월 한 칸과 맞대본다. 셋을 한 고리에서 도는 이유:
+    # 비교 대상만 다르고 "파일에 적혀 온 칸 ≠ 본사 값"이라는 판정이 똑같아서, 따로 적으면 허용값·
+    # 소계 처리·빈칸 처리가 열마다 어긋난다.
+    #
+    # absent_zero: 본사 값에 그 계정이 아예 없을 때 **0으로 보고 비교할지**.
+    #   plan  → 0으로 본다. 경영계획에 없는 계정은 "0으로 편성한 것"이고, 거기에 금액을 적어 보냈으면
+    #           그건 진짜 불일치다.
+    #   prev  → 건너뛴다. 같은 사실을 new_category가 "전실행에 없던 계정"으로 이미 알린다 — 둘 다
+    #           올리면 신규 계정마다 경고가 두 줄이 된다.
+    #   cur   → 건너뛴다. 비용 시트에 그 행이 없는 것은 비용 카드가 "파일에 이 행이 없습니다"로
+    #           이미 짚는다(core.js ovModCostTable의 gone).
+    ANALYSIS_COLS = (
+        ("plan", "analysis_plan", "경영계획", True),
+        ("prev", "analysis_prev", "전실행", False),
+        ("cur", "analysis_cur", "비용 시트", False),
+    )
+    ABASES = analysis_bases or {}
+    if analysis:
+        for field, rule_key, base_name, absent_zero in ANALYSIS_COLS:
+            rule = rules[rule_key]
+            src = ABASES.get(field)
+            if not rule["enabled"] or src is None:
                 continue
-            # 전실행에 그 계정이 아예 없으면 여기서 올리지 않는다 — 같은 사실을 new_category가
-            # "전실행에 없던 계정"으로 이미 알린다. 둘 다 올리면 신규 계정마다 경고가 두 줄이 된다.
-            if cat not in base_vals:
-                continue
-            computed = _total(base_vals.get(cat))
-            gap = _num(cell) - computed
-            if abs(gap) > tol:
-                add(
-                    "analysis_prev", cat, None,
-                    f"증감분석의 전실행 값 {_k(_num(cell))} ≠ 본사 전실행 합계 {_k(computed)} (차이 {_k(gap)})",
-                    value=_num(cell), base=computed, block="y",
-                )
+            tol_amt = _num(rule["amount"])
+
+            def _base_of(cat: str) -> list[Any] | None:
+                """본사 쪽 12개월. 소계·합계 행은 하위 계정 합으로 만든다 — 본사는 소계를 저장하지
+                않으므로(sum_mismatch와 같은 사정) 그냥 찾으면 전부 "없음"이 된다."""
+                if cat in group_calc:
+                    leaves = [src.get(leaf) for leaf in leaves_of(cat)]
+                    if all(x is None for x in leaves):
+                        return None
+                    n = max((len(x or []) for x in leaves), default=12)
+                    return [sum(_num((x or [None] * n)[i] if i < len(x or []) else None) for x in leaves) for i in range(n)]
+                return src.get(cat)
+
+            for cat, blocks in analysis.items():
+                months = _base_of(cat)
+                if months is None and not absent_zero:
+                    continue
+                for block, blabel in (("y", "연간"), ("m", f"{basis_month}월" if basis_month else "당월")):
+                    cell = ((blocks or {}).get(block) or {}).get(field)
+                    if cell is None:
+                        continue
+                    if block == "y":
+                        # 연간은 1~12월 합이다. 기간을 늘려 받은 값(24개월)이 와도 1년치만 더한다 —
+                        # 증감분석 시트의 연간 블록은 한 해를 가리킨다(period_mismatch와 같은 약속).
+                        computed = sum(_num(m) for m in (months or [])[:12])
+                    elif basis_month:
+                        computed = _num((months or [None] * 12)[basis_month - 1] if basis_month <= len(months or []) else None)
+                    else:
+                        # 기준월을 모르면 당월 블록은 짚을 자리가 없다 — 지어내지 않고 건너뛴다.
+                        continue
+                    row_tol, fmt = (COUNT_TOLERANCE, _hc) if cat in (count_keys or ()) else (tol_amt, _k)
+                    gap = _num(cell) - computed
+                    if abs(gap) > row_tol:
+                        add(
+                            rule_key, cat, None,
+                            f"증감분석 {blabel} 블록의 {base_name} 칸 {fmt(_num(cell))}"
+                            f" ≠ 본사 {base_name} {fmt(computed)} (차이 {fmt(gap)})",
+                            value=_num(cell), base=computed, block=block, fields=[field],
+                        )
 
     am = rules["analysis_missing"]
     if am["enabled"] and analysis:

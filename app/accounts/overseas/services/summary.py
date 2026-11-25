@@ -7,7 +7,6 @@ frontend-html/shared/core.js의 ovRender 히어로 블록이 그리는 숫자다
   ① CP는 업로드된 PL이 아니라 기준정보 › CP 계약 금액을 쓴다(분기 정산 계약이라 연 금액 ÷ 4를
      3·6·9·12월에 넣는다).
   ② 연구소가 추가한 행(extra-rows)도 anchor_key가 가리키는 계정에 얹어서 합계에 들어간다 — ovCustExtra.
-  ③ 원화 기타(_ETC)는 히어로 합계에 넣지 않는다(OV_ALLPK에 없음). 참고용으로 etc_total만 따로 준다.
 """
 
 import re
@@ -61,7 +60,7 @@ def build_summary(
     rate_year, rate_month, rate_kind = (
         (basis_year - 1, 12, "actual") if version == "prior" else (basis_year, basis_month, inp.api_version)
     )
-    # 합계 행(part_code="TOTAL")과 원화 기타(_ETC)는 다른 행을 더해 만든 값이라 빼야 두 번 세지
+    # 합계 행(part_code="TOTAL")은 다른 행을 더해 만든 값이라 빼야 두 번 세지
     # 않는다 — table_inputs.labs가 이미 뺀 목록이다(labor-split · 집계표와 같은 규칙).
     labs = sorted(inp.labs.values(), key=lambda lab: (lab.sort_order, lab.pk))
     rate = rate_arrays(db, rate_year, rate_month, rate_kind, set(), ix)["USD"]
@@ -83,9 +82,6 @@ def build_summary(
         labor += sum(lab_m[j] for j in ix)
     non_labor = total - labor
 
-    # 원화 기타는 이미 원화(억원 단위 입력)라 환산하지 않는다. 화면 히어로는 이 값을 합계에 넣지
-    # 않으므로 여기서도 total에 더하지 않고 따로만 준다.
-    etc_total = sum(n(inp.etc[j]) * 100_000_000 for j in ix)
 
     # 업로드 진척: 파트가 여러 개인 연구소는 파트가 모두 올라와야 1건으로 센다(화면 ovHas와 같다).
     by_code: dict[str, list[LabView]] = {}
@@ -134,7 +130,6 @@ def build_summary(
         step=max(0, min(screen_step(db) - 1, STEP_COUNT - 1)),
         step_count=STEP_COUNT,
         total=total,
-        etc_total=etc_total,
         labor=labor,
         non_labor=non_labor,
         labor_pct=labor / mix * 100,
@@ -146,6 +141,6 @@ def build_summary(
         note=(
             "화면 히어로 카드(해외연구소 편성 현황)와 같은 식이다. CP는 업로드 PL이 아니라 CP 계약 "
             "금액을 분기말에 넣고(분기 정산 계약), 연구소가 추가한 행도 anchor_key가 가리키는 계정에 "
-            "얹어서 센다. 원화 기타(etc_total)는 화면과 같이 total에 넣지 않는다."
+            "얹어서 센다."
         ),
     )
