@@ -548,9 +548,9 @@ def test_month_with_rows_still_comes_back_filled(db):
     if not latest:
         pytest.skip("속보 행이 없다")
 
-    s = get_overseas_state(basis_year=int(latest[:4]), basis_month=int(latest[4:]), db=db)
+    s = get_overseas_state(basis_year=latest // 100, basis_month=latest % 100, db=db)
 
-    assert s.basis_month == int(latest[4:])
+    assert s.basis_month == latest % 100
     assert s.V["cur"].d, "행이 있는 달인데 cur가 비어서 왔다"
 
 

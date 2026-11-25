@@ -205,7 +205,7 @@ def _summarize_cost_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "FROM cost_entries ce JOIN cost_entry_details ced ON ced.cost_entry_id = ce.id\n"
             f"WHERE ce.account_code = 'overseas' AND ce.scope_code = '{g['lab_pk']}'\n"
             f"  AND ce.version = '{g['version']}' AND ce.category_code = '{g['category_key']}'\n"
-            f"  AND ce.yyyymm = '{g['yyyymm']}' AND ced.period_type = 'MONTH'\n"
+            f"  AND ce.yyyymm = {g['yyyymm']} AND ced.period_type = 'MONTH'\n"
             "ORDER BY ced.period;"
         )
         out.append(g)
@@ -215,7 +215,7 @@ def _summarize_cost_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 @mcp.tool(
     description=(
         "비용 데이터를 조회한다. version: forecast(속보)|actual(실적). "
-        'yyyymm: 이 비용 헤더가 편성된 기준 연월 "YYYYMM"(필수, 예: "202609"). '
+        'yyyymm: 이 비용 헤더가 편성된 기준 연월 YYYYMM 6자리 정수(필수, 예: 202609). '
         f'lab_pk 예: "SARC:CPU", "SSIR". category_key(전체 목록, 헷갈리지 말 것): {COST_CATEGORY_KEYS}. '
         "주의: forecast와 actual은 서로 다른 헤더라 같은 yyyymm이라도 따로 조회해야 한다 — forecast는 "
         "그 시점에 전망한 1~12월 전체, actual은 그때까지 마감 확정된 달만 있다. "
@@ -230,7 +230,7 @@ def _summarize_cost_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 )
 async def list_cost_entries(
-    yyyymm: str,
+    yyyymm: int,
     version: str,
     lab_pk: str | None = None,
     category_key: str | None = None,
@@ -254,7 +254,7 @@ async def list_cost_entries(
         "나눠라(직접 나누지 마라)."
     )
 )
-async def get_cost_group(group_key: str, yyyymm: str, version: str, lab_pk: str | None = None) -> Any:
+async def get_cost_group(group_key: str, yyyymm: int, version: str, lab_pk: str | None = None) -> Any:
     if group_key not in GROUP_CALC:
         return {"error": f"알 수 없는 group_key: {group_key!r} (유효값: {', '.join(GROUP_CALC)})"}
     leaves = set(_resolve_leaves(group_key))
@@ -273,7 +273,7 @@ async def get_cost_group(group_key: str, yyyymm: str, version: str, lab_pk: str 
     return result
 
 
-async def _lab_series(yyyymm: str, version: str, lab_pk: str, category_key: str | None, group_key: str | None) -> dict[str, Any]:
+async def _lab_series(yyyymm: int, version: str, lab_pk: str, category_key: str | None, group_key: str | None) -> dict[str, Any]:
     if group_key:
         leaves = set(_resolve_leaves(group_key))
         rows = await _get("/overseas/cost-entries", {"yyyymm": yyyymm, "version": version, "lab_pk": lab_pk})
@@ -313,7 +313,7 @@ async def _lab_series(yyyymm: str, version: str, lab_pk: str, category_key: str 
     )
 )
 async def list_cost_across_labs(
-    yyyymm: str, version: str, category_key: str | None = None, group_key: str | None = None,
+    yyyymm: int, version: str, category_key: str | None = None, group_key: str | None = None,
     lab_pks: list[str] | None = None,
 ) -> Any:
     if bool(category_key) == bool(group_key):
@@ -337,13 +337,13 @@ async def list_cost_across_labs(
         "비용 데이터 한 칸(연구소×버전×계정×연월×월)을 넣거나 덮어쓴다. amount 단위는 hc(인력)만 명(名)이고 "
         f"나머지는 전부 $다(저장 단위 — 화면은 K$로 보여준다. 사용자가 K$로 말했으면 서버가 ×1000해서 "
         f"저장하니 네가 미리 곱하지 마라). category_key(전체 목록, 헷갈리지 말 것): {COST_CATEGORY_KEYS}. "
-        'yyyymm은 이 헤더의 편성 기준 연월 "YYYYMM"(예: "202609"). month는 보통 1~12(그 연도 1~12월)이지만, '
+        'yyyymm은 이 헤더의 편성 기준 연월 YYYYMM 6자리 정수(예: 202609). month는 보통 1~12(그 연도 1~12월)이지만, '
         "기간을 12개월 너머로 늘려 받는 경우엔 13부터 그다음 연도 1월(13=다음해 1월, 24=다음해 12월), "
         "25부터 또 그다음 연도로 — 12개씩 다음 해로 이어진다."
     )
 )
 async def upsert_cost_entry(
-    lab_pk: str, version: str, category_key: str, yyyymm: str, month: int, amount: float
+    lab_pk: str, version: str, category_key: str, yyyymm: int, month: int, amount: float
 ) -> Any:
     return await _put(
         "/overseas/cost-entries",
@@ -431,10 +431,10 @@ async def list_reason_translations(q: str | None = None, limit: int = 200) -> An
         "출장비('Travel Exp')). 돌려주는 값에서 resolved가 있으면 사람이 전에 확정해 둔 답이고, "
         "suggestions는 후보일 뿐이다 — 후보를 보고 네가 대신 확정하지 마라. 반드시 사용자에게 "
         "\"같은 행인가요?\"를 묻고, 답을 들은 뒤에만 upsert_row_alias로 저장해라. "
-        "yyyymm은 \"YYYYMM\"(예: \"202609\"), version은 forecast|actual."
+        "yyyymm은 YYYYMM 6자리 정수(예: 202609), version은 forecast|actual."
     )
 )
-async def match_row_labels(labels: list[str], yyyymm: str, version: str | None = None) -> Any:
+async def match_row_labels(labels: list[str], yyyymm: int, version: str | None = None) -> Any:
     """업로드 행 이름 → 이미 있는 행 후보 찾기(합치지는 않는다)."""
     return await _post("/overseas/row-match", {"labels": labels, "yyyymm": yyyymm, "version": version})
 
@@ -488,7 +488,7 @@ async def delete_row_alias(alias_label: str) -> Any:
     )
 )
 async def merge_rows(
-    yyyymm: str,
+    yyyymm: int,
     version: str,
     source_labels: list[str],
     target_kind: str,
@@ -627,12 +627,12 @@ async def upsert_match_rule(
 @mcp.tool(
     description=(
         "연구소가 편성 화면에서 직접 추가한 행(계정에 없는 비용 항목)을 조회한다. "
-        'yyyymm: v(12개월치 값, $)가 속한 편성 기준 연월 "YYYYMM"(필수, 예: "202609"). '
+        'yyyymm: v(12개월치 값, $)가 속한 편성 기준 연월 YYYYMM 6자리 정수(필수, 예: 202609). '
         "version: forecast(속보)|actual(실적) — '현재 화면' 정보에 나온 값을 그대로 써라."
     )
 )
 async def list_extra_rows(
-    yyyymm: str, version: str | None = None, lab_pk: str | None = None
+    yyyymm: int, version: str | None = None, lab_pk: str | None = None
 ) -> Any:
     rows = await _get(
         "/overseas/extra-rows",
@@ -673,7 +673,7 @@ async def list_extra_rows(
         "조회해서 받은 값을 그대로 되보내면 금액이 1000배 작아진다. 옮길 행의 row_key는 "
         "list_extra_rows로 찾아라.\n"
         "row_key는 처음 만들 때는 새 id를 하나 지어서 쓰면 된다. "
-        'yyyymm: "현재 화면" 정보의 편성 기준 연월 "YYYYMM"을 그대로 써라. '
+        'yyyymm: "현재 화면" 정보의 편성 기준 연월(YYYYMM 6자리 정수)을 그대로 써라. '
         f"anchor_key(원시 행에 필수): 그 행이 어느 항목 아래에 들어가는지 — 유효값: {ANCHOR_KEYS}. "
         "사용자가 '~계정 아래에'라고 말하면 그 키를 넣어라. **말하지 않았으면 비워 두지 말고 "
         "먼저 어디에 넣을지 물어라** — 비워서 호출하면 거부된다. 비어 있는 행은 표에서는 맨 "
@@ -689,7 +689,7 @@ async def list_extra_rows(
     )
 )
 async def upsert_extra_row(
-    lab_pk: str, version: str, row_key: str, label: str, yyyymm: str, v: list[float] | None = None,
+    lab_pk: str, version: str, row_key: str, label: str, yyyymm: int, v: list[float] | None = None,
     anchor_key: str | None = None, is_derived: bool = False, formula: dict[str, Any] | None = None,
 ) -> Any:
     return await _put(
@@ -714,7 +714,7 @@ async def upsert_extra_row(
     )
 )
 async def delete_extra_row(
-    lab_pk: str, version: str, row_key: str, yyyymm: str, step: str | None = None
+    lab_pk: str, version: str, row_key: str, yyyymm: int, step: str | None = None
 ) -> Any:
     # step(지금 보고 있는 탭)은 네가 채우지 않아도 된다 — 서버가 화면 정보에서 알아서 채운다.
     return await _delete(
@@ -727,11 +727,11 @@ async def delete_extra_row(
     description=(
         "연구소가 편성 화면 그리드에 직접 추가한 열(행×월이 아니라 행×열 구조의 숫자 값. 화면의 "
         "'+ 열 추가' 버튼과 같은 기능)을 조회한다. label 자체가 열 식별자다(별도 id 없음). "
-        'yyyymm: "YYYYMM" 필수. version: forecast(속보)|actual(실적) — "현재 화면" 정보의 '
+        'yyyymm: YYYYMM 6자리 정수 필수. version: forecast(속보)|actual(실적) — "현재 화면" 정보의 '
         "version_api 값을 그대로 써라."
     )
 )
-async def list_extra_cols(yyyymm: str, version: str | None = None, lab_pk: str | None = None) -> Any:
+async def list_extra_cols(yyyymm: int, version: str | None = None, lab_pk: str | None = None) -> Any:
     return await _get("/overseas/extra-cols", {"yyyymm": yyyymm, "version": version, "lab_pk": lab_pk})
 
 
@@ -742,7 +742,7 @@ async def list_extra_cols(yyyymm: str, version: str | None = None, lab_pk: str |
         "list_extra_cols와 동일."
     )
 )
-async def list_cost_extras(yyyymm: str, version: str | None = None, lab_pk: str | None = None) -> Any:
+async def list_cost_extras(yyyymm: int, version: str | None = None, lab_pk: str | None = None) -> Any:
     return await _get("/overseas/cost-extras", {"yyyymm": yyyymm, "version": version, "lab_pk": lab_pk})
 
 
@@ -767,7 +767,7 @@ async def list_cost_extras(yyyymm: str, version: str | None = None, lab_pk: str 
     )
 )
 async def upsert_extra_col(
-    lab_pk: str, version: str, yyyymm: str, label: str,
+    lab_pk: str, version: str, yyyymm: int, label: str,
     is_derived: bool = False, formula: dict[str, Any] | None = None, fmt: str = "raw",
 ) -> Any:
     return await _put(
@@ -792,7 +792,7 @@ async def upsert_extra_col(
     )
 )
 async def upsert_cost_extra(
-    lab_pk: str, version: str, yyyymm: str, label: str, row_key: str = "hc", value: float | str = 0
+    lab_pk: str, version: str, yyyymm: int, label: str, row_key: str = "hc", value: float | str = 0
 ) -> Any:
     return await _put(
         "/overseas/cost-extras",
@@ -808,7 +808,7 @@ async def upsert_cost_extra(
     )
 )
 async def delete_extra_col(
-    lab_pk: str, version: str, label: str, yyyymm: str, step: str | None = None
+    lab_pk: str, version: str, label: str, yyyymm: int, step: str | None = None
 ) -> Any:
     # step(지금 보고 있는 탭)은 네가 채우지 않아도 된다 — 서버가 화면 정보에서 알아서 채운다.
     return await _delete(
@@ -1282,8 +1282,8 @@ async def list_anomaly_rule_history(limit: int = 50) -> Any:
 async def scan_anomalies(
     lab_pk: str,
     version: str,
-    yyyymm: str,
-    base_yyyymm: str | None = None,
+    yyyymm: int,
+    base_yyyymm: int | None = None,
     base_version: str | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> Any:

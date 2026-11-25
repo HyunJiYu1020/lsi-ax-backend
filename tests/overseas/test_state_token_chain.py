@@ -24,7 +24,7 @@ from app.accounts.overseas.schemas import ExtraRowIn, ExtraValueIn
 from app.accounts.overseas.services.labs import all_labs
 from app.accounts.overseas.services.state import state_token
 
-YM = "209509"  # 실제 데이터가 없는 가짜 기준월
+YM = 209509  # 실제 데이터가 없는 가짜 기준월
 
 
 @pytest.fixture

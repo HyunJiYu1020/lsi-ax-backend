@@ -13,21 +13,21 @@ def _monthly_totals(rows: list[dict]) -> list[float]:
 
 
 def test_vendor_rows_reconcile_with_cost_sheet():
-    rows = _vendor_rows("DSRA", "202609", OUTS)
+    rows = _vendor_rows("DSRA", 202609, OUTS)
     assert 30 <= len(rows) <= 40
     assert _monthly_totals(rows) == [round(v, 2) for v in OUTS]
 
 
 def test_vendor_rows_keep_sscr_mismatch_example():
     """SSCR 3월은 화면에 "불일치"로 보여주려고 일부러 5K 틀리게 둔 예시다."""
-    rows = _vendor_rows("SSCR", "202609", OUTS)
+    rows = _vendor_rows("SSCR", 202609, OUTS)
     totals = _monthly_totals(rows)
     assert totals[2] == round(OUTS[2] + 5, 2)
     assert [totals[j] for j in range(12) if j != 2] == [round(OUTS[j], 2) for j in range(12) if j != 2]
 
 
 def test_vendor_rows_are_deterministic():
-    assert _vendor_rows("CP", "202609", OUTS) == _vendor_rows("CP", "202609", OUTS)
+    assert _vendor_rows("CP", 202609, OUTS) == _vendor_rows("CP", 202609, OUTS)
 
 
 def test_js_random_matches_browser_sequence():
@@ -48,7 +48,7 @@ def test_reason_rows_cover_all_categories_and_blocks():
         "prev": {"sal": [90.0] * 12, "hc": [9.0] * 12},
         "plan": {"sal": [80.0] * 12, "hc": [8.0] * 12},
     }
-    rows = _reason_rows("DSRA", "202609", "202608", el)
+    rows = _reason_rows("DSRA", 202609, 202608, el)
     assert len(rows) == 88  # 44개 항목 × (연간 y · 당월 m)
     assert {r["block"] for r in rows} == {"y", "m"}
     assert {r["prev_label"] for r in rows} == {"M2608A"}
@@ -65,7 +65,7 @@ def test_reason_rows_cover_all_categories_and_blocks():
 
 def test_vendor_rows_carry_master_detail_shape():
     """적재 payload는 마스터 컬럼 + 월 금액 배열(m)로 나오고, 디테일은 이 m을 월 1행씩 펼쳐 넣는다."""
-    rows = _vendor_rows("DSRA", "202609", OUTS)
+    rows = _vendor_rows("DSRA", 202609, OUTS)
     first = rows[0]
     assert first["lab_code"] == "DSRA"
     assert first["version"] == "cur"

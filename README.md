@@ -47,12 +47,18 @@ uv run python -m app.db.seed_overseas_sheets
 
 같은 "버전"인데 테이블마다 값이 다르다 — 섞어 쓰면 조회가 비게 된다.
 
-- `cost_entries` · `extra_cols`: `forecast`(속보) | `actual`(실적) + `yyyymm`(편성 기준 연월)
+- `cost_entries` · `extra_cols`: `forecast`(속보) | `actual`(실적) + `yyyymm`(편성 기준 연월, `202609` 같은 6자리 정수)
 - `overseas_reason_rows` · `overseas_vendor_rows` · `uploads` · `notes` ·
   `sheet_rows`: `cur`(당월 속보) | `prev`(전실행) | `prior`(전년 실적) | `plan`(경영계획)
 
 프론트는 화면 상태로 `cur/prev/prior/plan`을 쓰고, 비용 API를 부를 때만 `ovVerApi`/`ovYyyymmApi`로
 `forecast|actual` + `yyyymm`으로 바꿔 보낸다. 챗봇도 같은 규칙을 프롬프트로 지시받는다.
+
+`yyyymm`은 **6자리 정수**다(`202609` — 문자열 `"202609"`가 아니다). 자리수가 고정이라 크기 비교가
+곧 날짜순 비교이고(`max(yyyymm)`이 최신 달), 연·월 분해는 `/ 100`과 `% 100`이다 — 파이썬
+(`app/shared/core/periods.py`의 `ym_year`·`ym_month`)과 DB CHECK 제약이 같은 식을 쓴다.
+예외가 하나 있다: `uploads.yyyymm`만 NULL을 받는다 — 경영계획 업로드는 달이 없고, 그때는
+`version`이 그 해의 차수(`P02`)를 가리킨다.
 
 ## Docker로 전체(API + Postgres) 띄우기
 

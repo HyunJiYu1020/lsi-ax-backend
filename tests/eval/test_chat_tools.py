@@ -33,7 +33,7 @@ pytestmark = [
 BASE_CONTEXT = {
     "key": "overseas", "name": "해외연구소", "step": "취합",
     "lab_pk": "SARC:CPU", "version": "cur", "version_api": "forecast",
-    "yyyymm_api": "209801", "year": 2098, "usd_unit": "kdollar",
+    "yyyymm_api": 209801, "year": 2098, "usd_unit": "kdollar",
 }
 
 SCENARIOS = yaml.safe_load((Path(__file__).parent / "scenarios" / "chat_tools.yaml").read_text())

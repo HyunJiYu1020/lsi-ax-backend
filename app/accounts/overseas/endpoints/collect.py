@@ -237,7 +237,7 @@ def save_vendor_rows(body: VendorRowsIn, db: Session = Depends(get_db)) -> dict[
     lab_codes = {lab.lab_code for lab in all_labs(db)}
     replaced = replace_vendor_rows(
         db, body.basis_year, body.rows, lab_codes,
-        yyyymm(body.basis_year, body.basis_month) if body.basis_month else "",
+        yyyymm(body.basis_year, body.basis_month) if body.basis_month else 0,
     )
     try:
         db.commit()
@@ -392,7 +392,7 @@ def save_reason_rows(
     lab_codes = {lab.lab_code for lab in all_labs(db)}
     saved = upsert_reason_rows(
         db, body.rows, lab_codes,
-        yyyymm(body.basis_year, body.basis_month) if (body.basis_year and body.basis_month) else "",
+        yyyymm(body.basis_year, body.basis_month) if (body.basis_year and body.basis_month) else 0,
     )
     try:
         db.commit()
@@ -710,7 +710,7 @@ def delete_lab_sheet(lab_code: str, sheet_key: str, db: Session = Depends(get_db
 
 @router.get("/overseas/cost-entries", response_model=list[CostEntryOut])
 def list_cost_entries(
-    yyyymm: str,
+    yyyymm: int,
     version: str | None = None,
     lab_pk: str | None = None,
     category_key: str | None = None,
@@ -765,7 +765,7 @@ def upsert_cost_entry(body: CostEntryIn, db: Session = Depends(get_db)) -> CostE
 
 @router.get("/overseas/uploads", response_model=list[UploadOut])
 def list_uploads(
-    yyyymm: str | None = None,
+    yyyymm: int | None = None,
     version: str | None = None,
     lab_pk: str | None = None,
     db: Session = Depends(get_db),
@@ -802,7 +802,7 @@ def record_upload(body: UploadIn, db: Session = Depends(get_db)) -> UploadOut:
 @router.post("/overseas/uploads/file", response_model=UploadOut)
 async def upload_raw_file(
     lab_pk: str = Form(...),
-    yyyymm: str = Form(""),
+    yyyymm: int | None = Form(None),
     version: str = Form(""),
     client_token: str = Form("", alias="state_token"),
     file: UploadFile = File(...),
@@ -1276,7 +1276,7 @@ def upsert_extra_row(body: ExtraRowIn, db: Session = Depends(get_db)) -> ExtraRo
 
 @router.delete("/overseas/extra-rows")
 def delete_extra_row(
-    lab_pk: str, version: str, row_key: str, yyyymm: str, step: str | None = None,
+    lab_pk: str, version: str, row_key: str, yyyymm: int, step: str | None = None,
     confirmed: bool = False,
     client_token: str | None = Query(None, alias="state_token"),
     db: Session = Depends(get_db),
@@ -1326,7 +1326,7 @@ COL_FMTS = ("raw", "pct_ratio", "pct_plain")
 
 @router.get("/overseas/extra-cols", response_model=list[ExtraColOut])
 def list_extra_cols(
-    yyyymm: str, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
+    yyyymm: int, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
 ) -> list[ExtraColOut]:
     stmt = select(ExtraCol).where(ExtraCol.account_key == ACCOUNT_KEY, ExtraCol.yyyymm == yyyymm)
     if version:
@@ -1374,7 +1374,7 @@ def upsert_extra_col(body: ExtraColIn, db: Session = Depends(get_db)) -> ExtraCo
 
 @router.get("/overseas/cost-extras", response_model=list[ExtraValueOut])
 def list_cost_extras(
-    yyyymm: str, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
+    yyyymm: int, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
 ) -> list[ExtraValueOut]:
     stmt = select(CostEntry).where(CostEntry.account_code == ACCOUNT_KEY, CostEntry.yyyymm == yyyymm)
     if version:
@@ -1485,7 +1485,7 @@ def upsert_cost_extra(body: ExtraValueIn, db: Session = Depends(get_db)) -> Extr
 
 @router.delete("/overseas/extra-cols")
 def delete_extra_col(
-    lab_pk: str, version: str, label: str, yyyymm: str, step: str | None = None,
+    lab_pk: str, version: str, label: str, yyyymm: int, step: str | None = None,
     confirmed: bool = False,
     client_token: str | None = Query(None, alias="state_token"),
     db: Session = Depends(get_db),
@@ -1536,7 +1536,7 @@ def delete_extra_col(
 
 @router.get("/overseas/cost-headers", response_model=list[CostHeaderOut])
 def list_cost_headers(
-    yyyymm: str, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
+    yyyymm: int, version: str | None = None, lab_pk: str | None = None, db: Session = Depends(get_db)
 ) -> list[CostHeaderOut]:
     if version:
         check_version(version)
@@ -1670,7 +1670,7 @@ def delete_sheet_rows_all(lab_pk: str, version: str, sheet_key: str, db: Session
 
 @router.get("/overseas/extra-rows", response_model=list[ExtraRowOut])
 def list_extra_rows(
-    yyyymm: str,
+    yyyymm: int,
     version: str | None = None,
     lab_pk: str | None = None,
     db: Session = Depends(get_db),

@@ -6,6 +6,13 @@
 
 Base URL: `http://localhost:8000/api/v1`
 
+`yyyymm`(편성 기준 연월)은 **6자리 정수**다 — `202609`, 문자열 `"202609"`가 아니다. 쿼리
+파라미터로는 어차피 글자로 실려 오지만(`?yyyymm=202609`) JSON 본문·응답에서는 숫자다. 연·월
+분해는 `/ 100`과 `% 100`이고, 자리수가 고정이라 크기 비교가 곧 날짜순 비교다. 예외는
+`uploads.yyyymm` 하나다 — 경영계획 업로드는 달이 없어 `null`이고, 그때 `version`이 그 해의
+차수(`P02`)를 가리킨다. 프런트는 `ovYyyymmApi`/`ovVerYM`이 숫자를 돌려주고, 달로 환산할 수
+없는 자리는 `0`(`ovVerYM`) 또는 `null`(`ovYyyymmApi`)이다.
+
 ## 목록
 
 | Method | Path | 설명 | 호출처 |
@@ -159,7 +166,7 @@ $10 이상이 되어 전 칸이 걸린다 — 마이그레이션이 같이 올�
 짐작한다(옛 클라이언트 호환).
 
 왜 명시하게 됐나: 전에는 서버가 항상 `current_basis_month`(DB의 최신 속보월)로 짐작했다. 그래서
-`select * from cost_entries where yyyymm='202611'`이 0행인데도 화면에서 **속보 2026년 11월**을 열면
+`select * from cost_entries where yyyymm = 202611`이 0행인데도 화면에서 **속보 2026년 11월**을 열면
 9월 데이터가 `cur`로 내려와, 화면이 그걸 11월 버킷에 써넣고 업로드 현황이 전 연구소 ✓로 보였다.
 아직 아무것도 안 올린 달은 전부 "미"여야 한다. 다른 엔드포인트(`/overseas/summary`,
 `/overseas/labor-split`, 증감분석)는 이미 `basis_month`를 받고 있었고 — `services/versions.py`와
@@ -494,7 +501,7 @@ POST /overseas/reason-translate
 
 ```
 POST /overseas/row-match
-{ "labels": ["Travel Expense", "Cloud Usage Fee"], "yyyymm": "202609", "version": "forecast" }
+{ "labels": ["Travel Expense", "Cloud Usage Fee"], "yyyymm": 202609, "version": "forecast" }
 → { "items": [
      { "label": "Travel Expense",
        "resolved": null,                                  // 전에 답해 둔 게 없음 → 물어봐야 한다
@@ -575,7 +582,7 @@ LLM이 실패하면 그 폴백이 그대로 남아서 **사람마다·시점마�
 
 ```
 POST /overseas/row-merge
-{ "yyyymm": "202611", "version": "forecast", "source_labels": ["Other", "Misc Fee"],
+{ "yyyymm": 202611, "version": "forecast", "source_labels": ["Other", "Misc Fee"],
   "target_kind": "category", "target_key": "misc", "lab_pk": "", "dry_run": true }
 → { "dry_run": true, "target_label": "기타경비",
     "merged": [{ "lab_pk": "SARC:CPU", "source_label": "Other",

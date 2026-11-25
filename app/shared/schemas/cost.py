@@ -13,7 +13,7 @@ class CostEntryValueIn(BaseModel):
     account_code: str
     scope_code: str
     category_code: str
-    yyyymm: str  # 편성 기준 연월 "YYYYMM"
+    yyyymm: int  # 편성 기준 연월 YYYYMM 6자리 정수 (예: 202609)
     version: str  # forecast | actual
     label: str | None = None  # 커스텀 category_code일 때만 채움(한글)
     label_en: str | None = None  # 커스텀 category_code일 때만 채움(영문)
@@ -28,7 +28,7 @@ class CostEntryOut(BaseModel):
     account_code: str
     scope_code: str
     category_code: str
-    yyyymm: str
+    yyyymm: int
     version: str
     label: str | None = None
     label_en: str | None = None

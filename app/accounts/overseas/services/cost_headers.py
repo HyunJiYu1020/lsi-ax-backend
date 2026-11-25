@@ -54,7 +54,7 @@ def check_labels(labels: dict[str, str]) -> dict[str, str]:
 
 
 def replace_cost_headers(
-    db: Session, lab_pk: str, version: str, yyyymm: str, labels: dict[str, str], source_file: str = ""
+    db: Session, lab_pk: str, version: str, yyyymm: int, labels: dict[str, str], source_file: str = ""
 ) -> int:
     """(연구소 · 버전 · 기준월) 하나의 머리글을 통째로 바꿔 넣는다. 넣은 열 수를 돌려준다.
 
@@ -84,7 +84,7 @@ def replace_cost_headers(
 
 
 def read_cost_headers(
-    db: Session, yyyymm: str, version: str | None = None, lab_pk: str | None = None
+    db: Session, yyyymm: int, version: str | None = None, lab_pk: str | None = None
 ) -> list[CostHeaderOut]:
     """연구소별로 묶은 머리글 한 벌 목록. 열이 하나도 없는 연구소는 아예 나오지 않는다 —
     "머리글이 없다"와 "빈 머리글이 있다"를 화면에서 구별할 수 있어야 한다."""

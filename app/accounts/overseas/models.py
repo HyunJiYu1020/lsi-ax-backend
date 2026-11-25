@@ -5,6 +5,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Integer,
     Numeric,
     SmallInteger,
     String,
@@ -16,6 +17,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
+from app.shared.models.common import YYYYMM_CHECK
 
 
 class OverseasLab(Base):
@@ -115,7 +117,7 @@ class OverseasReasonRow(Base):
     __tablename__ = "overseas_reason_rows"
     __table_args__ = (
         UniqueConstraint("lab_code", "yyyymm", "category_key", "block", name="uq_overseas_reason_rows_key"),
-        CheckConstraint(r"yyyymm ~ '^\d{6}$'", name="ck_overseas_reason_rows_yyyymm_format"),
+        CheckConstraint(YYYYMM_CHECK, name="ck_overseas_reason_rows_yyyymm_format"),
         {"comment": "해외연구소 증감사유 업로드(연구소×버전×기준월×비용항목×구간). PLAN·전기·당기 비교값과 사유 텍스트."},
     )
 
@@ -125,8 +127,10 @@ class OverseasReasonRow(Base):
     # 어느 달 회신인지. version(역할값)만으로는 월을 알 수 없어 읽는 쪽이 "DB의 가장 최근 속보월
     # 것"이라고 짐작하게 되고, 그러면 9월에 올린 증감사유가 10월 자료로 잡혀 9월 업로드 현황이
     # '미'로 남는다. 비용(cost_entries.yyyymm)과 같은 기준을 쓴다.
-    yyyymm: Mapped[str] = mapped_column(
-        String(6), default="", comment='이 회신이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    # 기본값을 두지 않는다 — CHECK가 월 1~12를 요구해서 "비어 있는 값"이 애초에 저장될 수 없고,
+    # 호출부(services/reason_rows.py)가 값이 없으면 400으로 멈춘다.
+    yyyymm: Mapped[int] = mapped_column(
+        Integer, comment="이 회신이 속한 편성 기준연월 YYYYMM 6자리 정수(cost_entries.yyyymm과 같은 기준)"
     )
     category_key: Mapped[str] = mapped_column(String(40), comment="비용항목 키")
     block: Mapped[str] = mapped_column(String(1), comment="y(연간 블록) | m(월별 블록)")
@@ -216,16 +220,17 @@ class OverseasVendorRow(Base):
     __tablename__ = "overseas_vendor_rows"
     __table_args__ = (
         UniqueConstraint("lab_code", "yyyymm", "row_no", name="uq_overseas_vendor_rows_key"),
-        CheckConstraint(r"yyyymm ~ '^\d{6}$'", name="ck_overseas_vendor_rows_yyyymm_format"),
+        CheckConstraint(YYYYMM_CHECK, name="ck_overseas_vendor_rows_yyyymm_format"),
         {"comment": "해외연구소 외주용역 업로드(연구소×버전×기준월×행). 월별 금액은 overseas_vendor_row_details 참조."},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     lab_code: Mapped[str] = mapped_column(String(10), comment="연구소 코드(overseas_labs.lab_code, 파트 없이 — SARC는 CPU+GPU 합계)")
     version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
-    # 증감사유와 같은 이유로 둔 컬럼이다(OverseasReasonRow.yyyymm 주석 참고).
-    yyyymm: Mapped[str] = mapped_column(
-        String(6), default="", comment='이 회신이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    # 증감사유와 같은 이유로 둔 컬럼이다(OverseasReasonRow.yyyymm 주석 참고 — 기본값을 두지 않는
+    # 이유도 같다).
+    yyyymm: Mapped[int] = mapped_column(
+        Integer, comment="이 회신이 속한 편성 기준연월 YYYYMM 6자리 정수(cost_entries.yyyymm과 같은 기준)"
     )
     row_no: Mapped[int] = mapped_column(SmallInteger, comment="업로드한 시트 안에서의 행 순서(1부터)")
     category: Mapped[str] = mapped_column(String(50), default="", comment="Category(외주용역 구분)")
@@ -329,7 +334,7 @@ class OverseasCostHeader(Base):
     __table_args__ = (
         UniqueConstraint("lab_pk", "version", "yyyymm", "col_key", name="uq_overseas_cost_headers_key"),
         CheckConstraint("version IN ('forecast', 'actual')", name="ck_overseas_cost_headers_version"),
-        CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_overseas_cost_headers_yyyymm_format"),
+        CheckConstraint(YYYYMM_CHECK, name="ck_overseas_cost_headers_yyyymm_format"),
         CheckConstraint(r"col_key ~ '^(m[1-9][0-9]?|q[1-4]|y)$'", name="ck_overseas_cost_headers_col_key"),
         {
             "comment": "연구소 비용 시트의 기간 열 머리글 원문(연구소×버전×기준월×열). 취합 비용 표가 "
@@ -342,8 +347,8 @@ class OverseasCostHeader(Base):
         String(20), comment="연구소 식별 키(overseas_labs.pk — 파트까지, 예 \"SARC:CPU\")"
     )
     version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
-    yyyymm: Mapped[str] = mapped_column(
-        String(6), comment='이 파일이 속한 편성 기준연월 "YYYYMM"(cost_entries.yyyymm과 같은 기준)'
+    yyyymm: Mapped[int] = mapped_column(
+        Integer, comment="이 파일이 속한 편성 기준연월 YYYYMM 6자리 정수(cost_entries.yyyymm과 같은 기준)"
     )
     col_key: Mapped[str] = mapped_column(
         String(10),

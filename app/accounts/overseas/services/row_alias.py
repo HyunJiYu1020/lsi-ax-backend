@@ -27,7 +27,7 @@ def alias_rows(db: Session, norms: list[str]) -> dict[str, RowAlias]:
     }
 
 
-def match_candidates(db: Session, yyyymm: str, version: str | None) -> list[dict]:
+def match_candidates(db: Session, yyyymm: int, version: str | None) -> list[dict]:
     """비교 대상: ① 고정 비용항목(집계로 계산되는 그룹 행은 제외 — 거기에 값을 꽂을 수 없다),
     ② 그 달에 이미 쓰이는 추가 행(연구소 전체에서 모은 이름, 어느 연구소가 쓰는지까지)."""
     out: list[dict] = [

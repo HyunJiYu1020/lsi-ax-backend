@@ -16,7 +16,7 @@ from app.accounts.overseas.services.extra_rows import months_by_category
 from app.accounts.overseas.schemas import ReasonRow
 
 # 실제 데이터와 안 겹치는 미래의 가짜 연월/연도를 키로 써서 테스트한다.
-TEST_YM = "209901"
+TEST_YM = 209901
 # 중복 키 테스트용 자리 — 실제 연구소 pk를 쓴다(쓰지 않는 가상 scope를 쓰면,
 # 그 가상 행이 없어졌을 때 테스트가 "무엇을 덮어쓰는지" 모르는 채로 통과한다).
 TEST_SCOPE = "SARC:CPU"
@@ -197,7 +197,7 @@ def test_bulk_upsert_reason_rows(db):
         )
     ]
     # 기준월은 이제 필수다 — 행에 없으면 호출부가 기본값으로 준다(없으면 400).
-    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, "202609")
+    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, 202609)
     db.flush()
 
     row = db.scalar(
@@ -205,10 +205,10 @@ def test_bulk_upsert_reason_rows(db):
     )
     assert row is not None
     assert float(row.cur_value) == 3.0
-    assert row.yyyymm == "202609"
+    assert row.yyyymm == 202609
 
     # 같은 연구소·항목이라도 달이 다르면 다른 행이다 — 11월 회신이 9월 회신을 덮으면 안 된다.
-    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, "202611")
+    upsert_reason_rows(db, reasons, {r.lab_code for r in reasons}, 202611)
     db.flush()
     yms = set(
         db.scalars(
@@ -217,7 +217,7 @@ def test_bulk_upsert_reason_rows(db):
             )
         )
     )
-    assert yms == {"202609", "202611"}
+    assert yms == {202609, 202611}
 
 
 # ---------- 적용 차수 고르기 ----------
@@ -269,7 +269,7 @@ def test_blank_month_deletes_the_stored_row(db):
     연구소가 칸을 비워 다시 보내는 것은 "그 달은 아직 안 냈다"는 보고다. 건너뛰기만 하면 지난
     업로드의 숫자가 남아 화면이 거짓으로 채워지고, 0으로 덮으면 "0으로 보고"가 된다. 그래서
     지우는 것이 유일하게 뜻이 맞는 처리다. 0.0은 지우지 않는다(그건 보고된 값이다)."""
-    pk, ym, cat = "DSRA", "209905", "sal"
+    pk, ym, cat = "DSRA", 209905, "sal"
     bulk_upsert_cost_entries(db, [(pk, "forecast", cat, ym, [1.0, 2.0, 0.0] + [None] * 9)])
     assert months_by_category(db, pk, "forecast", ym)[cat][:3] == [1.0, 2.0, 0.0]
 

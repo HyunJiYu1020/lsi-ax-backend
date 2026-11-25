@@ -295,7 +295,7 @@ def bulk_upsert_plan_entries(
     db.execute(detail_stmt)
 
 
-def get_or_create_entry(db: Session, scope_code: str, version: str, category_code: str, yyyymm: str) -> int:
+def get_or_create_entry(db: Session, scope_code: str, version: str, category_code: str, yyyymm: int) -> int:
     """비용 헤더(cost_entries)를 account_code×scope_code×category_code×yyyymm×version으로 upsert하고
     id를 돌려준다."""
     stmt = pg_insert(CostEntry).values(
@@ -352,9 +352,9 @@ def upsert_entry_months(db: Session, cost_entry_id: int, base_year: int, months:
 
 
 def filled_cost_yyyymm(
-    db: Session, version: str, before: str | None = None, after: str | None = None
-) -> str:
-    """그 버전에서 **합산 대상 연구소 데이터가 실제로 들어 있는** 가장 늦은 편성 연월. 없으면 빈 문자열.
+    db: Session, version: str, before: int | None = None, after: int | None = None
+) -> int:
+    """그 버전에서 **합산 대상 연구소 데이터가 실제로 들어 있는** 가장 늦은 편성 연월. 없으면 0.
 
     왜 max(yyyymm)이 아닌가 (2026-11-23): 그냥 최댓값을 집으면 연구소 행이 하나도 없는 달도 "그
     버전이 있는 달"로 집힌다. 실제로 11월 속보에 값이 없는 줄 하나만 들어간 적이 있는데,
@@ -382,10 +382,10 @@ def filled_cost_yyyymm(
     for ym in db.scalars(stmt):
         if has_summable_rows(db, version, ym):
             return ym
-    return ""
+    return 0
 
 
-def has_summable_rows(db: Session, version: str, ym: str) -> bool:
+def has_summable_rows(db: Session, version: str, ym: int) -> bool:
     """그 버전·연월에 합산 대상 연구소 행이 하나라도 있나 — filled_cost_yyyymm과 같은 판정이다
     (달을 알고 있을 때 쓴다)."""
     if not ym:
@@ -397,15 +397,15 @@ def has_summable_rows(db: Session, version: str, ym: str) -> bool:
                 CostEntry.account_code == ACCOUNT_KEY,
                 CostEntry.version == version,
                 CostEntry.yyyymm == ym,
-                CostEntry.scope_code.in_(summable_pks(db, f"{ym[:4]}-{ym[4:6]}")),
+                CostEntry.scope_code.in_(summable_pks(db, f"{ym_year(ym):04d}-{ym_month(ym):02d}")),
             )
             .limit(1)
         )
     )
 
 
-def current_basis_yyyymm(db: Session) -> str:
-    """지금 편성 기준 연월 "YYYYMM" — forecast(속보) 중 가장 최근. 아무것도 없으면 빈 문자열.
+def current_basis_yyyymm(db: Session) -> int:
+    """지금 편성 기준 연월 YYYYMM 6자리 정수 — forecast(속보) 중 가장 최근. 아무것도 없으면 0.
 
     current_basis_month가 월만 돌려주는 것과 달리 연도까지 필요한 곳이 있다. "지나간 칸은 건드리지
     않는다"를 판정할 때가 그렇다 — 월만 보면 연말에 202512와 202601을 거꾸로 비교한다."""

@@ -33,7 +33,7 @@ _SET_COLS = (
 
 
 def upsert_reason_rows(
-    db: Session, rows: list[ReasonRow], known_lab_codes: set[str], default_yyyymm: str = ""
+    db: Session, rows: list[ReasonRow], known_lab_codes: set[str], default_yyyymm: int = 0
 ) -> int:
     """보낸 행을 키로 upsert한다. 반영된 행 수를 돌려준다.
 

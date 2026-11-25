@@ -15,6 +15,7 @@ from app.accounts.overseas.cost_groups import (
     resolve_leaves,
 )
 from app.shared.core import anomaly
+from app.shared.core.periods import ym_month, ym_year
 from app.shared.models.generic import AnomalyRule, AnomalyRuleLog
 from app.accounts.overseas.schemas import (
     AnomalyFinding,
@@ -154,10 +155,10 @@ def analysis_bases(db: Session, body: AnomalyScanIn) -> tuple[dict[str, dict | N
     skipped: list[tuple[str, str]] = []
     if not body.analysis:
         return out, skipped
-    ym = (body.yyyymm or "").strip()
-    if len(ym) != 6 or not ym.isdigit():
+    ym = body.yyyymm or 0
+    if not (2000 <= ym_year(ym) <= 2999 and 1 <= ym_month(ym) <= 12):
         return out, [("analysis_prev", "증감분석 대조 — 기준 연월(yyyymm)을 읽을 수 없습니다")]
-    year, month = int(ym[:4]), int(ym[4:6])
+    year, month = ym_year(ym), ym_month(ym)
     pks = set(scan_pks(db, body.lab_pk, body.base_lab_wide))
 
     by_key = {b.key: b for b in resolve_bases(db, year, month, body.version).bases}
@@ -184,7 +185,7 @@ def analysis_bases(db: Session, body: AnomalyScanIn) -> tuple[dict[str, dict | N
     return out, skipped
 
 
-def base_months(db: Session, lab_pk: str, version: str, ym: str, lab_wide: bool) -> dict[str, list[float]]:
+def base_months(db: Session, lab_pk: str, version: str, ym: int, lab_wide: bool) -> dict[str, list[float]]:
     """급변·단위 검사가 비교할 전월 속보 값. lab_wide면 파트를 전부 더한다(scan_pks와 같은 이유)."""
     if not lab_wide:
         return months_by_category(db, lab_pk, version, ym)

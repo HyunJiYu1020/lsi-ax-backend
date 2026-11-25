@@ -7,7 +7,7 @@ from app.shared.models.common import Upload
 from app.accounts.overseas.services.labs import ACCOUNT_KEY
 
 
-def next_revision(db: Session, scope_key: str, yyyymm: str) -> str:
+def next_revision(db: Session, scope_key: str, yyyymm: int | None) -> str:
     """그 (연구소, 기준월)의 다음 차수. 경영계획처럼 달이 없는 자료는 차수를 세지 않는다.
 
     세는 일을 서버가 하는 이유: 올리는 쪽은 그 달에 이미 몇 번 올라왔는지 모른다. 두 사람이

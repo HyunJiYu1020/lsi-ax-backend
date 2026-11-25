@@ -21,7 +21,7 @@ from app.accounts.overseas.schemas import ExtraColIn, ExtraValueIn
 from app.accounts.overseas.services.labs import all_labs
 
 # 실제 데이터가 없는 가짜 기준월 — 개발 DB의 2026년 자료를 건드리지 않는다(db 픽스처가 롤백도 한다).
-YM = "209509"
+YM = 209509
 
 
 @pytest.fixture

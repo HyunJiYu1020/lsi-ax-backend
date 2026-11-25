@@ -35,7 +35,7 @@ def save_overseas_state(*a, **kw):
     return _save_overseas_state(*a, **kw)
 
 # 실제 데이터와 겹치지 않는 미래 연월
-YYYYMM = "209912"
+YYYYMM = 209912
 YEAR = 2099
 PK = "SARC:CPU"
 CAT = "sal"

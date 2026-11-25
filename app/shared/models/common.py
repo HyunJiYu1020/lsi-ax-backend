@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Integer,
     Numeric,
     SmallInteger,
     String,
@@ -22,6 +23,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
+
+# yyyymm(편성 기준연월)은 202609처럼 6자리 정수다 — 연도 4자리 + 월 2자리. 정수라 "숫자인지"는
+# 타입이 보장하고, CHECK는 자리수와 월 범위만 본다. `/ 100`이 연도, `% 100`이 월이다
+# (app/shared/core/periods.py의 ym_year · ym_month와 같은 규칙).
+YYYYMM_CHECK = "yyyymm / 100 BETWEEN 2000 AND 2999 AND yyyymm % 100 BETWEEN 1 AND 12"
 
 
 class SheetRow(Base):
@@ -56,7 +62,7 @@ class SheetRow(Base):
 
 
 class CostEntry(Base):
-    """계정×행×비용항목×시점의 편성 회차 헤더. yyyymm은 편성 기준 연월(예: "202609"), version은
+    """계정×행×비용항목×시점의 편성 회차 헤더. yyyymm은 편성 기준 연월(예: 202609), version은
     forecast(속보)|actual(실적)만 저장한다(경영계획은 ManagementPlanEntry가 따로 담당).
     scope_code는 계정 안의 행 단위 식별자로 계정마다 의미가 달라 FK로 강제하지 않고 애플리케이션이
     검증한다. label·label_en·anchor_key는 사용자가 추가한 커스텀 행일 때만 채워지고, 고정 항목은
@@ -65,7 +71,7 @@ class CostEntry(Base):
     __tablename__ = "cost_entries"
     __table_args__ = (
         UniqueConstraint("account_code", "scope_code", "category_code", "yyyymm", "version"),
-        CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_cost_entries_yyyymm_format"),
+        CheckConstraint(YYYYMM_CHECK, name="ck_cost_entries_yyyymm_format"),
         CheckConstraint("version IN ('forecast', 'actual')", name="ck_cost_entries_version"),
         # 읽기 핫패스 인덱스(마이그레이션 f2b7c9d14e08). 위 UNIQUE는 (account_code, scope_code, ...)
         # 순서라 selectivity가 거의 없는 account_code만 걸러지고 version·yyyymm은 못 쓴다 —
@@ -81,7 +87,7 @@ class CostEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    yyyymm: Mapped[str] = mapped_column(String(6), comment='편성 기준 연월 "YYYYMM" (예: "202609")')
+    yyyymm: Mapped[int] = mapped_column(Integer, comment="편성 기준 연월 YYYYMM 6자리 정수 (예: 202609)")
     account_code: Mapped[str] = mapped_column(
         String(32), ForeignKey("accounts.key"), comment='accounts.key ("overseas", "dep", ...) — 가장 큰 분류'
     )
@@ -197,9 +203,13 @@ class Upload(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
     scope_key: Mapped[str] = mapped_column(String(40), comment="계정 안에서의 행 단위 식별자")
-    # 달이 없는 자료(경영계획)는 빈 문자열이고, 그때는 version이 그 해의 차수(P02)를 가리킨다.
-    yyyymm: Mapped[str] = mapped_column(
-        String(6), default="", comment='이 파일이 속한 기준연월 "YYYYMM". 경영계획처럼 달이 없는 자료는 빈 문자열'
+    # 달이 없는 자료(경영계획)는 NULL이고, 그때는 version이 그 해의 차수(P02)를 가리킨다.
+    # 여기만 nullable인 이유: 정수에는 "빈 문자열"에 해당하는 자리가 없다. 0을 센티넬로 쓰면
+    # CHECK(월 1~12)와 싸우고, 날짜순 정렬에서 맨 앞에 끼어든다. 이 칼럼은 UNIQUE 제약에
+    # 들어가지 않고(ix_uploads_account_scope_month_recent 인덱스에만 쓴다) ON CONFLICT 대상도
+    # 아니라서, NULL을 서로 다른 값으로 보는 Postgres 성질이 중복 삽입을 낼 자리가 없다.
+    yyyymm: Mapped[int | None] = mapped_column(
+        Integer, comment="이 파일이 속한 기준연월 YYYYMM 6자리 정수. 경영계획처럼 달이 없는 자료는 NULL"
     )
     # 같은 달에 **몇 번째로 받은 파일인지**. 경영계획이 차수를 P00·P01·P02로 관리하는 것과 같은
     # 관례다 — 연구소가 같은 달에 두 번 보내면 v1 · v2로 남아 "무엇을 받아 지금 숫자가 됐나"를
@@ -256,7 +266,7 @@ class ExtraCol(Base):
     __table_args__ = (
         UniqueConstraint("account_key", "scope_key", "version", "yyyymm", "label"),
         CheckConstraint("version IN ('forecast', 'actual')", name="ck_extra_cols_version"),
-        CheckConstraint(r"yyyymm ~ '^\d{4}(0[1-9]|1[0-2])$'", name="ck_extra_cols_yyyymm_format"),
+        CheckConstraint(YYYYMM_CHECK, name="ck_extra_cols_yyyymm_format"),
         CheckConstraint("fmt IN ('raw', 'pct_ratio', 'pct_plain')", name="ck_extra_cols_fmt"),
         {"comment": "편성 그리드 추가 열(존재·이름·파생 여부). 원시 열의 칸 값은 cost_entry_details 참조."},
     )
@@ -265,7 +275,7 @@ class ExtraCol(Base):
     account_key: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.key"), comment="accounts.key")
     scope_key: Mapped[str] = mapped_column(String(40), comment="계정 안에서의 행 단위 식별자 (해외연구소는 연구소 pk)")
     version: Mapped[str] = mapped_column(String(10), comment="forecast(속보) | actual(실적)")
-    yyyymm: Mapped[str] = mapped_column(String(6), comment='편성 기준 연월 "YYYYMM" (예: "202609")')
+    yyyymm: Mapped[int] = mapped_column(Integer, comment="편성 기준 연월 YYYYMM 6자리 정수 (예: 202609)")
     label: Mapped[str] = mapped_column(String(100), comment="사용자가 입력한 열 이름. 이 값 자체가 열 식별자")
     is_derived: Mapped[bool] = mapped_column(
         Boolean,

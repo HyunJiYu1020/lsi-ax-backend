@@ -21,8 +21,8 @@ from app.accounts.overseas.services.labs import all_labs
 
 # 실제 데이터가 없는 가짜 기준월. 개발 DB의 2026년 자료를 건드리지 않고 교체 규칙만 본다
 # (conftest의 db 픽스처가 롤백하긴 하지만, 어느 달을 보고 있는지가 테스트에서도 분명해야 한다).
-YM = "209509"
-OTHER_YM = "209510"  # 건드리면 안 되는 다른 달
+YM = 209509
+OTHER_YM = 209510  # 건드리면 안 되는 다른 달
 
 
 @pytest.fixture

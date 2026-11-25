@@ -1,7 +1,9 @@
 """기간(연·월·분기) 표기와 변환 — 전 계정 공용 순수 유틸. DB도 HTTP도 모른다.
 
-yyyymm은 "YYYYMM" 6자리 고정폭이다 — 고정폭이라 문자열 크기 비교가 곧 날짜순 비교가 되고
+yyyymm은 YYYYMM 6자리 **정수**다(202609). 자리수가 고정이라 크기 비교가 곧 날짜순 비교가 되고
 (`max(yyyymm)`이 최신 달), 그래서 DB 쿼리에서 따로 날짜 타입으로 바꾸지 않고 그대로 정렬·비교한다.
+연·월 분해는 `/ 100`과 `% 100`이다 — DB에서도 같은 식을 쓸 수 있어서(CHECK 제약이 그렇게 걸려
+있다: app/shared/models/common.py의 YYYYMM_CHECK) 파이썬과 SQL이 같은 규칙을 공유한다.
 """
 
 # 기간 코드 → 그 기간에 드는 월 인덱스(0=1월). 조회 파라미터(period=y|q1~q4|m1~m12)를 그대로 받는다.
@@ -15,19 +17,19 @@ PERIOD_IX: dict[str, tuple[int, ...]] = {
 QUARTER_END_IX: tuple[int, ...] = (2, 5, 8, 11)
 
 
-def yyyymm(year: int, month: int) -> str:
-    """(2026, 9) -> "202609"."""
-    return f"{year:04d}{month:02d}"
+def yyyymm(year: int, month: int) -> int:
+    """(2026, 9) -> 202609."""
+    return year * 100 + month
 
 
-def ym_year(ym: str) -> int:
-    """"202609" -> 2026."""
-    return int(ym[:4])
+def ym_year(ym: int) -> int:
+    """202609 -> 2026."""
+    return ym // 100
 
 
-def ym_month(ym: str) -> int:
-    """"202609" -> 9."""
-    return int(ym[4:6])
+def ym_month(ym: int) -> int:
+    """202609 -> 9."""
+    return ym % 100
 
 
 def month_value(cats: dict[str, list], key: str, j: int):

@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from dataclasses import dataclass
 
-from app.shared.core.periods import yyyymm
+from app.shared.core.periods import ym_month, ym_year, yyyymm
 from app.accounts.overseas.services.aggregate import extra_row_months
 from app.accounts.overseas.services.extra_rows import read_extra_rows
 from app.accounts.overseas.services.fxcalc import rate_arrays
@@ -57,11 +57,11 @@ def check_kind(kind: str) -> str:
 # "그 버전에 데이터가 있나"는 **계산이 실제로 읽는 집합**으로 판정한다(entries.has_summable_rows ·
 # filled_cost_yyyymm). 행이 하나라도 있으면 있다고 보면, 값이 없는 줄 하나만 들어간 달이
 # "속보가 있는 달"로 집힌다 — 그 달로 화면이 열리고 증감분석은 "데이터가 없다"로 404를 낸다.
-def has_cost_data(db: Session, version: str, yyyymm: str) -> bool:
+def has_cost_data(db: Session, version: str, yyyymm: int) -> bool:
     return has_summable_rows(db, version, yyyymm)
 
 
-def latest_cost_yyyymm(db: Session, version: str, before: str | None = None) -> str | None:
+def latest_cost_yyyymm(db: Session, version: str, before: int | None = None) -> int | None:
     """그 버전 종류에서 데이터가 실제로 들어있는 가장 최근 편성 연월. before를 주면 그보다 앞선 것만."""
     return filled_cost_yyyymm(db, version, before=before) or None
 
@@ -120,7 +120,7 @@ def prev_spec(db: Session, year: int, month: int, kind: str) -> tuple[int, int, 
     for fb_kind in ("actual", "forecast"):
         latest = latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
         if latest:
-            fy, fm = int(latest[:4]), int(latest[4:6])
+            fy, fm = ym_year(latest), ym_month(latest)
             return (
                 fy,
                 fm,
@@ -141,7 +141,7 @@ def prior_spec(db: Session, year: int, month: int) -> tuple[int, int, str, str]:
     for fb_kind in ("actual", "forecast"):
         latest = latest_cost_yyyymm(db, fb_kind, before=cur_yyyymm)
         if latest:
-            fy, fm = int(latest[:4]), int(latest[4:6])
+            fy, fm = ym_year(latest), ym_month(latest)
             return (
                 fy,
                 fm,
@@ -253,7 +253,7 @@ def resolve_bases(
 
 
 # ---------- 버전 데이터 읽기 ----------
-def load_cost_version(db: Session, version: str, yyyymm: str, lab_pks: set[str]) -> dict[str, dict[str, list]]:
+def load_cost_version(db: Session, version: str, yyyymm: int, lab_pks: set[str]) -> dict[str, dict[str, list]]:
     """cost_entries 한 버전(편성 연월 1건)을 pk → 계정 → 12개월 배열로 읽는다.
 
     연구소가 직접 추가한 행(label이 채워진 행)은 뺀다 — 고정 계정 합계에 섞이면 같은 금액이 두 번
@@ -355,7 +355,7 @@ class TableInputs:
     plan_no: str              # 경영계획이면 차수, 아니면 빈 문자열
     label: str                # "26.09 속보" 같은 사람이 읽는 이름
     api_version: str          # 추가 행·환율을 읽을 슬롯(forecast | actual)
-    extras_yyyymm: str        # 그 슬롯의 연월("YYYYMM")
+    extras_yyyymm: int        # 그 슬롯의 연월(YYYYMM 6자리 정수)
     labs: dict                # 계산에 넣을 연구소 pk → 기준정보(합계 시트 제외)
     pks: list                 # labs의 키를 정렬한 목록
     d: dict                   # 연구소 pk → 비용항목 → 12개월($)

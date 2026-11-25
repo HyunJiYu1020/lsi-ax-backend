@@ -13,7 +13,7 @@ from app.accounts.overseas.services.row_alias import match_candidates
 from app.shared.core import row_match
 from app.accounts.overseas.schemas import RowAliasIn, RowMatchIn
 
-YYYYMM = "202609"
+YYYYMM = 202609
 
 
 def _match(db, labels):

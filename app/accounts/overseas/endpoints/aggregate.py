@@ -89,7 +89,7 @@ def get_cp_contract(year: int, as_of: str, db: Session = Depends(get_db)) -> CpC
 
 
 # ---------- 확정 사전점검 ----------
-def _uploaded_lab_pks(db: Session, ym: str, version: str) -> set[str]:
+def _uploaded_lab_pks(db: Session, ym: int, version: str) -> set[str]:
     """그 버전·연월에 "칸이 하나라도 등록된" 연구소 pk.
 
     값이 0인 칸도 올라온 것으로 센다 — 0으로 보고한 연구소를 미업로드로 세면 "12개 중 n개 기준"이

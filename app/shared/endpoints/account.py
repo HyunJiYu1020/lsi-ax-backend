@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.shared.core.enums import CodeGroup
+from app.shared.core.periods import ym_month, ym_year
 from app.db.session import get_db
 from app.shared.models.account import Account, AccountProgress, AccountStep
 from app.shared.models.common import CostEntry, CostEntryDetail
@@ -32,10 +33,14 @@ from app.shared.schemas.account import (
 router = APIRouter()
 
 
-def _check_yyyymm(yyyymm: str) -> None:
-    """"202609" 모양만 받는다 — 형식이 틀리면 조용히 다른 버전 칸에 쓰게 된다."""
-    if not (len(yyyymm) == 6 and yyyymm.isdigit() and 1 <= int(yyyymm[4:]) <= 12):
-        raise HTTPException(status_code=400, detail=f'yyyymm은 "YYYYMM" 형식이어야 합니다: {yyyymm!r}')
+def _check_yyyymm(yyyymm: int) -> None:
+    """202609 모양만 받는다 — 형식이 틀리면 조용히 다른 버전 칸에 쓰게 된다.
+
+    DB의 CHECK 제약(models/common.py의 YYYYMM_CHECK)과 같은 규칙이다. 여기서 먼저 막는 이유는
+    제약 위반을 500이 아니라 400으로 돌려주기 위해서다.
+    """
+    if not (2000 <= ym_year(yyyymm) <= 2999 and 1 <= ym_month(yyyymm) <= 12):
+        raise HTTPException(status_code=400, detail=f"yyyymm은 YYYYMM 6자리 정수여야 합니다: {yyyymm!r}")
 
 
 def _status_labels(db: Session) -> dict[str, str]:
@@ -102,7 +107,7 @@ SUMMARY_CATEGORY = "total"
 PRIOR_CATEGORY = "prior"
 
 
-def _summary_header(db: Session, key: str, yyyymm: str, version: str, category: str) -> CostEntry | None:
+def _summary_header(db: Session, key: str, yyyymm: int, version: str, category: str) -> CostEntry | None:
     return db.scalar(
         select(CostEntry).where(
             CostEntry.account_code == key,
@@ -114,8 +119,8 @@ def _summary_header(db: Session, key: str, yyyymm: str, version: str, category: 
     )
 
 
-def _summary_of(db: Session, a: Account, yyyymm: str, version: str) -> AccountSummaryOut:
-    year = int(yyyymm[:4])
+def _summary_of(db: Session, a: Account, yyyymm: int, version: str) -> AccountSummaryOut:
+    year = ym_year(yyyymm)
     monthly = [0.0] * 12
     head = _summary_header(db, a.key, yyyymm, version, SUMMARY_CATEGORY)
     if head is not None:
@@ -146,7 +151,7 @@ def _summary_of(db: Session, a: Account, yyyymm: str, version: str) -> AccountSu
 
 @router.get("/accounts/summaries", response_model=list[AccountSummaryOut])
 def list_account_summaries(
-    yyyymm: str, version: str = "forecast", db: Session = Depends(get_db)
+    yyyymm: int, version: str = "forecast", db: Session = Depends(get_db)
 ) -> list[AccountSummaryOut]:
     """19개 계정의 그 버전 월별 편성액·전년 실적 총액 — 전체 현황판이 한 번에 받는다.
 
@@ -171,7 +176,7 @@ def put_account_summary(
     account = db.scalar(select(Account).where(Account.key == key))
     if account is None:
         raise HTTPException(status_code=404, detail=f"그런 계정이 없습니다: {key}")
-    year = int(body.yyyymm[:4])
+    year = ym_year(body.yyyymm)
     months = [float(v or 0) for v in (body.monthly or [])][:12]
     months += [0.0] * (12 - len(months))
 

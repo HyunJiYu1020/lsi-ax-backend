@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
     reason="node 또는 프런트 소스(frontend-html/shared/core.js)가 없어 대조할 수 없다",
 )
 
-YM = "209509"  # 실제 데이터가 없는 가짜 기준월(test_cost_headers_api와 같은 이유)
+YM = 209509  # 실제 데이터가 없는 가짜 기준월(test_cost_headers_api와 같은 이유)
 
 # 계정 행 — ovParse는 고정 계정을 3개 이상 찾아야 시트로 인정한다.
 ROWS = [

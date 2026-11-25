@@ -16,7 +16,7 @@ from app.accounts.overseas.schemas import AnomalyRuleIn, AnomalyScanIn
 # 호출부가 안 넘기게 바뀌어도 이 파일만 통과한다.
 from app.accounts.overseas.services.anomaly_rules import COUNT_KEYS
 
-YM, BASE_YM, VER = "209901", "209812", "forecast"
+YM, BASE_YM, VER = 209901, 209812, "forecast"
 
 # 저장·검사 단위는 $다(2026-11-18 단위 전환 — 그 전에는 K$였다). 이 파일의 금액은 "몇 K$인가"로
 # 읽는 게 업무에 가까워서, 숫자는 K$로 적고 K를 곱해 $로 넘긴다. 인력(명)·비율(%)에는 곱하지 않는다.
@@ -63,9 +63,13 @@ def test_jump_reports_the_month_that_drove_it():
 
 
 def test_new_item_without_base_is_reported_as_new():
-    """전실행에 없던 항목은 비율을 낼 수 없다 — 0으로 나누지 말고 "신규"로 알린다."""
+    """전실행에 없던 항목은 비율을 낼 수 없다 — 0으로 나누지 말고 "전실행 0"으로 알린다.
+
+    문구에 "신규"를 쓰지 않는다: 화면의 '신규'는 계정 자체가 없던 것(계정 목록에 없는 이름으로 온
+    행 · 양식 밖 열)만 가리키고, 이쪽은 계정 행은 있었고 금액만 0이던 자리라 이상값으로 센다."""
     f = [x for x in _detect({"cons": [5 * K] * 12}, {"travel": [1 * K] * 12}) if x["rule"] == "jump"]
-    assert len(f) == 1 and "신규" in f[0]["message"] and f[0].get("rate") is None
+    assert len(f) == 1 and "전실행 0" in f[0]["message"] and "신규" not in f[0]["message"]
+    assert f[0].get("rate") is None and f[0].get("base") == 0
 
 
 def test_sum_mismatch_allows_rounding():

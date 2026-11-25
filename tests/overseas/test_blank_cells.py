@@ -12,7 +12,7 @@ from app.shared.core.values import n
 from app.accounts.overseas.services.entries import bulk_upsert_cost_entries, entry_months_bulk
 from app.accounts.overseas.services.aggregate import krw_months
 
-TEST_YM = "209902"
+TEST_YM = 209902
 
 
 def _entry(db, scope: str, category: str) -> CostEntry:

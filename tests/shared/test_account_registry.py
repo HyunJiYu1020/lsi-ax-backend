@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from app.shared.endpoints import account as ep
 from app.shared.schemas.account import AccountSummaryIn, AccountUpdate
 
-YM = "202609"
+YM = 202609
 KEY = "market"
 
 
@@ -76,7 +76,10 @@ def test_summary_is_per_version(db):
 
 def test_bad_inputs(db):
     with pytest.raises(HTTPException) as e:
-        ep.put_account_summary(KEY, AccountSummaryIn(yyyymm="2026-09"), db=db)
+        # 13월 — 정수이긴 해서 pydantic은 통과하고, _check_yyyymm이 400으로 막아야 한다.
+        # (yyyymm이 varchar였을 때는 "2026-09" 같은 모양 오류를 여기서 걸렀다. 이제 그런 값은
+        #  pydantic이 먼저 422로 거절하므로, 이 테스트는 "숫자지만 없는 달"을 본다.)
+        ep.put_account_summary(KEY, AccountSummaryIn(yyyymm=202613), db=db)
     assert e.value.status_code == 400
     with pytest.raises(HTTPException) as e:
         ep.put_account_summary(KEY, AccountSummaryIn(yyyymm=YM, version="plan"), db=db)

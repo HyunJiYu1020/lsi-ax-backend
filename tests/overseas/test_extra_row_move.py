@@ -17,7 +17,7 @@ from app.accounts.overseas.schemas import ExtraRowIn
 
 LAB = "SARC:CPU"
 VERSION = "forecast"
-YYYYMM = "209706"
+YYYYMM = 209706
 ROW = "test_move_row"
 MONTHS = [float(m) for m in range(1, 13)]
 

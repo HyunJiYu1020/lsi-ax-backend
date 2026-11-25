@@ -12,6 +12,7 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.shared.core.periods import ym_month, ym_year
 from app.shared.models.version import Version, VersionAccountStatus
 
 # cost_entries의 version 값 → versions.kind. 같은 값이지만 두 테이블이 쓰는 이름이 달라서 한 곳에
@@ -19,7 +20,7 @@ from app.shared.models.version import Version, VersionAccountStatus
 VERSION_TO_KIND = {"forecast": "forecast", "actual": "actual"}
 
 
-def unconfirm_account(db: Session, yyyymm: str, version: str, account_key: str) -> bool:
+def unconfirm_account(db: Session, yyyymm: int, version: str, account_key: str) -> bool:
     """그 버전·그 계정의 확정을 작성 중으로 되돌린다. 되돌렸으면 True, 되돌릴 게 없었으면 False.
 
     버전 행이 아예 없거나 그 계정이 확정 상태가 아니면 아무것도 하지 않는다 — 없는 버전을 만들지
@@ -28,9 +29,9 @@ def unconfirm_account(db: Session, yyyymm: str, version: str, account_key: str) 
     생기지 않는다.
     """
     kind = VERSION_TO_KIND.get(version)
-    if not kind or len(yyyymm) != 6:
+    if not kind or not 200001 <= yyyymm <= 299912:
         return False
-    year, month = int(yyyymm[:4]), int(yyyymm[4:])
+    year, month = ym_year(yyyymm), ym_month(yyyymm)
     v = db.scalar(
         select(Version).where(Version.year == year, Version.month == month, Version.kind == kind)
     )

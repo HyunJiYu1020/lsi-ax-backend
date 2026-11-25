@@ -23,7 +23,7 @@ Q3 = [7, 8, 9]
 def _make_col(db, label: str, op: str, months: list[int]) -> None:
     upsert_extra_col(
         ExtraColIn(
-            lab_pk="ALL", version="forecast", yyyymm=f"{BASIS_YEAR}{BASIS_MONTH:02d}",
+            lab_pk="ALL", version="forecast", yyyymm=BASIS_YEAR * 100 + BASIS_MONTH,
             label=label, is_derived=True, formula={"op": op, "months": months},
         ),
         db=db,

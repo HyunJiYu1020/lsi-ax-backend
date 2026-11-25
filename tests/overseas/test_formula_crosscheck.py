@@ -231,7 +231,7 @@ def test_labor_split_matches_backend(db, lab_scope):
     snap = state.actualV.get("cur")
     assert snap is not None  # get_labor_split이 성공했으면 반드시 있다
     basis_month = state.basis_month or 1
-    labs = {lab.pk: lab for lab in lab_views(db, yyyymm(BASIS_YEAR, basis_month))}
+    labs = {lab.pk: lab for lab in lab_views(db, f"{BASIS_YEAR:04d}-{basis_month:02d}")}
 
     pks = [row.lab_pk for row in result.labs]
     if not pks:
@@ -286,7 +286,7 @@ def test_local_currency_rate_formula_matches_core_js(db):
 
     """
     basis_month = current_basis_month(db) or 1
-    labs = lab_views(db, yyyymm(BASIS_YEAR, basis_month))
+    labs = lab_views(db, f"{BASIS_YEAR:04d}-{basis_month:02d}")
     local = {lab.currency for lab in labs if lab.currency and lab.currency != "USD"}
     if not local:
         pytest.skip("현지통화 연구소가 없다")

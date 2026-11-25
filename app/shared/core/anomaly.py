@@ -340,8 +340,12 @@ def detect(
                 continue
             if base == 0:
                 # 전실행에 없던 항목이 새로 생긴 것 — 비율을 낼 수 없어서 금액만으로 알린다.
+                # 문구에 "신규"를 쓰지 않는다 — 화면의 '신규'는 **계정 자체가 없던 것**(계정 목록에
+                # 없는 이름으로 온 행 · 양식 밖 열)만 가리킨다. 이쪽은 계정 행은 원래 있었고 금액만
+                # 0이던 자리라(EDA Tool 등 기초자료가 비어 있던 계정) 묻는 것도 다르다: 자리가 아니라
+                # "이 금액이 맞나"다. 그래서 화면도 이 건을 이상값으로 센다(core.js OV_FLAG_CLS).
                 jumped[cat] = None
-                add("jump", cat, None, f"전실행에 없던 항목에 {_k(cur)}가 올라왔습니다 (신규)", value=cur, base=base)
+                add("jump", cat, None, f"전실행에 없던 항목에 {_k(cur)}가 올라왔습니다 (전실행 0)", value=cur, base=base)
                 continue
             rate = diff / abs(base) * 100
             if abs(rate) >= pct_limit:

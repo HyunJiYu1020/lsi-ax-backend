@@ -56,7 +56,7 @@ class AccountSummaryIn(BaseModel):
     category="total") — 계정 전용 화면이 생기면 같은 자리를 더 잘게 쓰면 된다.
     """
 
-    yyyymm: str  # 편성 기준 연월 "YYYYMM" (= 그 버전)
+    yyyymm: int  # 편성 기준 연월 YYYYMM 6자리 정수 (= 그 버전)
     version: str = "forecast"  # forecast | actual
     monthly: list[float] = []  # 1~12월 편성액. 12개가 아니면 모자란 달은 0으로 채운다
     prior_amount: float = 0  # 전년 실적 총액(비교 기준)

@@ -74,7 +74,7 @@ def build(lab: str, basis: str, out_dir: Path) -> Path:
     y, m = basis.split("-")
     # 화면이 업로드 검증의 비교 상대로 쓰는 버전·연월 — **전월 속보**다(core.js ovYyyymmPrevForecast).
     pm = int(m) - 1
-    base_ym = f"{int(y) - 1}12" if pm < 1 else f"{y}{pm:02d}"
+    base_ym = (int(y) - 1) * 100 + 12 if pm < 1 else int(y) * 100 + pm
     db = SessionLocal()
     try:
         base = months_by_category(db, lab, "forecast", base_ym)
@@ -137,7 +137,7 @@ def build(lab: str, basis: str, out_dir: Path) -> Path:
     # 머리글은 파서가 찾는 모양이어야 한다(core.js ovParseRsn): "PLAN"과 M####A 코드가 한 줄에
     # 있어야 그 줄을 머리글로 잡고, 둘째 줄의 "vs Plan" · "vs M####A"로 차이·사유 칸을 찾는다.
     # 블록은 PLAN 열 두 개로 끊는다 — 앞이 연간, 뒤가 당월이다.
-    prev_code, cur_code = f"M{base_ym[2:]}A", f"M{str(y)[2:]}{int(m):02d}A"
+    prev_code, cur_code = f"M{base_ym % 10000:04d}A", f"M{str(y)[2:]}{int(m):02d}A"
     mon_label = MONTHS[mon_i] + "."
     a_hdr1 = ["계정코드", "구분", "Cost Element", "PLAN", prev_code, cur_code, f"Difference({y})", "", "", "",
               "PLAN", prev_code, cur_code, f"Difference({MONTHS[mon_i]})", "", "", ""]

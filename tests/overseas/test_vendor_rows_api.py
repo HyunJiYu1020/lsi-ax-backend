@@ -31,7 +31,7 @@ def save_overseas_state(*a, **kw):
 BASIS_YEAR = 2026
 BASIS_MONTH = 9
 # 외주용역·증감사유는 이제 "어느 달 회신인지"(yyyymm)를 들고 다닌다 — 없으면 400이다.
-YM = f"{BASIS_YEAR}{BASIS_MONTH:02d}"
+YM = BASIS_YEAR * 100 + BASIS_MONTH
 VER = "forecast"   # version은 cost_entries와 같은 값만 받는다(forecast|actual)
 
 

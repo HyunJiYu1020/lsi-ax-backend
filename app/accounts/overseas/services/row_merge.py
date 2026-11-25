@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.accounts.overseas.cost_groups import CATEGORY_LABELS, GROUP_CALC, category_label
 from app.shared.core import row_match
 from app.shared.core.confirm_state import unconfirm_account
-from app.shared.core.periods import ym_year
+from app.shared.core.periods import ym_month, ym_year
 from app.shared.core.values import n
 from app.shared.models.common import CostEntry
 from app.accounts.overseas.schemas import RowMergeIn, RowMergePreview, RowMergeResult
@@ -69,8 +69,8 @@ def merge_rows(db: Session, body: RowMergeIn) -> RowMergeResult:
     안 맞게 되면 업로드 미리보기가 색으로 알린다(anomaly: period_mismatch).
     """
     version = check_version(body.version)
-    if len(body.yyyymm) != 6 or not body.yyyymm.isdigit():
-        raise HTTPException(400, 'yyyymm은 "YYYYMM" 6자리여야 합니다.')
+    if not (2000 <= ym_year(body.yyyymm) <= 2999 and 1 <= ym_month(body.yyyymm) <= 12):
+        raise HTTPException(400, "yyyymm은 YYYYMM 6자리 정수여야 합니다.")
     basis = current_basis_yyyymm(db)
     if basis and body.yyyymm < basis:
         raise HTTPException(

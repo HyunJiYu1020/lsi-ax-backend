@@ -15,7 +15,7 @@ from app.accounts.overseas.cost_groups import AGGREGATE_ROWS, CATEGORY_LABELS, C
 from app.shared.core import row_match
 from app.shared.core.values import n
 from app.accounts.overseas.models import OverseasLab
-from app.shared.core.periods import ym_year
+from app.shared.core.periods import ym_month, ym_year
 from app.shared.models.common import CostEntry, CostEntryDetail
 from app.accounts.overseas.schemas import ExtraRowIn, ExtraRowOut
 from app.accounts.overseas.services.entries import entry_months_bulk
@@ -54,7 +54,7 @@ def operand_months(key: str, by_category: dict[str, list[float]], width: int) ->
             out[i] += v
     return [round(v, 4) for v in out]
 
-def months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> dict[str, list[float]]:
+def months_by_category(db: Session, lab_pk: str, version: str, yyyymm: int) -> dict[str, list[float]]:
     """그 연구소·버전·연월에 저장된 모든 행의 월별 값을 category_code -> 월 배열로 모아 온다.
     파생 행(is_derived)은 제외한다 — 파생값을 다시 파생의 재료로 쓰면 평가가 꼬이고 순환할 수 있다.
     lab_pk가 ALL_SCOPE면 전체 연구소를 계정별로 합산한다(집계 화면의 파생 행이 쓰는 범위) —
@@ -72,7 +72,9 @@ def months_by_category(db: Session, lab_pk: str, version: str, yyyymm: str) -> d
         # CPU+GPU+TOTAL로 두 번 세어져, 재료가 그 연구소만큼 부풀고 합계·차이 파생 행이 그대로
         # 틀린다(집계표는 전부터 빼고 있어서 같은 급여 행인데 표와 파생 행 숫자가 달랐다).
         # 빼는 판정은 집계표와 같은 한 곳에서 온다(labs.is_summable).
-        stmt = stmt.where(CostEntry.scope_code.in_(summable_pks(db, f"{yyyymm[:4]}-{yyyymm[4:6]}")))
+        stmt = stmt.where(
+            CostEntry.scope_code.in_(summable_pks(db, f"{ym_year(yyyymm):04d}-{ym_month(yyyymm):02d}"))
+        )
     entries = list(db.scalars(stmt))
     months_by_entry = entry_months_bulk(db, entries)
     out: dict[str, list[float]] = {}
@@ -214,7 +216,7 @@ def extra_cell_value(data_type: str, value: str | None, amount: float) -> float 
 
 def read_extra_rows(
     db: Session,
-    yyyymm: str,
+    yyyymm: int,
     version: str | None = None,
     lab_pk: str | None = None,
     rate: list[float] | None = None,

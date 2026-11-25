@@ -80,7 +80,7 @@ def list_cost_entries(
     scope_code: str | None = None,
     category_code: str | None = None,
     version: str | None = None,
-    yyyymm: str | None = None,
+    yyyymm: int | None = None,
     db: Session = Depends(get_db),
 ) -> list[CostEntryOut]:
     stmt = select(CostEntry).where(CostEntry.account_code == account_code)
@@ -191,7 +191,7 @@ def upsert_cost_entries_batch(body: list[CostEntryValueIn], db: Session = Depend
 
 @router.delete("/cost-entries")
 def delete_cost_entry(
-    account_code: str, scope_code: str, category_code: str, yyyymm: str, version: str, db: Session = Depends(get_db)
+    account_code: str, scope_code: str, category_code: str, yyyymm: int, version: str, db: Session = Depends(get_db)
 ) -> dict[str, str]:
     """헤더(cost_entries)를 지운다 — 디테일(cost_entry_details)은 FK CASCADE로 같이 지워진다."""
     entry = db.scalar(

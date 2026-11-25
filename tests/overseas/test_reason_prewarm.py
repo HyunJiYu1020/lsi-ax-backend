@@ -24,7 +24,7 @@ from app.shared.models.generic import TextTranslation
 
 LAB, VER = "SARC", "forecast"
 # 증감사유는 "어느 달 회신인지"(yyyymm)를 들고 다닌다 — 없으면 저장이 400으로 막힌다.
-YM = "202609"
+YM = 202609
 EN1 = "Increase mainly due to additional headcount"
 EN2 = "Decrease due to delayed tape-out"
 

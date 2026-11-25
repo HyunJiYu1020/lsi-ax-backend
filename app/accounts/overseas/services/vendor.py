@@ -18,7 +18,7 @@ from app.accounts.overseas.schemas import VendorByProjectResult, VendorProjectRo
 
 def replace_vendor_rows(
     db: Session, basis_year: int, rows: list[VendorRow], known_lab_codes: set[str],
-    default_yyyymm: str = "",
+    default_yyyymm: int = 0,
 ) -> int:
     """rows에 등장하는 (연구소, 버전, 기준월) 조합을 통째로 바꿔 넣는다. 바뀐 조합 수를 돌려준다.
 

@@ -11,7 +11,7 @@
 import hashlib
 
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import false as sa_false, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,20 +50,30 @@ from app.accounts.overseas.services.vendor import replace_vendor_rows
 from app.accounts.overseas.services.versions import resolve_bases
 
 
-def latest_uploads_stmt(lab_pks: set[str], yyyymms: list[str]):
+def latest_uploads_stmt(lab_pks: set[str], yyyymms: list[int | None]):
     """(scope_key, yyyymm) 조합마다 가장 최근 업로드 1건만 고르는 쿼리.
 
     uploads는 지울 일이 없이 계속 쌓이기만 하는 이력 테이블이라, 계정 전체를 파이썬으로 끌어와
     마지막 것만 남기는 방식은 업로드가 늘수록 그대로 느려진다. DISTINCT ON으로 DB에서 바로
     최신 행만 받아 온다(연구소·달 필터도 같이 밀어 넣어 쓸모없는 행은 아예 안 읽는다).
 
-    같은 달에 여러 번 받았으면 차수가 높은 쪽(= 나중에 받은 쪽)이 "지금 그 달의 파일"이다."""
+    같은 달에 여러 번 받았으면 차수가 높은 쪽(= 나중에 받은 쪽)이 "지금 그 달의 파일"이다.
+
+    yyyymms에 None이 들어오면 "달이 없는 자료(경영계획)"를 같이 집는다 — `IN`은 NULL을 절대 못
+    맞추므로(SQL에서 `NULL IN (...)`은 참이 되지 않는다) IS NULL 조건을 따로 OR로 붙여야 한다.
+    예전에 이 칼럼이 varchar였을 때는 빈 문자열이라 `IN ('', ...)`으로 같이 집혔다.
+    DISTINCT ON은 NULL끼리 같은 값으로 묶으므로, 그때와 같이 경영계획 행은 연구소당 1건이 된다.
+    """
+    months = [ym for ym in yyyymms if ym is not None]
+    month_filter = Upload.yyyymm.in_(months) if months else sa_false()
+    if len(months) != len(yyyymms):
+        month_filter = or_(month_filter, Upload.yyyymm.is_(None))
     return (
         select(Upload)
         .where(
             Upload.account_key == ACCOUNT_KEY,
             Upload.scope_key.in_(lab_pks),
-            Upload.yyyymm.in_(yyyymms),
+            month_filter,
         )
         .distinct(Upload.scope_key, Upload.yyyymm)
         .order_by(Upload.scope_key, Upload.yyyymm, Upload.uploaded_at.desc(), Upload.id.desc())
@@ -191,7 +201,7 @@ def build_state(
     resolved_plan_no = ""
     # 자리(cur · prev · prior · plan)마다 "그 자리가 가리키는 달". 증감사유 · 외주용역을 어느 자리로
     # 내려줄지 고르는 데 쓴다 — 두 테이블이 yyyymm을 갖게 되면서 월을 짐작할 필요가 없어졌다.
-    slot_ym: dict[str, str] = {}
+    slot_ym: dict[str, int] = {}
     slots: dict[str, str] = {}
     if basis_month:
         resolved = resolve_bases(db, basis_year, basis_month, kind, plan_no)
@@ -224,7 +234,9 @@ def build_state(
             select(CostEntry).where(
                 CostEntry.account_code == ACCOUNT_KEY,
                 CostEntry.version == "actual",
-                CostEntry.yyyymm.like(f"{basis_year:04d}%"),
+                # 그 해 12개월 범위. yyyymm이 varchar였을 때는 LIKE '2026%'로 집었다 — 정수에는
+                # LIKE를 쓸 수 없고, 자리수가 고정이라 범위 비교가 정확히 같은 집합을 가리킨다.
+                CostEntry.yyyymm.between(yyyymm(basis_year, 1), yyyymm(basis_year, 12)),
             )
         )
     )
@@ -252,19 +264,21 @@ def build_state(
         # 따로 고르면 집계·증감분석의 해석과 어긋난다(전년 = 전년 12월 실적, 경영계획 = ★ 차수).
 
     # 어느 달이 어느 자리인지 뒤집은 표. 한 달이 두 자리를 겸할 수도 있다(드물지만 막을 이유는 없다).
-    roles_of_ym: dict[str, list[str]] = {}
+    roles_of_ym: dict[int, list[str]] = {}
     for role, ym in slot_ym.items():
         roles_of_ym.setdefault(ym, []).append(role)
 
     # 업로드 이력도 기준월로 읽는다 — 자리(cur·prev…)는 저장돼 있지 않고 **그 달이 어느 자리인지**로
     # 정한다(증감사유·외주용역과 같은 규칙) — 파일이 자기 달을 들고 있다.
     files: dict[str, dict[str, FileInfo]] = {v: {} for v in ("cur", "prev", "prior", "plan")}
-    # 경영계획은 달이 없는 자료라 yyyymm이 빈 문자열이다(그때 version이 P02 같은 계획 차수다).
-    ym_wanted = {ym for ym in slot_ym.values() if ym} | {""}
-    for up in db.scalars(latest_uploads_stmt(lab_pks, sorted(ym_wanted))):
+    # 경영계획은 달이 없는 자료라 uploads.yyyymm이 NULL이다(그때 version이 P02 같은 계획 차수다).
+    # 목록 끝의 None이 "NULL 행도 같이 집어라"는 뜻이다(latest_uploads_stmt 주석).
+    ym_wanted = sorted({ym for ym in slot_ym.values() if ym}) + [None]
+    for up in db.scalars(latest_uploads_stmt(lab_pks, ym_wanted)):
         for role in (roles_of_ym.get(up.yyyymm) or (["plan"] if not up.yyyymm else [])):
             files[role][up.scope_key] = FileInfo(
-                file=up.filename, at=up.uploaded_at.strftime("%m.%d %H:%M"), yyyymm=up.yyyymm
+                # 달 없음(NULL)은 화면 쪽에서 0으로 읽는다 — FileInfo.yyyymm이 "비었으면 0"이다.
+                file=up.filename, at=up.uploaded_at.strftime("%m.%d %H:%M"), yyyymm=up.yyyymm or 0
             )
 
     note: dict[str, dict[str, str]] = {}
@@ -300,7 +314,7 @@ def build_state(
             select(OverseasReasonRow)
             .where(
                 OverseasReasonRow.lab_code.in_(lab_codes),
-                OverseasReasonRow.yyyymm.in_(roles_of_ym or [""]),
+                OverseasReasonRow.yyyymm.in_(roles_of_ym or [0]),
             )
             .order_by(
                 OverseasReasonRow.lab_code,
@@ -318,7 +332,7 @@ def build_state(
             select(OverseasVendorRow)
             .where(
                 OverseasVendorRow.lab_code.in_(lab_codes),
-                OverseasVendorRow.yyyymm.in_(roles_of_ym or [""]),
+                OverseasVendorRow.yyyymm.in_(roles_of_ym or [0]),
             )
             .order_by(OverseasVendorRow.lab_code, OverseasVendorRow.row_no)
         )
@@ -552,23 +566,31 @@ def save_state(db: Session, state: OverseasState) -> dict[str, object]:
                 plan_rev = base.plan_no or bases.default_plan_no
     # 같은 (연구소, 달)에 이미 같은 파일이 있으면 다시 적지 않는다. 다른 파일이면 차수를 올려 쌓는다 —
     # 지난 차수를 지우지 않으므로 "무엇을 받아 지금 숫자가 됐나"가 남는다.
-    seen: dict[tuple[str, str], tuple[str, int]] = {}
-    for up in db.scalars(latest_uploads_stmt(lab_pks, sorted({ym for ym in slot_ym.values() if ym} | {""}))):
+    # None은 "달이 없는 자료(경영계획)"를 집으라는 뜻이다 — 예전 빈 문자열 자리다.
+    seen: dict[tuple[str, int | None], tuple[str, int]] = {}
+    for up in db.scalars(latest_uploads_stmt(lab_pks, sorted({ym for ym in slot_ym.values() if ym}) + [None])):
         rev = int(up.version[1:]) if up.version[:1] == "v" and up.version[1:].isdigit() else 0
         seen[(up.scope_key, up.yyyymm)] = (up.filename, rev)
     for version, pk_files in state.files.items():
-        ym = slot_ym.get(version, "")
+        ym = slot_ym.get(version, 0)
         if version != "plan" and not ym and not any(i.yyyymm for i in pk_files.values()):
             continue  # 달을 모르는 자리는 적지 않는다 — 어느 달 파일인지 말할 수 없다
         for pk, info in pk_files.items():
-            ym = info.yyyymm or ym   # 화면이 달을 실어 보냈으면 그게 맞다(자리 해석보다 우선)
-            last_file, last_rev = seen.get((pk, ym), ("", 0))
+            # 화면이 달을 실어 보냈으면 그게 맞다(자리 해석보다 우선). 경영계획은 달이 없어
+            # 0이 남고, 그건 uploads.yyyymm에 NULL로 들어간다.
+            ym = info.yyyymm or ym
+            # DB에는 "달 없음"이 NULL로 들어간다 — seen의 키도 DB에서 읽은 값과 같은 모양이어야
+            # 한다(0으로 두면 방금 읽어 온 NULL 행을 못 찾아 같은 파일을 매번 다시 적는다).
+            ym_key = ym or None
+            last_file, last_rev = seen.get((pk, ym_key), ("", 0))
             if last_file == info.file:
                 continue
             # 경영계획만 계획 차수(P02)를 쓴다 — 나머지는 그 달의 다음 차수다.
             rev = (plan_rev or "P00") if version == "plan" else f"v{last_rev + 1}"
-            db.add(Upload(account_key=ACCOUNT_KEY, scope_key=pk, yyyymm=ym, version=rev, filename=info.file))
-            seen[(pk, ym)] = (info.file, last_rev + 1)
+            db.add(
+                Upload(account_key=ACCOUNT_KEY, scope_key=pk, yyyymm=ym_key, version=rev, filename=info.file)
+            )
+            seen[(pk, ym_key)] = (info.file, last_rev + 1)
 
     # 3) 증감 사유 메모
     note_rows: list[tuple[str, str, str, str, str]] = []

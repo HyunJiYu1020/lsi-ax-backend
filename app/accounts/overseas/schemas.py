@@ -9,7 +9,7 @@ class FileInfo(BaseModel):
     # 이 파일이 속한 기준연월 "YYYYMM". 화면이 자리(cur·prev…)별 묶음으로 보내더라도 달은 파일마다
     # 명시한다 — 자리는 보는 달에 따라 달라지는 값이라 저장 키로 쓸 수 없다(models.Upload 주석).
     # 비워 보내면 서버가 그 자리가 가리키는 달로 채운다.
-    yyyymm: str = ""
+    yyyymm: int = 0
 
 
 class VersionData(BaseModel):
@@ -38,7 +38,7 @@ class ReasonRow(BaseModel):
     lab_code: str
     version: str = "forecast"  # forecast(속보) | actual(실적) — cost_entries.version과 같은 값
     slot: str = ""  # 응답에만 담는 자리(cur · prev · prior · plan). 저장되는 값이 아니다
-    yyyymm: str = ""
+    yyyymm: int = 0
     category_key: str
     block: str  # "y"(연간) | "m"(월별)
     mon_label: str = ""
@@ -63,7 +63,7 @@ class VendorRow(BaseModel):
     lab_code: str
     version: str = "forecast"
     slot: str = ""
-    yyyymm: str = ""
+    yyyymm: int = 0
     row_no: int  # 업로드한 시트 안에서의 행 순서(1부터)
     category: str = ""  # Category
     project: str = ""  # Project name
@@ -254,7 +254,7 @@ class CostEntryIn(BaseModel):
     lab_pk: str
     version: str  # forecast(속보) | actual(실적)
     category_key: str
-    yyyymm: str  # 편성 기준 연월 "YYYYMM" (cost_entries.yyyymm)
+    yyyymm: int  # 편성 기준 연월 YYYYMM 6자리 정수 (cost_entries.yyyymm)
     month: int  # 이 금액이 속한 달. 기본 1~12는 yyyymm 연도 그대로, 13~24는 그다음 연도 1~12월(기간을
     # 12개월 너머로 늘려 받을 때 씀), 25~36은 그다음다음 연도… 식으로 12개씩 다음 해로 넘어간다.
     amount: float
@@ -264,7 +264,7 @@ class CostEntryOut(BaseModel):
     lab_pk: str
     version: str
     category_key: str
-    yyyymm: str
+    yyyymm: int
     year: int
     month: int
     # None = 그 달 칸이 아예 등록되지 않았다는 뜻(미업로드). 0.0("0으로 올라옴")과 구분해야 하므로
@@ -277,7 +277,9 @@ class UploadIn(BaseModel):
     # 그 기준월의 차수(v1 · v2 …). 비우면 서버가 그 달의 다음 차수를 매긴다 —
     # 올리는 쪽은 "몇 번째인지"를 알 수 없으므로 세는 일은 서버가 한다.
     version: str = ""
-    yyyymm: str = ""  # 이 파일이 속한 기준연월 "YYYYMM"
+    # 이 파일이 속한 기준연월 YYYYMM 6자리 정수. 경영계획처럼 달이 없는 자료는 None이고, 그때는
+    # version이 그 해의 차수(P02)를 가리킨다(models.Upload.yyyymm 주석).
+    yyyymm: int | None = None
     filename: str
 
 
@@ -308,7 +310,7 @@ class ExtraRowIn(BaseModel):
     row_key: str
     label: str  # 구분(한글)
     label_en: str = ""  # Cost Element(영문)
-    yyyymm: str  # v가 속한 편성 기준 연월 "YYYYMM" (cost_entries.yyyymm)
+    yyyymm: int  # v가 속한 편성 기준 연월 YYYYMM 6자리 정수 (cost_entries.yyyymm)
     anchor_key: str | None = None  # 표에서 이 계정(core.js OV_EL의 k) 바로 뒤에 끼워 넣는다. None이면 맨 끝
     # 원시 행(is_derived=False)의 월별 값. 12개월(기본) 또는 12의 배수(24·36…, 기간을 12개월 너머로
     # 늘려 받을 때). 파생 행은 값을 저장하지 않고 formula로 매번 계산하므로 비워 보내면 된다.
@@ -358,7 +360,7 @@ class ExtraColIn(BaseModel):
 
     lab_pk: str
     version: str  # forecast(속보) | actual(실적)
-    yyyymm: str
+    yyyymm: int
     label: str
     # True면 월을 가로로 묶어 계산한 파생 열(집계 전용). 칸 값을 저장하지 않고 formula로 매번 계산한다.
     is_derived: bool = False
@@ -387,7 +389,7 @@ class ExtraValueIn(BaseModel):
     lab_pk: str
     version: str
     row_key: str
-    yyyymm: str
+    yyyymm: int
     label: str
     value: float | str = 0
     # 동시 편집 지문 — ExtraRowIn.state_token과 같은 규칙(낡았으면 409, 응답에 새 지문).
@@ -412,7 +414,7 @@ class CostHeaderIn(BaseModel):
 
     lab_pk: str
     version: str  # forecast(속보) | actual(실적)
-    yyyymm: str
+    yyyymm: int
     labels: dict[str, str] = {}
     source_file: str = ""
 
@@ -642,7 +644,7 @@ class RowMatchIn(BaseModel):
     추가 행"을 어느 버전에서 찾을지 정한다(그 달에 실제로 쓰이는 행만 후보로 올린다)."""
 
     labels: list[str]
-    yyyymm: str
+    yyyymm: int
     version: str | None = None
 
 
@@ -674,7 +676,7 @@ class RowMergeIn(BaseModel):
     들어간 값"을 옮긴다. 담당자가 "Other랑 Misc 기타경비로 합쳐줘" 한 마디로 둘 다 원하므로 보통
     같이 호출되지만, 별칭은 지울 수 있고 합치기는 되돌릴 수 없어서 따로 둔다."""
 
-    yyyymm: str # 합칠 칸의 편성 기준 연월 "YYYYMM"
+    yyyymm: int # 합칠 칸의 편성 기준 연월 YYYYMM 6자리 정수
     version: str # forecast(속보) | actual(실적)
     source_labels: list[str] # 합쳐 없앨 추가 행 이름들(정규화해서 찾는다 — 'Other'/'other' 같다)
     target_kind: str # "category"(고정 계정으로) | "extra_row"(이미 있는 추가 행으로)
@@ -700,7 +702,7 @@ class RowMergeResult(BaseModel):
     """합치기 결과(또는 dry_run 미리보기)."""
 
     dry_run: bool
-    yyyymm: str
+    yyyymm: int
     version: str
     target_label: str
     merged: list[RowMergePreview] = []
@@ -731,9 +733,9 @@ class CarryForwardIn(BaseModel):
     """새 버전을 열 때, 유지 승인한 파생 행·열의 정의(계산식)만 그 버전으로 복제한다.
     값은 복제하지 않는다 — 재료가 새 버전 업로드 값으로 바뀌면 계산 결과도 그 버전 숫자로 나와야 한다."""
 
-    from_yyyymm: str
+    from_yyyymm: int
     from_version: str
-    to_yyyymm: str
+    to_yyyymm: int
     to_version: str
 
 
@@ -1536,13 +1538,13 @@ class AnomalyScanIn(BaseModel):
 
     lab_pk: str
     version: str
-    yyyymm: str
+    yyyymm: int
     vals: dict[str, list[float | None]] | None = None
     # 파일에 적혀 온 소계·합계 행(계정 키 → 12개월). 합계 불일치 검사에만 쓴다.
     sums: dict[str, list[float | None]] | None = None
     # 계정 키 → 증감사유 텍스트. 사유 누락 검사에만 쓴다.
     reasons: dict[str, str] | None = None
-    base_yyyymm: str | None = None
+    base_yyyymm: int | None = None
     base_version: str | None = None
     # 전실행을 **연구소 단위**(같은 lab_code의 파트 합)로 읽는다. 증감분석·외주용역은 연구소가
     # 연구소 전체로 보내는 시트라(SARC = CPU+GPU 합), 파트 하나의 전실행과 비교하면 SARC는

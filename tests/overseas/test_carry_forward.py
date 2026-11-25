@@ -12,7 +12,7 @@ from app.accounts.overseas.endpoints import collect as ov
 from app.accounts.overseas.services.labs import ALL_SCOPE
 from app.accounts.overseas.schemas import CarryDefIn, CarryForwardIn, ExtraRowIn
 
-FROM_YM, TO_YM, VER = "209901", "209902", "forecast"
+FROM_YM, TO_YM, VER = 209901, 209902, "forecast"
 
 
 def _mk_derived_row(db, row_key, label, yyyymm=FROM_YM):

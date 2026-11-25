@@ -17,7 +17,7 @@ from app.accounts.overseas.schemas import ExtraRowIn
 
 LAB = "SARC:CPU"
 VER = "forecast"
-YM = "209801"
+YM = 209801
 
 
 def _row(**kw):
@@ -73,4 +73,4 @@ def test_other_lab_or_month_is_not_a_duplicate(db):
     """다른 연구소·다른 연월의 같은 이름은 중복이 아니다 — 12개 연구소가 같은 이름을 쓰는 게 정상이다."""
     upsert_extra_row(_row(row_key="t_l1", label="클라우드 사용료", source="screen"), db)
     assert upsert_extra_row(_row(row_key="t_l2", label="클라우드 사용료", lab_pk="DSRA"), db)
-    assert upsert_extra_row(_row(row_key="t_l3", label="클라우드 사용료", yyyymm="209802"), db)
+    assert upsert_extra_row(_row(row_key="t_l3", label="클라우드 사용료", yyyymm=209802), db)

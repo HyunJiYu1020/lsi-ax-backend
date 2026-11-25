@@ -169,7 +169,7 @@ def test_missing_source_is_not_an_error(db, ym):
 
 def test_rejects_past_month(db, ym):
     """지나간 칸은 거절한다 — 이미 보고된 숫자를 뒤에서 바꾸면 그 달 보고서를 다시 뽑을 때 달라진다."""
-    past = f"{int(ym[:4]) - 1}12"
+    past = (ym // 100 - 1) * 100 + 12
     with pytest.raises(HTTPException) as e:
         ov.merge_rows(_body(past), db)
     assert e.value.status_code == 400
@@ -223,7 +223,7 @@ def test_merge_unconfirms_the_account(db, ym):
     from app.shared.models.version import Version
     from app.shared.schemas.version import VersionAccountStatusUpdate
 
-    year, month = int(ym[:4]), int(ym[4:])
+    year, month = ym // 100, ym % 100
     # 버전 행이 없으면 만든다(바깥 트랜잭션이 롤백되니 DB에는 안 남는다). 스킵하지 않는 이유:
     # 이 테스트가 지키려는 건 "값이 바뀌면 확정이 거짓이 된다"이고, 그건 버전 행 유무와 무관하게
     # 반드시 성립해야 한다 — 로컬 DB에 버전 행이 없다고 조용히 안 돌면 회귀를 못 잡는다.

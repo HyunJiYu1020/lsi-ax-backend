@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.accounts.overseas.cost_groups import GROUP_CALC
+from app.shared.core.periods import ym_month, ym_year
 from app.db.session import SessionLocal
 from app.accounts.overseas.models import OverseasLab, OverseasReasonRow, OverseasVendorRow, OverseasVendorRowDetail
 from app.shared.models.common import CostEntry, CostEntryDetail
@@ -156,8 +157,9 @@ def _hc_remark(diff: float) -> str:
 
 # ---------- 비용 시트(cost_entries) 읽기 ----------
 
-def _basis(db: Session) -> tuple[str, str]:
-    """(기준월 속보 yyyymm, 그 앞의 최신 실적 yyyymm). 화면의 "당월 속보 / 전실행"에 해당한다."""
+def _basis(db: Session) -> tuple[int, int]:
+    """(기준월 속보 yyyymm, 그 앞의 최신 실적 yyyymm). 화면의 "당월 속보 / 전실행"에 해당한다.
+    앞선 실적이 없으면 두 번째 값은 0이다."""
     forecast_yms = sorted(
         db.scalars(
             select(CostEntry.yyyymm)
@@ -177,7 +179,12 @@ def _basis(db: Session) -> tuple[str, str]:
         )
         if ym < cur_ym
     )
-    return cur_ym, (actual_yms[-1] if actual_yms else "")
+    return cur_ym, (actual_yms[-1] if actual_yms else 0)
+
+
+def _yy_mm(ym: int) -> str:
+    """202609 -> "2609". 시트 라벨("M2609A")과 파일명에 쓰는 두 자리 연도 + 월 표기."""
+    return f"{ym % 10000:04d}"
 
 
 def _lab_parts(db: Session) -> dict[str, list[str]]:
@@ -192,7 +199,7 @@ def _lab_parts(db: Session) -> dict[str, list[str]]:
     return parts
 
 
-def _lab_months(db: Session, yyyymm: str, version: str, lab_parts: dict[str, list[str]]) -> dict[str, dict[str, list[float]]]:
+def _lab_months(db: Session, yyyymm: int, version: str, lab_parts: dict[str, list[str]]) -> dict[str, dict[str, list[float]]]:
     """연구소코드 -> 비용항목 -> 12개월 금액. 리프 항목을 먼저 모아 파트 합산한 뒤 집계 행을 전개한다."""
     if not yyyymm:
         return {lab: {} for lab in lab_parts}
@@ -215,7 +222,7 @@ def _lab_months(db: Session, yyyymm: str, version: str, lab_parts: dict[str, lis
             select(CostEntryDetail).where(
                 CostEntryDetail.cost_entry_id.in_([e.id for e in entries]),
                 CostEntryDetail.period_type == "MONTH",
-                CostEntryDetail.year == int(yyyymm[:4]),
+                CostEntryDetail.year == ym_year(yyyymm),
             )
         ):
             months_by_entry.setdefault(d.cost_entry_id, {})[d.period] = float(d.amount)
@@ -264,9 +271,9 @@ def _plan_months(cur: dict[str, list[float]], lab: str) -> dict[str, list[float]
 
 # ---------- 증감사유 ----------
 
-def _reason_rows(lab: str, cur_ym: str, prev_ym: str, el: dict[str, dict[str, list[float]]]) -> list[dict]:
+def _reason_rows(lab: str, cur_ym: int, prev_ym: int, el: dict[str, dict[str, list[float]]]) -> list[dict]:
     """한 연구소의 증감사유 시트 행(44개 항목 × 연간·당월 2블록)을 만든다 — 화면 ovSeedX와 같은 규칙."""
-    month = int(cur_ym[4:6])
+    month = ym_month(cur_ym)
     rand = JsRandom("ovrsn|" + lab)
 
     def agg(version: str, key: str, annual: bool) -> float:
@@ -311,9 +318,9 @@ def _reason_rows(lab: str, cur_ym: str, prev_ym: str, el: dict[str, dict[str, li
             else:
                 cell["r_prev"] = _remark(key, cell["d_prev"], False, rand)
 
-    prev_label = f"M{prev_ym[2:]}A" if prev_ym else ""
-    cur_label = f"M{cur_ym[2:]}A"
-    source_file = f"OV_{lab}_{cur_ym[2:]}.xlsx"
+    prev_label = f"M{_yy_mm(prev_ym)}A" if prev_ym else ""
+    cur_label = f"M{_yy_mm(cur_ym)}A"
+    source_file = f"OV_{lab}_{_yy_mm(cur_ym)}.xlsx"
     return [
         {
             "lab_code": lab, "version": "cur", "category_key": key, "block": block,
@@ -330,7 +337,7 @@ def _reason_rows(lab: str, cur_ym: str, prev_ym: str, el: dict[str, dict[str, li
 
 # ---------- 외주용역 ----------
 
-def _vendor_rows(lab: str, cur_ym: str, outs: list[float]) -> list[dict]:
+def _vendor_rows(lab: str, cur_ym: int, outs: list[float]) -> list[dict]:
     """한 연구소의 외주용역 상세(업체·과제 30~40건)를 만든다 — 화면 ovSeedX와 같은 규칙."""
     rand = JsRandom("ovouts|" + lab)
     count = 30 + math.floor(rand() * 11)
@@ -359,7 +366,7 @@ def _vendor_rows(lab: str, cur_ym: str, outs: list[float]) -> list[dict]:
     if lab == "SSCR" and items:  # 대사 불일치 예시 1건(화면에 빨간 칸으로 보이는 3월)
         items[0]["m"][2] = _r1(items[0]["m"][2] + 5)
 
-    source_file = f"OV_{lab}_{cur_ym[2:]}.xlsx"
+    source_file = f"OV_{lab}_{_yy_mm(cur_ym)}.xlsx"
     return [
         {
             "lab_code": lab, "version": "cur", "row_no": i + 1,
@@ -423,7 +430,7 @@ def seed_overseas_sheets(db: Session) -> tuple[int, int]:
         db.execute(
             insert(OverseasVendorRowDetail),
             [
-                {"vendor_row_id": new_id, "year": int(cur_ym[:4]), "month": month, "amount": amount}
+                {"vendor_row_id": new_id, "year": ym_year(cur_ym), "month": month, "amount": amount}
                 for new_id, r in zip(new_ids, vendor_rows)
                 for month, amount in enumerate(r["m"], start=1)
             ],

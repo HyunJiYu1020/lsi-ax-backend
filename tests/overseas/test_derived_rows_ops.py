@@ -25,7 +25,7 @@ from app.accounts.overseas.services.extra_rows import (
 from app.accounts.overseas.services.labs import ALL_SCOPE
 
 BASIS_YEAR, BASIS_MONTH = 2026, 9
-YYYYMM = f"{BASIS_YEAR}{BASIS_MONTH:02d}"
+YYYYMM = BASIS_YEAR * 100 + BASIS_MONTH
 
 # 재료 세 개 — 금액 둘(급여·상여)과 수량 하나(인력).
 MATERIALS = {"sal": [100.0] * 12, "bonus": [20.0] * 12, "hc": [10.0] * 12}
